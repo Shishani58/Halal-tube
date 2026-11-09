@@ -36,12 +36,14 @@ function feeder(sb, bytes) {
       // abandon the partially appended cluster, re-send init, continue at the cluster for the target
       const c = [...idx].reverse().find((x) => x.t <= f.jumpTo) ?? idx[0];
       f.jumpTo = null;
+      // like a real player: drop the half-parsed cluster (abort), re-send init, continue at the target cluster
+      try { sb.abort(); } catch {}
       sb.addEventListener('updateend', () => { f.pos = c.off; setTimeout(step, 20); }, { once: true });
       sb.appendBuffer(bytes.subarray(0, initEnd));
       return;
     }
     if (f.pos >= bytes.length) { if (++done === 2) { try { ms.endOfStream(); } catch {} } return; }
-    if (ahead(sb) > 20) return setTimeout(step, 250);
+    if (f.jumpTo === null && ahead(sb) > 20) return setTimeout(() => step(), 250);
     const n = Math.min(bytes.length - f.pos, 3000 + Math.floor(Math.random() * 20000));
     sb.addEventListener('updateend', () => setTimeout(step, 20), { once: true });
     sb.appendBuffer(bytes.subarray(f.pos, f.pos + n));

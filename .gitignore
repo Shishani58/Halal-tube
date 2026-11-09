@@ -3,3 +3,5 @@ dist/
 models/*.onnx
 *.zip
 dist-test/
+.DS_Store
+.claude/
