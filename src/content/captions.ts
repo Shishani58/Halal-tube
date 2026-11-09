@@ -24,11 +24,14 @@ interface YtPlayer extends HTMLElement {
   unloadModule?: (m: string) => void;
   getOption?: (m: string, o: string) => unknown;
   setOption?: (m: string, o: string, v: unknown) => void;
+  isSubtitlesOn?: () => boolean;
 }
 
 const LANGS = ['ru', 'en'];
 /** Give up on a request after this long (then the worker uses speech recognition). */
-const REQUEST_TIMEOUT_MS = 7000;
+const REQUEST_TIMEOUT_MS = 8000;
+/** No response yet after this long: reload the caption module and ask again (once). */
+const RETRY_MS = 3000;
 const HIDE_CLASS = 'mr-captions-hidden';
 
 export interface CaptionResult {
@@ -55,7 +58,15 @@ export class Captions {
   /** Bumped whenever `result` changes. */
   version = 0;
   private cache = new Map<string, CaptionResult>();
-  private want: { videoId: string; languageCode: string; kind?: 'asr'; at: number; userTrack: unknown } | null = null;
+  private want: {
+    videoId: string;
+    languageCode: string;
+    kind?: 'asr';
+    at: number;
+    retried: boolean;
+    /** The viewer's own captions were on (their track is restored afterwards). */
+    userTrack: unknown;
+  } | null = null;
   private style: HTMLStyleElement | null = null;
 
   constructor() {
@@ -76,35 +87,46 @@ export class Captions {
       const t = pickTrack(tracks);
       if (!t) return this.set({ videoId: vid, state: 'none', words: [] });
       this.set({ videoId: vid, state: 'pending', words: [], lang: t.languageCode, kind: t.kind === 'asr' ? 'asr' : 'uploaded' });
-      this.want = { videoId: vid, languageCode: t.languageCode, kind: t.kind, at: 0, userTrack: null };
+      this.want = { videoId: vid, languageCode: t.languageCode, kind: t.kind, at: 0, retried: false, userTrack: null };
     }
     const w = this.want;
     if (!w || this.result.state !== 'pending') return;
     if (p.classList.contains('ad-showing')) return; // ask once the video itself plays
-    if (!w.at) {
-      w.at = performance.now();
-      try {
-        const cur = p.getOption?.('captions', 'track') as { languageCode?: string } | undefined;
-        w.userTrack = cur && cur.languageCode ? cur : null;
+    const now = performance.now();
+    try {
+      if (!w.at) {
+        w.at = now;
+        // 'track' keeps the last track even with captions off: ask whether they are shown
+        const on = p.isSubtitlesOn ? p.isSubtitlesOn() : document.querySelector('.ytp-subtitles-button')?.getAttribute('aria-pressed') === 'true';
+        w.userTrack = on ? (p.getOption?.('captions', 'track') ?? null) : null;
         if (!w.userTrack) this.hideOverlay(true);
-        p.loadModule?.('captions');
-        // the module needs a moment before it takes a track
-        setTimeout(() => {
-          if (this.want === w) p.setOption?.('captions', 'track', w.kind ? { languageCode: w.languageCode, kind: w.kind } : { languageCode: w.languageCode });
-        }, 300);
-      } catch (e) {
-        console.warn('[music-remover] captions request failed', e);
+        this.ask(p, w, false);
+      } else if (!w.retried && now - w.at > RETRY_MS) {
+        // the player wasn't ready, or it had the track cached and didn't fetch it
+        w.retried = true;
+        this.ask(p, w, true);
+      } else if (now - w.at > REQUEST_TIMEOUT_MS) {
         this.fail(p);
       }
-    } else if (performance.now() - w.at > REQUEST_TIMEOUT_MS) {
+    } catch (e) {
+      console.warn('[music-remover] captions request failed', e);
       this.fail(p);
     }
   }
 
-  private set(r: CaptionResult): void {
+  private ask(p: YtPlayer, w: NonNullable<Captions['want']>, reload: boolean): void {
+    if (reload) p.unloadModule?.('captions');
+    p.loadModule?.('captions');
+    // the module needs a moment before it takes a track
+    setTimeout(() => {
+      if (this.want === w) p.setOption?.('captions', 'track', w.kind ? { languageCode: w.languageCode, kind: w.kind } : { languageCode: w.languageCode });
+    }, 300);
+  }
+
+  private set(r: CaptionResult, cache = true): void {
     this.result = r;
     this.version++;
-    if (r.state !== 'pending') {
+    if (cache && r.state !== 'pending') {
       this.cache.set(r.videoId, r);
       if (this.cache.size > 6) this.cache.delete(this.cache.keys().next().value!);
     }
@@ -113,7 +135,7 @@ export class Captions {
   private fail(p: YtPlayer): void {
     const vid = this.result.videoId;
     this.finishRequest(p);
-    this.set({ videoId: vid, state: 'none', words: [] });
+    this.set({ videoId: vid, state: 'none', words: [] }, false); // try again when the video is opened again
   }
 
   /** Put the viewer's caption setting back and show the overlay again. */
