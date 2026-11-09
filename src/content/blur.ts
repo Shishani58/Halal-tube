@@ -48,8 +48,9 @@ export class VisionController {
     private readonly sessionOf: (v: HTMLVideoElement) => number,
   ) {}
 
+  /** Appends must carry a buffer of their own: it is transferred, not copied. */
   private send(msg: ToVision): void {
-    window.postMessage({ ns: MSG_NS, from: 'main', kind: 'to-vision', msg }, '*');
+    window.postMessage({ ns: MSG_NS, from: 'main', kind: 'to-vision', msg }, '*', msg.type === 'append' ? [msg.data] : []);
   }
 
   // ───────── MSE hooks (called for video SourceBuffers) ─────────
@@ -68,6 +69,9 @@ export class VisionController {
   onAppend(id: number, data: BufferSource, tsOffset: number): void {
     const sb = this.sbs.get(id);
     if (!sb) return;
+    // keep the Map in least-recently-appended order: the cap drops idle buffers, never the playing one
+    this.sbs.delete(id);
+    this.sbs.set(id, sb);
     const init = isInitSegment(headOf(data));
     if (!init && !this.active) return; // no copies at all while blurring is off
     const copy = copyOf(data);
@@ -77,7 +81,7 @@ export class VisionController {
     }
     if (!this.active) return;
     if (!sb.announced) this.announce(sb, init);
-    this.send({ type: 'append', session: sb.session, sb: sb.id, data: copy, tsOffset });
+    this.send({ type: 'append', session: sb.session, sb: sb.id, data: init ? copy.slice(0) : copy, tsOffset });
   }
 
   onAbort(id: number): void {
@@ -96,11 +100,10 @@ export class VisionController {
     if (msg.type === 'status') this.status = msg.status;
     else if (msg.type === 'result') {
       let tl = this.timelines.get(msg.session);
-      if (!tl) {
-        tl = new VisionTimeline();
-        this.timelines.set(msg.session, tl);
-        if (this.timelines.size > MAX_TIMELINES) this.timelines.delete(this.timelines.keys().next().value!);
-      }
+      if (tl) this.timelines.delete(msg.session); // re-inserted below: least-recently-updated order
+      else tl = new VisionTimeline();
+      this.timelines.set(msg.session, tl);
+      if (this.timelines.size > MAX_TIMELINES) this.timelines.delete(this.timelines.keys().next().value!);
       tl.add(msg.from, msg.to, msg.samples);
     } else if (msg.type === 'ready') this.lastPos = 0;
   }

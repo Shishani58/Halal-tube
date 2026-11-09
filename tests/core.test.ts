@@ -3,8 +3,8 @@ import { MdxProcessor, KIM_VOCAL_2 } from '../src/core/mdx';
 import { resampleCubic } from '../src/core/resample';
 import { assert, test } from './harness';
 
-test('FFT matches naive DFT (N=60)', () => {
-  const N = 60;
+test('FFT and inverse match naive DFT (N=60, 250, 360)', () => {
+  for (const N of [60, 250, 360]) {
   const fft = new FFT(N);
   const re = new Float64Array(N), im = new Float64Array(N);
   for (let i = 0; i < N; i++) { re[i] = Math.sin(i * 0.37) + 0.1 * i; im[i] = Math.cos(i * 1.3); }
@@ -17,10 +17,11 @@ test('FFT matches naive DFT (N=60)', () => {
       sr += r0[n] * Math.cos(a) - i0[n] * Math.sin(a);
       si += r0[n] * Math.sin(a) + i0[n] * Math.cos(a);
     }
-    assert(Math.abs(sr - re[k]) < 1e-9 && Math.abs(si - im[k]) < 1e-9, `bin ${k}`);
+    assert(Math.abs(sr - re[k]) < 1e-9 && Math.abs(si - im[k]) < 1e-9, `N=${N} bin ${k}`);
   }
   fft.inverse(re, im);
-  for (let i = 0; i < N; i++) assert(Math.abs(re[i] - r0[i]) < 1e-9, 'inverse');
+  for (let i = 0; i < N; i++) assert(Math.abs(re[i] - r0[i]) < 1e-9 && Math.abs(im[i] - i0[i]) < 1e-9, `inverse ${N}`);
+  }
 });
 
 test('FFT N=7680 spot check + speed', () => {

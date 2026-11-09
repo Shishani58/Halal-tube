@@ -127,7 +127,15 @@ pub fn run(
         enc_cmd.args(["-itsoffset", &format!("{offset:.6}")]);
     }
     enc_cmd.args(["-f", "f32le", "-ar", &rate.to_string(), "-ac", "2", "-i", "pipe:0"]);
-    enc_cmd.args(["-map", "0:v?", "-map", "0:s?", "-map", "1:a", "-c:v", "copy", "-c:s", "copy"]);
+    // Audio-only containers take no picture stream: Ogg turns embedded cover art into a video
+    // stream that its muxer then rejects ("Unsupported codec id"). Matroska keeps attachments (fonts).
+    if !matches!(job.plan.ext.as_str(), "ogg" | "oga" | "opus" | "aac") {
+        enc_cmd.args(["-map", "0:v?"]);
+    }
+    if matches!(job.plan.ext.as_str(), "mkv" | "mka") {
+        enc_cmd.args(["-map", "0:t?"]);
+    }
+    enc_cmd.args(["-map", "0:s?", "-map", "1:a", "-c:v", "copy", "-c:s", "copy"]);
     enc_cmd.args(&job.plan.codec_args);
     let out_rate = output_rate(&job.plan, info);
     let out_ch = info.audio.channels.clamp(1, 2);

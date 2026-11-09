@@ -6,8 +6,10 @@
  *  - Keeps the stream headers and recent audio so a restarted processor can catch up.
  *  - Answers popup status queries.
  */
-import { DEFAULT_SETTINGS, MSG_NS, type PageStatus, type Settings, type ToWorker } from '../shared/messages';
+import { DEFAULT_SETTINGS, MSG_NS, needsProcessor, type PageStatus, type Settings, type ToWorker } from '../shared/messages';
+import { isInitSegment } from '../shared/vision-messages';
 import { decodeFromWorker, encodeToWorker, type FromWorkerWire, type ToWorkerWire } from '../shared/wire';
+import { ReplayLog } from './replay-log';
 import './bridge-vision';
 
 let settings: Settings = { ...DEFAULT_SETTINGS };
@@ -35,45 +37,18 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 // ───────────── replay log: stream setup + recent audio, re-sent after a reconnect ─────────────
-interface LogEntry {
-  wire: ToWorkerWire;
-  bytes: number;
-  pinned: boolean; // sb-init and init segments are never dropped
-}
-const log: LogEntry[] = [];
-let logBytes = 0;
-const LOG_MAX = 24 * 1024 * 1024;
-
-function isInitSegment(data: ArrayBuffer): boolean {
-  const b = new Uint8Array(data, 0, Math.min(8, data.byteLength));
-  if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return true; // EBML header
-  const t = String.fromCharCode(b[4], b[5], b[6], b[7]);
-  return t === 'ftyp' || t === 'moov';
-}
+const log = new ReplayLog<ToWorkerWire>(24 * 1024 * 1024);
 
 function remember(msg: ToWorker, wire: ToWorkerWire): void {
   if (msg.type === 'sb-init') {
-    log.push({ wire, bytes: 0, pinned: true });
+    log.add({ wire, session: msg.session, sb: msg.sb, bytes: 0, pinned: true });
   } else if (msg.type === 'captions') {
     // only the latest caption state per session matters
-    for (let i = log.length - 1; i >= 0; i--) {
-      const w = log[i].wire;
-      if (w.type === 'captions' && w.session === msg.session) log.splice(i, 1);
-    }
-    log.push({ wire, bytes: 0, pinned: true });
-  } else if (msg.type === 'append') {
-    const pinned = isInitSegment(msg.data);
-    const bytes = msg.data.byteLength;
-    log.push({ wire, bytes, pinned });
-    logBytes += bytes;
-    for (let i = 0; logBytes > LOG_MAX && i < log.length; ) {
-      if (log[i].pinned) {
-        i++;
-        continue;
-      }
-      logBytes -= log[i].bytes;
-      log.splice(i, 1);
-    }
+    log.remove((e) => e.wire.type === 'captions' && e.session === msg.session);
+    log.add({ wire, session: msg.session, bytes: 0, pinned: true });
+  } else if (msg.type === 'append' && wire.type === 'append') {
+    const init = isInitSegment(new Uint8Array(msg.data, 0, Math.min(8, msg.data.byteLength)));
+    log.add({ wire, session: msg.session, sb: msg.sb, bytes: wire.data.length, pinned: init, init });
   }
 }
 
@@ -121,7 +96,7 @@ async function connect(): Promise<void> {
       if (wanted && contextAlive()) setTimeout(() => void connect(), 300);
     });
     port = p;
-    for (const e of log) p.postMessage(e.wire); // catch the (new) processor up
+    for (const e of log.all) p.postMessage(e.wire); // catch the (new) processor up
     reportLink();
   } catch (e) {
     // The service worker may still be starting (fresh install / browser start): retry soon.
@@ -149,7 +124,8 @@ window.addEventListener('message', (e: MessageEvent) => {
     }
     const wire = encodeToWorker(d.msg);
     remember(d.msg, wire);
-    wanted = true;
+    if (needsProcessor(d.msg)) wanted = true;
+    if (!wanted) return; // kept in the log, replayed once the page needs the processor
     if (port) {
       try {
         port.postMessage(wire);

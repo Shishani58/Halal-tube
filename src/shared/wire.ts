@@ -4,7 +4,13 @@
  */
 import type { FromWorker, ToWorker } from './messages';
 
+/** Native base64 (Chrome 140+), when present: one call, no intermediate strings. */
+const native = typeof (Uint8Array.prototype as { toBase64?: unknown }).toBase64 === 'function';
+type B64 = { toBase64(): string };
+type FromB64 = { fromBase64(s: string): Uint8Array };
+
 export function b64encode(u: Uint8Array): string {
+  if (native) return (u as unknown as B64).toBase64();
   let s = '';
   const CH = 0x8000;
   for (let i = 0; i < u.length; i += CH) s += String.fromCharCode.apply(null, u.subarray(i, i + CH) as unknown as number[]);
@@ -12,6 +18,7 @@ export function b64encode(u: Uint8Array): string {
 }
 
 export function b64decode(s: string): Uint8Array {
+  if (native) return (Uint8Array as unknown as FromB64).fromBase64(s);
   const bin = atob(s);
   const u = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);

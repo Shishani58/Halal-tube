@@ -50,13 +50,19 @@ export function configKey(codec: string, sampleRate: number, channels: number, d
 
 /** Growable byte queue with an absolute stream offset. */
 export class ByteQueue {
-  private buf = new Uint8Array(0);
+  private buf: Uint8Array = new Uint8Array(0);
   private start = 0; // read index into buf
   /** Absolute stream offset of the first unread byte. */
   offset = 0;
 
   push(bytes: Uint8Array): void {
     const avail = this.buf.length - this.start;
+    if (!avail) {
+      // common case: the previous chunk was parsed to the end — no copy (callers don't reuse `bytes`)
+      this.buf = bytes;
+      this.start = 0;
+      return;
+    }
     const next = new Uint8Array(avail + bytes.length);
     next.set(this.buf.subarray(this.start), 0);
     next.set(bytes, avail);

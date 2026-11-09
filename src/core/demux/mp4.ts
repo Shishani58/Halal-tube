@@ -38,7 +38,7 @@ export class Mp4Demuxer implements Demuxer {
 
   private q = new ByteQueue();
   private tracks = new Map<number, TrackInfo>();
-  private audioTrackId = -1;
+  private selectedTrackId = -1;
   private pending: PendingSamples | null = null;
 
   resetParser(): void {
@@ -163,7 +163,7 @@ export class Mp4Demuxer implements Demuxer {
       if (handler !== (this.kind === 'video' ? 'vide' : 'soun') || !config) continue;
       const d = trex.get(id) ?? { dur: 1024, size: 0, flags: 0 };
       this.tracks.set(id, { id, timescale, config, defaultDuration: d.dur, defaultSize: d.size, defaultFlags: d.flags, startOffset: this.kind === 'video' ? startOffset : 0 });
-      this.audioTrackId = id;
+      this.selectedTrackId = id;
     }
   }
 
@@ -217,7 +217,7 @@ export class Mp4Demuxer implements Demuxer {
           }
         }
       }
-      if (trackId === this.audioTrackId) {
+      if (trackId === this.selectedTrackId) {
         samples.trackId = trackId;
         this.pending = samples;
       }

@@ -39,6 +39,14 @@ export type ToWorker =
 
 export type CaptionState = 'pending' | 'ready' | 'none';
 
+/**
+ * Whether a message means the page wants processing now. Until one arrives the bridge only keeps
+ * the stream in its replay log and does not start the processor (extension off, or only blurring).
+ */
+export function needsProcessor(m: ToWorker): boolean {
+  return (m.type === 'position' && m.enabled) || m.type === 'captions';
+}
+
 /** Messages processor → page. */
 export type FromWorker =
   | { type: 'ready' }

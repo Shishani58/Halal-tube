@@ -324,7 +324,8 @@ fn worker(app: AppHandle, rx: Receiver<u64>) {
 
         let started = Instant::now();
         let mut last_emit = Instant::now();
-        let res = job::run(tools_ref, separator, &prepared, &cancel, |p| {
+        // A panic must fail this job, not leave it (and the queue behind it) "running" forever.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job::run(tools_ref, separator, &prepared, &cancel, |p| {
             if last_emit.elapsed().as_millis() < 150 && p < 1.0 {
                 return;
             }
@@ -335,7 +336,20 @@ fn worker(app: AppHandle, rx: Receiver<u64>) {
                 j.progress = p;
                 j.eta = eta;
             });
-        });
+        })));
+        let res = match res {
+            Ok(r) => r,
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unexpected error".into());
+                sep = None; // its state may be inconsistent: reload the model for the next job
+                fail("internal", msg);
+                continue;
+            }
+        };
         match res {
             Ok(out) => {
                 with_job(&app, id, |j| {

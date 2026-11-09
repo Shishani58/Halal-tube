@@ -5,37 +5,18 @@
  */
 import { MSG_NS } from '../shared/messages';
 import { encodeToVision, isInitSegment, type FromVision, type ToVision, type ToVisionWire } from '../shared/vision-messages';
+import { ReplayLog } from './replay-log';
 
-interface LogEntry {
-  wire: ToVisionWire;
-  bytes: number;
-  pinned: boolean;
-}
-const log: LogEntry[] = [];
-let logBytes = 0;
-const LOG_MAX = 32 * 1024 * 1024;
+const log = new ReplayLog<ToVisionWire>(32 * 1024 * 1024);
 
 function remember(msg: ToVision, wire: ToVisionWire): void {
-  if (msg.type === 'sb-init') log.push({ wire, bytes: 0, pinned: true });
-  else if (msg.type === 'append') {
-    const pinned = isInitSegment(new Uint8Array(msg.data, 0, Math.min(8, msg.data.byteLength)));
-    if (pinned) {
-      // only the latest init segment per SourceBuffer matters
-      for (let i = log.length - 1; i >= 0; i--) {
-        const w = log[i].wire;
-        if (log[i].pinned && w.type === 'append' && w.sb === msg.sb) log.splice(i, 1);
-      }
-    }
-    log.push({ wire, bytes: msg.data.byteLength, pinned });
-    logBytes += msg.data.byteLength;
-    for (let i = 0; logBytes > LOG_MAX && i < log.length; ) {
-      if (log[i].pinned) {
-        i++;
-        continue;
-      }
-      logBytes -= log[i].bytes;
-      log.splice(i, 1);
-    }
+  if (msg.type === 'position' && !msg.enabled) {
+    log.clearMedia(); // blurring turned off: the recent video won't be needed again
+  } else if (msg.type === 'sb-init') {
+    log.add({ wire, session: msg.session, sb: msg.sb, bytes: 0, pinned: true });
+  } else if (msg.type === 'append' && wire.type === 'append') {
+    const init = isInitSegment(new Uint8Array(msg.data, 0, Math.min(8, msg.data.byteLength)));
+    log.add({ wire, session: msg.session, sb: msg.sb, bytes: wire.data.length, pinned: init, init });
   }
 }
 
@@ -64,7 +45,7 @@ async function connect(): Promise<void> {
       if (contextAlive()) setTimeout(() => void connect(), 1000);
     });
     port = p;
-    for (const e of log) p.postMessage(e.wire);
+    for (const e of log.all) p.postMessage(e.wire);
   } catch (e) {
     console.warn('[music-remover] vision connect failed', e);
     if (contextAlive()) setTimeout(() => void connect(), 2000);

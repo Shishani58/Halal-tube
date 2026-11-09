@@ -63,10 +63,18 @@ export class MdxProcessor {
     const { re, im, window: w, fft } = this;
     for (let t = 0; t < dimT; t++) {
       const base = t * hop - pad;
-      for (let n = 0; n < N; n++) {
-        const idx = reflect(base + n, L);
-        re[n] = left[idx] * w[n];
-        im[n] = right[idx] * w[n];
+      if (base >= 0 && base + N <= L) {
+        for (let n = 0; n < N; n++) {
+          re[n] = left[base + n] * w[n];
+          im[n] = right[base + n] * w[n];
+        }
+      } else {
+        // edge frames: torch.stft(center=True) reflect padding
+        for (let n = 0; n < N; n++) {
+          const idx = reflect(base + n, L);
+          re[n] = left[idx] * w[n];
+          im[n] = right[idx] * w[n];
+        }
       }
       fft.forward(re, im);
       for (let k = 0; k < dimF; k++) {
@@ -92,17 +100,16 @@ export class MdxProcessor {
    * Model output tensor → stereo waveform of length genSize (the trimmed, valid region).
    */
   istftTrimmed(spec: Float32Array): [Float32Array, Float32Array] {
-    const { nFft: N, hop, dimF, dimT, compensate } = this.cfg;
+    const { nFft: N, hop, dimF, dimT } = this.cfg;
     const plane = dimF * dimT;
-    const pad = N / 2;
     const olaLen = (dimT - 1) * hop + N;
     const olaL = new Float64Array(olaLen);
     const olaR = new Float64Array(olaLen);
-    const env = new Float64Array(olaLen);
     const { re, im, window: w, fft } = this;
     for (let t = 0; t < dimT; t++) {
-      re.fill(0);
-      im.fill(0);
+      // bins [dimF, N − dimF] are never written below: only they need clearing
+      re.fill(0, dimF, N - dimF + 1);
+      im.fill(0, dimF, N - dimF + 1);
       for (let k = 0; k < dimF; k++) {
         const o = k * dimT + t;
         let lr = spec[o], li = spec[plane + o], rr = spec[2 * plane + o], ri = spec[3 * plane + o];
@@ -116,26 +123,44 @@ export class MdxProcessor {
           im[N - k] = -li + rr;
         }
       }
-      fft.inverse(re, im);
+      fft.inverseUnscaled(re, im); // the 1/N is in `outGain`
       const off = t * hop;
       for (let n = 0; n < N; n++) {
         olaL[off + n] += re[n] * w[n];
         olaR[off + n] += im[n] * w[n];
-        env[off + n] += w[n] * w[n];
       }
     }
     const G = this.genSize;
+    const gain = this.outGain();
     const outL = new Float32Array(G);
     const outR = new Float32Array(G);
     // istft output index j ↔ ola index j + pad; we keep j ∈ [trim, trim + G)
-    const start = pad + this.trim;
+    const start = N / 2 + this.trim;
     for (let j = 0; j < G; j++) {
-      const e = env[start + j];
-      const g = e > 1e-11 ? compensate / e : 0;
-      outL[j] = olaL[start + j] * g;
-      outR[j] = olaR[start + j] * g;
+      outL[j] = olaL[start + j] * gain[j];
+      outR[j] = olaR[start + j] * gain[j];
     }
     return [outL, outR];
+  }
+
+  private gain: Float64Array | null = null;
+  /**
+   * Per-sample output gain of the trimmed region: compensate / (N · Σ window²). The window
+   * envelope depends only on the config, so it is computed once.
+   */
+  private outGain(): Float64Array {
+    if (this.gain) return this.gain;
+    const { nFft: N, hop, dimT, compensate } = this.cfg;
+    const w = this.window;
+    const env = new Float64Array((dimT - 1) * hop + N);
+    for (let t = 0; t < dimT; t++) for (let n = 0; n < N; n++) env[t * hop + n] += w[n] * w[n];
+    const start = N / 2 + this.trim;
+    this.gain = new Float64Array(this.genSize);
+    for (let j = 0; j < this.genSize; j++) {
+      const e = env[start + j];
+      this.gain[j] = e > 1e-11 ? compensate / (N * e) : 0;
+    }
+    return this.gain;
   }
 }
 

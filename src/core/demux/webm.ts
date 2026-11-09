@@ -59,7 +59,7 @@ export class WebmDemuxer implements Demuxer {
   private skip = 0;
   private timecodeScale = 1_000_000; // ns
   private clusterTime = 0;
-  private audioTrack = -1;
+  private trackNum = -1; // the audio or video track this demuxer extracts
   private config: TrackConfig | null = null;
   private codecDelay = 0;
   /** Video frame duration (s) from DefaultDuration, else a 30 fps guess. */
@@ -233,7 +233,7 @@ export class WebmDemuxer implements Demuxer {
         if (!codec) continue;
         // VP8/VP9 need no description; for AV1 CodecPrivate is the av1C record.
         const description = codecId === 'V_AV1' && priv && priv.length > 4 ? priv : undefined;
-        this.audioTrack = num;
+        this.trackNum = num;
         if (defDur > 0) this.frameDur = defDur / 1e9;
         this.config = { codec, sampleRate: 0, channels: 0, description, kind: 'video', width, height, key: configKey(codec, width, height, description) };
         return;
@@ -245,7 +245,7 @@ export class WebmDemuxer implements Demuxer {
       else if (codecId.startsWith('A_AAC')) codec = 'mp4a.40.2';
       else continue;
       if (codec === 'opus') rate = 48000;
-      this.audioTrack = num;
+      this.trackNum = num;
       this.codecDelay = delay / 1e9;
       this.config = { codec, sampleRate: rate, channels: ch, description: priv, kind: 'audio', key: configKey(codec, rate, ch, priv) };
       return;
@@ -279,7 +279,7 @@ export class WebmDemuxer implements Demuxer {
   private parseBlock(b: Uint8Array, out: Packet[], tsOffset: number, groupKey?: boolean): void {
     if (!this.config) return;
     const tn = readVint(b, 0);
-    if (!tn || tn.value !== this.audioTrack) return;
+    if (!tn || tn.value !== this.trackNum) return;
     let p = tn.len;
     const rel = (b[p] << 24) >> 16 | b[p + 1]; // signed int16
     p += 2;

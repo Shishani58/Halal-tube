@@ -36,13 +36,6 @@ badgeEl.addEventListener('change', () => void chrome.storage.sync.set({ showBadg
 for (const m of modeEls) m.addEventListener('change', () => m.checked && void chrome.storage.sync.set({ mode: m.value }));
 for (const [k, el] of blurEls) el.addEventListener('change', () => void chrome.storage.sync.set({ [k]: el.checked }));
 
-const VISION_TEXT = {
-  off: 'Выключено',
-  'no-video': 'Видео не найдено',
-  checking: 'Проверяется…',
-  hidden: 'Размыт',
-  clear: 'Чистый',
-} as const;
 musicEl.addEventListener('change', () => {
   hint(current());
   void chrome.storage.sync.set({ musicRemoval: musicEl.checked });
@@ -53,6 +46,14 @@ for (const p of profEls)
     hint(current());
     void chrome.storage.sync.set({ profanity: p.value });
   });
+
+const VISION_TEXT = {
+  off: 'Выключено',
+  'no-video': 'Видео не найдено',
+  checking: 'Проверяется…',
+  hidden: 'Размыт',
+  clear: 'Чистый',
+} as const;
 
 const STATE_TEXT: Record<PageStatus['state'], string> = {
   disabled: 'Выключено',
@@ -109,24 +110,22 @@ async function refresh(): Promise<void> {
   set('st-ahead', w ? `${Math.round(w.ahead)} с (аудио загружено на ${Math.round(w.inputAhead)} с)` : '—');
   const filterOn = current().profanity !== 'off';
   $('row-asr').hidden = !filterOn;
-  if (filterOn) {
-    const a = w?.asr;
-    set(
-      'st-asr',
-      w?.words === 'captions'
-        ? 'По субтитрам YouTube'
-        : w?.words === 'pending'
-          ? 'Получаю субтитры…'
-          : a === 'ready'
-        ? w?.asrMs
-          ? `Готово, ${(w.asrMs / 1000).toFixed(1)} с на фрагмент`
-          : 'Готово'
-        : a === 'error'
-          ? `Ошибка: ${w?.asrError ?? ''}`
-          : a === 'loading'
-            ? 'Загрузка…'
-            : '—',
-    );
+  if (filterOn) set('st-asr', asrText(w));
+}
+
+/** Where the profanity filter's words come from, and the recognizer's state. */
+function asrText(w: PageStatus['worker']): string {
+  if (w?.words === 'captions') return 'По субтитрам YouTube';
+  if (w?.words === 'pending') return 'Получаю субтитры…';
+  switch (w?.asr) {
+    case 'ready':
+      return w.asrMs ? `Готово, ${(w.asrMs / 1000).toFixed(1)} с на фрагмент` : 'Готово';
+    case 'error':
+      return `Ошибка: ${w.asrError ?? ''}`;
+    case 'loading':
+      return 'Загрузка…';
+    default:
+      return '—';
   }
 }
 

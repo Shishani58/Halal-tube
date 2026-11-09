@@ -50,7 +50,14 @@ const KEEP_BEHIND = 5;
 /** Cap on compressed video held while waiting for analysis. */
 const MAX_BYTES = 256 * 1024 * 1024;
 const MAX_SESSIONS = 4;
+/** Free the models after this long without analysing anything (paused, everything checked, off). */
 const IDLE_RELEASE_MS = 3 * 60_000;
+/** Drop the buffered video of a session not reported for this long (navigated away, blur off). */
+const STALE_SESSION_MS = 60_000;
+/** Consecutive analysis failures (lost GPU device, broken decoder) before reporting an error. */
+const MAX_FAILURES = 3;
+/** After a model error, try loading again after this long. */
+const RETRY_MS = 30_000;
 
 interface Gop {
   start: number;
@@ -87,7 +94,11 @@ let pos: Extract<ToVision, { type: 'position' }> | null = null;
 let model: LoadedModel | null = null;
 let gender: LoadedModel | null = null;
 let busy = false;
-let lastEnabledAt = Date.now();
+/** Last time a GOP was analysed or the models became ready (idle release). */
+let lastWorkAt = Date.now();
+let failures = 0;
+let everLoaded = false;
+let errorAt = 0;
 let workSec = 0;
 let mediaSec = 0;
 const status: VisionStatus = { model: 'idle', backend: '-', frames: 0, speed: 0, ahead: 0 };
@@ -138,7 +149,11 @@ function addPacket(s: Session, sb: Sb, p: Packet): void {
     sb.cur = g;
     return;
   }
-  if (!cur || cur.closed) return; // no keyframe to start decoding from
+  if (!cur || cur.closed || cur.done) {
+    // no keyframe to start decoding from, or the GOP was dropped (memory cap)
+    if (cur?.done) sb.cur = null;
+    return;
+  }
   if (p.config.key !== cur.configKey || dts <= cur.lastDts - 1e-6 || dts > cur.lastDts + 1) {
     // discontinuity without a keyframe: nothing after this point is decodable
     close(cur, null);
@@ -189,13 +204,18 @@ self.onmessage = (e: MessageEvent<ToVision>) => {
     }
     case 'position': {
       pos = m;
-      if (m.enabled) lastEnabledAt = Date.now();
       const s = sessions.get(m.session);
       if (s) {
         s.lastUsed = Date.now();
         evict(s, m.time);
+        // the last GOP of the video has no next keyframe to close it
+        if (Number.isFinite(m.duration) && m.duration > 0)
+          for (const sb of s.sbs.values()) if (sb.cur && sb.cur.end >= m.duration - 0.1) close(sb.cur, null);
       }
-      if (m.enabled && status.model === 'idle') void initModel();
+      if (status.model === 'error' && Date.now() - errorAt > RETRY_MS) status.model = 'idle';
+      // Load as soon as a page has a video; after an idle release, once there is something to analyse
+      // (not for a paused video whose frames ahead are all checked).
+      if (m.enabled && status.model === 'idle' && (!everLoaded || (s && pickGop(s, m.time)))) void initModel();
       schedule();
       updateStatus();
       break;
@@ -228,9 +248,12 @@ async function initModel(): Promise<void> {
     gender = await loadModel({ base, modelFile: GENDER_FILE, shape: [G, 3, GS, GS], backend: 'wasm' });
     status.model = 'ready';
     status.backend = model.backend;
+    status.error = undefined;
+    lastWorkAt = Date.now();
+    everLoaded = true;
   } catch (e) {
-    status.model = 'error';
-    status.error = e instanceof Error ? e.message : String(e);
+    void releaseModels();
+    setError(e);
     console.error('[music-remover] vision model load failed', e);
   }
   updateStatus(true);
@@ -295,10 +318,19 @@ async function pump(): Promise<void> {
   busy = true;
   try {
     await analyse(sid, s, g);
+    failures = 0;
+    lastWorkAt = Date.now();
   } catch (e) {
     console.warn('[music-remover] GOP analysis failed', g.start, e);
     if (g.closed) free(g);
     else g.analyzedCount = g.packets.length; // retry once more data arrives
+    // a persistent failure (lost GPU device…) must show, not silently stop checking frames
+    if (++failures >= MAX_FAILURES) {
+      failures = 0;
+      await releaseModels();
+      setError(e);
+      updateStatus(true);
+    }
   } finally {
     busy = false;
   }
@@ -463,17 +495,35 @@ function updateStatus(force = false): void {
   post({ type: 'status', status: { ...status } });
 }
 
+function setError(e: unknown): void {
+  status.model = 'error';
+  status.error = e instanceof Error ? e.message : String(e);
+  errorAt = Date.now();
+}
+
+async function releaseModels(): Promise<void> {
+  const m = model;
+  const gm = gender;
+  model = null;
+  gender = null;
+  status.model = 'idle';
+  status.backend = '-';
+  await Promise.all([m?.release(), gm?.release()]).catch(() => undefined);
+}
+
 setInterval(() => {
-  if (model && !busy && Date.now() - lastEnabledAt > IDLE_RELEASE_MS) {
-    const m = model;
-    const gm = gender;
-    model = null;
-    gender = null;
-    status.model = 'idle';
-    status.backend = '-';
-    void m.release().catch(() => undefined);
-    void gm?.release().catch(() => undefined);
+  const now = Date.now();
+  if (model && !busy && now - lastWorkAt > IDLE_RELEASE_MS) {
+    void releaseModels();
     updateStatus(true);
+  }
+  // Buffered video nobody asks about any more (the page plays another video, or blurring was
+  // turned off and positions stopped): free it, keep `checked`.
+  for (const s of sessions.values()) {
+    if (now - s.lastUsed < STALE_SESSION_MS || !s.gops.length) continue;
+    for (const g of s.gops) free(g);
+    s.gops = [];
+    for (const sb of s.sbs.values()) sb.cur = null;
   }
 }, 30_000);
 

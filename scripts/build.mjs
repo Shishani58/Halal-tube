@@ -64,7 +64,7 @@ const common = {
 };
 
 const builds = [
-  { entryPoints: { 'content/main': 'src/content/main.ts', 'content/bridge': 'src/content/bridge.ts', }, format: 'iife' },
+  { entryPoints: { 'content/main': 'src/content/main.ts', 'content/bridge': 'src/content/bridge.ts' }, format: 'iife' },
   // transformers.js (speech recognition), loaded by the worker only when the profanity filter is on;
   // it reuses the ONNX Runtime the worker already loaded (see src/processor/ort-shim.ts)
   {

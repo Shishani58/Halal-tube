@@ -8,6 +8,7 @@ import {
   DEFAULT_SETTINGS,
   MSG_NS,
   filterKey,
+  needsProcessor,
   type FilterConfig,
   type FromWorker,
   type PageStatus,
@@ -39,8 +40,9 @@ declare global {
   /** No link for this long while a video needs processing → give up and play the original. */
   const LINK_GRACE_MS = 4000;
   function send(msg: ToWorker): void {
-    if (!link.up && !link.downSince) link.downSince = performance.now();
-    window.postMessage({ ns: MSG_NS, from: 'main', kind: 'to-worker', msg }, '*');
+    if (!link.up && !link.downSince && needsProcessor(msg)) link.downSince = performance.now();
+    // appends carry a private copy of the segment: hand it over instead of cloning it again
+    window.postMessage({ ns: MSG_NS, from: 'main', kind: 'to-worker', msg }, '*', msg.type === 'append' ? [msg.data] : []);
   }
 
   // Blurring: video track → frame classifier; CSS blur on flagged / unchecked frames.
@@ -357,8 +359,7 @@ declare global {
       return ctx.currentTime + (m - t) / rate - lat;
     }
 
-    tick(): void {
-      const v = this.pickVideo();
+    tick(v: HTMLVideoElement | null): void {
       if (v !== this.video) {
         this.stopAll();
         this.video = v;
@@ -554,7 +555,6 @@ declare global {
     }
   })();
 
-  // ───────────────────────── loop & events ─────────────────────────
   // ───────────────────────── captions for the profanity filter ─────────────────────────
   const captions = new Captions();
   let capSent = { version: -1, session: 0 };
@@ -568,15 +568,17 @@ declare global {
     send({ type: 'captions', session: sid, state: r.state, words: r.words, lang: r.lang, kind: r.kind });
   }
 
+  // ───────────────────────── loop & events ─────────────────────────
   function tick(): void {
     // blur decision first: the badge (drawn by player.tick) reports it
+    const v = player.pickVideo(); // one layout query per tick
     try {
-      vision.tick(player.pickVideo());
+      vision.tick(v);
     } catch (e) {
       console.warn('[music-remover] blur tick error', e);
     }
     try {
-      player.tick();
+      player.tick(v);
       syncCaptions();
     } catch (e) {
       console.warn('[music-remover] tick error', e);

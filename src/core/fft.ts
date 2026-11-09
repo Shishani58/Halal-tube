@@ -43,6 +43,8 @@ export class FFT {
         radix2(xr, xi, yr, yi, m, s, nStep, cos, sin);
       } else if (r === 3) {
         radix3(xr, xi, yr, yi, m, s, nStep, cos, sin);
+      } else if (r === 5) {
+        radix5(xr, xi, yr, yi, m, s, nStep, cos, sin);
       } else for (let p = 0; p < m; p++) {
         for (let q = 0; q < s; q++) {
           // gather
@@ -82,14 +84,20 @@ export class FFT {
 
   /** In-place inverse DFT (normalized by 1/N). */
   inverse(re: Float64Array, im: Float64Array): void {
-    const N = this.n;
-    for (let i = 0; i < N; i++) im[i] = -im[i];
-    this.forward(re, im);
-    const inv = 1 / N;
-    for (let i = 0; i < N; i++) {
+    this.inverseUnscaled(re, im);
+    const inv = 1 / this.n;
+    for (let i = 0; i < this.n; i++) {
       re[i] *= inv;
-      im[i] = -im[i] * inv;
+      im[i] *= inv;
     }
+  }
+
+  /**
+   * In-place inverse DFT without the 1/N factor (callers that scale anyway fold it in).
+   * IDFT(x) = swap(DFT(swap(x))): a forward transform with real and imaginary parts exchanged.
+   */
+  inverseUnscaled(re: Float64Array, im: Float64Array): void {
+    this.forward(im, re);
   }
 }
 
@@ -169,6 +177,47 @@ function radix3(xr: A, xi: A, yr: A, yi: A, m: number, s: number, nStep: number,
       ur = mr - er; ui = mi - ei;
       yr[o + 2 * s] = ur * c2 - ui * s2;
       yi[o + 2 * s] = ur * s2 + ui * c2;
+    }
+  }
+}
+
+const C5_1 = Math.cos((2 * Math.PI) / 5), C5_2 = Math.cos((4 * Math.PI) / 5);
+const S5_1 = Math.sin((2 * Math.PI) / 5), S5_2 = Math.sin((4 * Math.PI) / 5);
+function radix5(xr: A, xi: A, yr: A, yi: A, m: number, s: number, nStep: number, cos: A, sin: A): void {
+  const sm = s * m;
+  for (let p = 0; p < m; p++) {
+    const w1 = p * nStep;
+    const c1 = cos[w1], s1 = sin[w1], c2 = cos[2 * w1], s2 = sin[2 * w1];
+    const c3 = cos[3 * w1], s3 = sin[3 * w1], c4 = cos[4 * w1], s4 = sin[4 * w1];
+    for (let q = 0; q < s; q++) {
+      const i0 = q + s * p;
+      const a0r = xr[i0], a0i = xi[i0];
+      const a1r = xr[i0 + sm], a1i = xi[i0 + sm];
+      const a2r = xr[i0 + 2 * sm], a2i = xi[i0 + 2 * sm];
+      const a3r = xr[i0 + 3 * sm], a3i = xi[i0 + 3 * sm];
+      const a4r = xr[i0 + 4 * sm], a4i = xi[i0 + 4 * sm];
+      const t1r = a1r + a4r, t1i = a1i + a4i, t2r = a2r + a3r, t2i = a2i + a3i;
+      const t3r = a1r - a4r, t3i = a1i - a4i, t4r = a2r - a3r, t4i = a2i - a3i;
+      const b1r = a0r + C5_1 * t1r + C5_2 * t2r, b1i = a0i + C5_1 * t1i + C5_2 * t2i;
+      const b2r = a0r + C5_2 * t1r + C5_1 * t2r, b2i = a0i + C5_2 * t1i + C5_1 * t2i;
+      const d1r = S5_1 * t3r + S5_2 * t4r, d1i = S5_1 * t3i + S5_2 * t4i;
+      const d2r = S5_2 * t3r - S5_1 * t4r, d2i = S5_2 * t3i - S5_1 * t4i;
+      const o = q + s * 5 * p;
+      yr[o] = a0r + t1r + t2r;
+      yi[o] = a0i + t1i + t2i;
+      // y1 = b1 − i·d1, y4 = b1 + i·d1, y2 = b2 − i·d2, y3 = b2 + i·d2; then twiddle by e^{−2πi·pk/n}
+      let ur = b1r + d1i, ui = b1i - d1r;
+      yr[o + s] = ur * c1 - ui * s1;
+      yi[o + s] = ur * s1 + ui * c1;
+      ur = b2r + d2i; ui = b2i - d2r;
+      yr[o + 2 * s] = ur * c2 - ui * s2;
+      yi[o + 2 * s] = ur * s2 + ui * c2;
+      ur = b2r - d2i; ui = b2i + d2r;
+      yr[o + 3 * s] = ur * c3 - ui * s3;
+      yi[o + 3 * s] = ur * s3 + ui * c3;
+      ur = b1r - d1i; ui = b1i + d1r;
+      yr[o + 4 * s] = ur * c4 - ui * s4;
+      yi[o + 4 * s] = ur * s4 + ui * c4;
     }
   }
 }
