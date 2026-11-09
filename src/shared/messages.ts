@@ -20,7 +20,24 @@ export type ToWorker =
       /** What to do to each tile (default: remove music, no profanity filter). */
       filter?: FilterConfig;
     }
+  | {
+      /**
+       * Word timings from the video's captions for the profanity filter. 'pending': being fetched
+       * (the worker waits a little before falling back to speech recognition); 'none': the video
+       * has no usable captions.
+       */
+      type: 'captions';
+      session: number;
+      state: CaptionState;
+      /** Media seconds, sorted by start. */
+      words?: { text: string; start: number; end: number }[];
+      lang?: string;
+      /** Auto-generated (word-timed) or uploaded (line-timed) track. */
+      kind?: 'asr' | 'uploaded';
+    }
   | { type: 'drop-session'; session: number };
+
+export type CaptionState = 'pending' | 'ready' | 'none';
 
 /** Messages processor → page. */
 export type FromWorker =
@@ -63,6 +80,8 @@ export interface WorkerStatus {
    * audio yet; 'compute' — it is queued or being separated; undefined — it's done.
    */
   waitFor?: 'input' | 'compute';
+  /** Where the profanity filter gets this video's words: its captions, speech recognition, or still deciding. */
+  words?: 'captions' | 'asr' | 'pending';
   /** Speech recognizer for the profanity filter. */
   asr?: 'idle' | 'loading' | 'ready' | 'error';
   asrError?: string;

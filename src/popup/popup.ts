@@ -93,7 +93,11 @@ async function refresh(): Promise<void> {
     const a = w?.asr;
     set(
       'st-asr',
-      a === 'ready'
+      w?.words === 'captions'
+        ? 'По субтитрам YouTube'
+        : w?.words === 'pending'
+          ? 'Получаю субтитры…'
+          : a === 'ready'
         ? w?.asrMs
           ? `Готово, ${(w.asrMs / 1000).toFixed(1)} с на фрагмент`
           : 'Готово'

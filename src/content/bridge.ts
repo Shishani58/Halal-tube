@@ -53,6 +53,13 @@ function isInitSegment(data: ArrayBuffer): boolean {
 function remember(msg: ToWorker, wire: ToWorkerWire): void {
   if (msg.type === 'sb-init') {
     log.push({ wire, bytes: 0, pinned: true });
+  } else if (msg.type === 'captions') {
+    // only the latest caption state per session matters
+    for (let i = log.length - 1; i >= 0; i--) {
+      const w = log[i].wire;
+      if (w.type === 'captions' && w.session === msg.session) log.splice(i, 1);
+    }
+    log.push({ wire, bytes: 0, pinned: true });
   } else if (msg.type === 'append') {
     const pinned = isInitSegment(msg.data);
     const bytes = msg.data.byteLength;

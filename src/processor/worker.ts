@@ -7,9 +7,11 @@
  */
 import { createDemuxer, type Demuxer } from '../core/demux';
 import { KIM_VOCAL_2, MdxProcessor } from '../core/mdx';
+import { wordsIn } from '../core/captions';
+import type { Word } from '../core/profanity';
 import { resampleCubic } from '../core/resample';
 import { Tiling, separateWindow } from '../core/tiles';
-import { DEFAULT_FILTER, filterKey, type FilterConfig, type FromWorker, type ToWorker, type WorkerStatus } from '../shared/messages';
+import { DEFAULT_FILTER, filterKey, type CaptionState, type FilterConfig, type FromWorker, type ToWorker, type WorkerStatus } from '../shared/messages';
 import { decodePackets } from './decode';
 import { loadModel, type LoadedModel } from './model';
 import { PacketStore } from './packet-store';
@@ -25,6 +27,8 @@ const MAX_SESSIONS = 8;
 const IDLE_RELEASE_MS = 3 * 60_000;
 /** A session that stopped reporting its position (tab frozen / closed) is not worked on. */
 const POSITION_STALE_MS = 10_000;
+/** How long the profanity filter waits for a video's captions before using speech recognition. */
+const CAPTIONS_WAIT_MS = 10_000;
 
 const base = new URL('../', self.location.href).href;
 const mdx = new MdxProcessor(KIM_VOCAL_2);
@@ -37,7 +41,10 @@ function serial<T>(load: () => Promise<T>): Promise<T> {
   loadChain = p.catch(() => undefined);
   return p;
 }
-const profanity = new ProfanityStage(base, serial);
+const profanity = new ProfanityStage(base, serial, (sid, from, to) => {
+  const c = sessions.get(sid)?.captions;
+  return c?.state === 'ready' ? wordsIn(c.words, from, to) : null;
+});
 let cfgKey = filterKey(DEFAULT_FILTER);
 
 type Position = Extract<ToWorker, { type: 'position' }>;
@@ -49,6 +56,10 @@ interface Session {
   pos: Position | null;
   posAt: number;
   have: Set<number>;
+  /** Caption words for the profanity filter (see ToWorker 'captions'). */
+  captions: { state: CaptionState; words: Word[] } | null;
+  /** When this session first asked for the profanity filter (start of the captions wait). */
+  filterSince: number;
 }
 
 const sessions = new Map<number, Session>();
@@ -74,7 +85,7 @@ function post(msg: FromWorker, transfer: Transferable[] = []): void {
 function session(id: number): Session {
   let s = sessions.get(id);
   if (!s) {
-    s = { store: new PacketStore(), sbs: new Map(), lastUsed: Date.now(), pos: null, posAt: 0, have: new Set() };
+    s = { store: new PacketStore(), sbs: new Map(), lastUsed: Date.now(), pos: null, posAt: 0, have: new Set(), captions: null, filterSince: 0 };
     sessions.set(id, s);
     if (sessions.size > MAX_SESSIONS) {
       const oldest = [...sessions.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
@@ -122,6 +133,13 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
       sessions.get(m.session)?.sbs.get(m.sb)?.demuxer?.resetParser();
       break;
     }
+    case 'captions': {
+      const s = session(m.session);
+      s.captions = { state: m.state, words: m.words ?? [] };
+      schedule();
+      updateStatus(true);
+      break;
+    }
     case 'drop-session':
       sessions.delete(m.session);
       break;
@@ -142,7 +160,11 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
       }
       // Load the model as soon as a page has a video; after an idle release, only once one plays.
       if (m.enabled && f.musicRemoval && model$.model === 'idle' && (m.playing || !modelEverLoaded)) void initModel();
-      if (m.enabled && f.profanity !== 'off' && (m.playing || profanity.state !== 'idle')) profanity.ensure(() => (updateStatus(true), schedule()));
+      if (f.profanity === 'off') s.filterSince = 0;
+      else if (!s.filterSince) s.filterSince = Date.now();
+      // speech recognition only for videos without captions
+      if (m.enabled && f.profanity !== 'off' && wordsFrom(s) === 'asr' && (m.playing || profanity.state !== 'idle'))
+        profanity.ensure(() => (updateStatus(true), schedule()));
       schedule();
       updateStatus();
       break;
@@ -188,13 +210,30 @@ interface TilePick {
 
 function activeSessions(): [number, Session][] {
   const now = Date.now();
-  return [...sessions.entries()].filter(([, s]) => s.pos?.enabled && now - s.posAt < POSITION_STALE_MS && canProcess(s.pos.filter ?? DEFAULT_FILTER));
+  return [...sessions.entries()].filter(([, s]) => s.pos?.enabled && now - s.posAt < POSITION_STALE_MS && canProcess(s));
 }
 
-/** The models this config needs are loaded (a failed recognizer lets tiles go out unfiltered; the page shows why). */
-function canProcess(f: FilterConfig): boolean {
+/** Where the profanity filter takes this session's words from. */
+function wordsFrom(s: Session): 'captions' | 'asr' | 'pending' {
+  const st = s.captions?.state;
+  if (st === 'ready') return 'captions';
+  if (st === 'none') return 'asr';
+  return s.filterSince && Date.now() - s.filterSince < CAPTIONS_WAIT_MS ? 'pending' : 'asr';
+}
+
+/**
+ * What this session's config needs is there: the separation model; for the profanity filter the
+ * captions, or else the recognizer (a failed recognizer lets tiles go out unfiltered — the page
+ * shows why).
+ */
+function canProcess(s: Session): boolean {
+  const f = s.pos?.filter ?? DEFAULT_FILTER;
   if (f.musicRemoval && !model) return false;
-  if (f.profanity !== 'off' && (profanity.state === 'idle' || profanity.state === 'loading')) return false;
+  if (f.profanity !== 'off') {
+    const src = wordsFrom(s);
+    if (src === 'pending') return false;
+    if (src === 'asr' && (profanity.state === 'idle' || profanity.state === 'loading')) return false;
+  }
   return true;
 }
 
@@ -237,7 +276,7 @@ function pickFor(id: number, s: Session): TilePick | null {
     const due = Math.max(0, tiling.tileStart(k) - t) / rate + (pos.playing ? 0 : 1000);
     const [a, b] = tiling.inputRange(k);
     // with the profanity filter, tiles ahead of the playhead also wait for the recognition context
-    const after = k > kNow && pos.filter && pos.filter.profanity !== 'off' ? CONTEXT_S : 0;
+    const after = k > kNow && pos.filter && pos.filter.profanity !== 'off' && wordsFrom(s) === 'asr' ? CONTEXT_S : 0;
     if (s.store.covers(a, b + after, pos.duration)) return { sessionId: id, k, validFrom: tiling.tileStart(k), due };
     // Right after a seek the player has no audio before the new position. For the tile under
     // the playhead, separate what exists (the unheard part before it is treated as silence)
@@ -327,6 +366,7 @@ function sessionStatus(id: number, s: Session): WorkerStatus {
   }
   return {
     ...model$,
+    words: (pos.filter ?? DEFAULT_FILTER).profanity !== 'off' ? wordsFrom(s) : undefined,
     asr: profanity.state,
     asrError: profanity.error,
     asrMs: profanity.avgMs,

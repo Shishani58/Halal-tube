@@ -17,6 +17,7 @@ import {
   type WorkerStatus,
 } from '../shared/messages';
 import { timeStretch } from '../core/stretch';
+import { Captions } from './captions';
 
 declare global {
   interface Window {
@@ -502,11 +503,12 @@ declare global {
         else if (link.orphaned) text = '⚠ Расширение обновилось — обновите страницу (сейчас играет оригинал)';
         else if (state === 'offline') text = '⚠ Нет связи с обработчиком — играет оригинал';
         else if (state === 'suspended') text = `🔇 Нажмите на страницу, чтобы включить ${music ? 'звук без музыки' : 'фильтр мата'}`;
-        else if (!ws || (music && (ws.model === 'loading' || ws.model === 'idle')) || (filter && (ws.asr === 'loading' || ws.asr === 'idle' || !ws.asr)))
+        else if (!ws || (music && (ws.model === 'loading' || ws.model === 'idle')) || (filter && ws.words === 'asr' && (ws.asr === 'loading' || ws.asr === 'idle' || !ws.asr)))
           text = '⏳ Загружаю модель…';
+        else if (filter && ws.words === 'pending') text = '⏳ Получаю субтитры…';
         else if (state === 'waiting' && ws.waitFor === 'input') text = '⏳ Жду звук от YouTube…';
         else if (state === 'waiting') text = music ? '⏳ Убираю музыку…' : '⏳ Проверяю речь…';
-        else if (filter && ws.asr === 'error') text = `⚠ Фильтр мата не работает: ${ws.asrError ?? 'ошибка распознавания речи'}`;
+        else if (filter && ws.words === 'asr' && ws.asr === 'error') text = `⚠ Фильтр мата не работает: ${ws.asrError ?? 'ошибка распознавания речи'}`;
         else text = music && filter ? '🎙 Без музыки и мата' : music ? '🎙 Без музыки' : '🎙 Без мата';
 
       if (state === 'clean' || state === 'paused') {
@@ -527,9 +529,23 @@ declare global {
   })();
 
   // ───────────────────────── loop & events ─────────────────────────
+  // ───────────────────────── captions for the profanity filter ─────────────────────────
+  const captions = new Captions();
+  let capSent = { version: -1, session: 0 };
+  function syncCaptions(): void {
+    if (!active() || settings.profanity === 'off') return;
+    captions.update();
+    const sid = player.session;
+    if (!sid || (capSent.version === captions.version && capSent.session === sid)) return;
+    capSent = { version: captions.version, session: sid };
+    const r = captions.result;
+    send({ type: 'captions', session: sid, state: r.state, words: r.words, lang: r.lang, kind: r.kind });
+  }
+
   function tick(): void {
     try {
       player.tick();
+      syncCaptions();
     } catch (e) {
       console.warn('[music-remover] tick error', e);
     }
@@ -558,6 +574,7 @@ declare global {
           time: player.video?.currentTime,
           procConnected: procReady,
           link: { ...link },
+          captions: { state: captions.result.state, videoId: captions.result.videoId, words: captions.result.words.length, lang: captions.result.lang, kind: captions.result.kind },
           hookLog: hookLog.slice(-8),
           hookStats,
           videoSrc: player.video?.currentSrc?.slice(0, 60),
