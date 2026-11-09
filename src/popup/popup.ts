@@ -23,6 +23,7 @@ const STATE_TEXT: Record<PageStatus['state'], string> = {
   clean: 'Играет без музыки',
   paused: 'Пауза (готово)',
   suspended: 'Нажмите на страницу',
+  offline: 'Нет связи с обработчиком — обновите страницу',
 };
 
 async function refresh(): Promise<void> {

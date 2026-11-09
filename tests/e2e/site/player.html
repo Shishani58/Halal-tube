@@ -30,7 +30,7 @@ const feeders = [];
 function feeder(sb, bytes) {
   const idx = clusterIndex(bytes);
   const initEnd = idx.length ? idx[0].off : 0;
-  const f = { pos: 0, jumpTo: null };
+  const f = { pos: 0, jumpTo: null, finished: false };
   const step = () => {
     if (f.jumpTo !== null) {
       // abandon the partially appended cluster, re-send init, continue at the cluster for the target
@@ -42,23 +42,29 @@ function feeder(sb, bytes) {
       sb.appendBuffer(bytes.subarray(0, initEnd));
       return;
     }
-    if (f.pos >= bytes.length) { if (++done === 2) { try { ms.endOfStream(); } catch {} } return; }
+    if (f.pos >= bytes.length) { f.finished = true; if (++done === 2) { try { ms.endOfStream(); } catch {} } return; }
     if (f.jumpTo === null && ahead(sb) > 20) return setTimeout(() => step(), 250);
     const n = Math.min(bytes.length - f.pos, 3000 + Math.floor(Math.random() * 20000));
     sb.addEventListener('updateend', () => setTimeout(step, 20), { once: true });
     sb.appendBuffer(bytes.subarray(f.pos, f.pos + n));
     f.pos += n;
   };
-  f.seek = (t) => { if (ahead(sb) <= 0) f.jumpTo = t; };
+  f.seek = (t) => {
+    if (ahead(sb) > 0) return;
+    f.jumpTo = t;
+    // the feeder stops at the end of the file: a seek back into unbuffered media restarts it
+    if (f.finished) { f.finished = false; done--; step(); }
+  };
   feeders.push(f);
   step();
 }
 v.addEventListener('seeking', () => { for (const f of feeders) f.seek(v.currentTime); });
+// once: 'sourceopen' fires again when an ended stream is reopened by a later append
 ms.addEventListener('sourceopen', async () => {
   const vsb = ms.addSourceBuffer('video/webm; codecs="vp9"');
   const asb = ms.addSourceBuffer('audio/webm; codecs="opus"');
   const [vd, ad] = await Promise.all(['video.webm', 'audio.webm'].map((f) => fetch(f).then((r) => r.arrayBuffer())));
   feeder(vsb, new Uint8Array(vd));
   feeder(asb, new Uint8Array(ad));
-});
+}, { once: true });
 </script></body></html>

@@ -9,6 +9,10 @@ export type ToWorker =
       time: number;
       duration: number;
       enabled: boolean;
+      /** The video is actually playing (not paused, seeking or stalled). Playing videos go first. */
+      playing: boolean;
+      /** Playback rate, to rank how soon each video needs its next tile. */
+      rate: number;
       /** Tile indices the page currently holds around `time`. */
       have: number[];
       /** Debug: also return the original mix with each tile. */
@@ -33,7 +37,8 @@ export type FromWorker =
       mixLeft?: Float32Array;
       computeMs?: number;
     }
-  | { type: 'status'; status: WorkerStatus }
+  /** Status of one media session (`session` set) or of the model only (no session yet). */
+  | { type: 'status'; session?: number; status: WorkerStatus }
   | { type: 'tiling'; tileSeconds: number; sampleRate: number };
 
 export interface WorkerStatus {
@@ -47,6 +52,11 @@ export interface WorkerStatus {
   ahead: number;
   /** Seconds of compressed audio buffered ahead of the playhead. */
   inputAhead: number;
+  /**
+   * Why the tile under the playhead isn't there yet: 'input' — the player hasn't loaded that
+   * audio yet; 'compute' — it is queued or being separated; undefined — it's done.
+   */
+  waitFor?: 'input' | 'compute';
 }
 
 export interface Settings {
@@ -61,7 +71,8 @@ export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showB
 /** What the page reports for the popup. */
 export interface PageStatus {
   worker: WorkerStatus | null;
-  state: 'disabled' | 'no-video' | 'waiting' | 'clean' | 'paused' | 'suspended';
+  /** offline: no link to the processor (e.g. the extension was updated) — the original plays. */
+  state: 'disabled' | 'no-video' | 'waiting' | 'clean' | 'paused' | 'suspended' | 'offline';
   videoTime: number;
   sessions: number;
 }

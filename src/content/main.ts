@@ -28,7 +28,12 @@ declare global {
   // ───────────────────────── transport ─────────────────────────
   // The ISOLATED-world bridge forwards these to the extension's offscreen processor.
   let procReady = false;
+  /** Link to the processor as reported by the bridge (see bridge.ts reportLink). */
+  const link = { up: false, orphaned: false, downSince: 0 };
+  /** No link for this long while a video needs processing → give up and play the original. */
+  const LINK_GRACE_MS = 4000;
   function send(msg: ToWorker): void {
+    if (!link.up && !link.downSince) link.downSince = performance.now();
     window.postMessage({ ns: MSG_NS, from: 'main', kind: 'to-worker', msg }, '*');
   }
 
@@ -134,8 +139,18 @@ declare global {
   let tileSeconds = 253440 / 44100;
 
   window.addEventListener('message', (e: MessageEvent) => {
-    const d = e.data as { ns?: string; from?: string; kind?: string; msg?: FromWorker; settings?: Settings };
+    const d = e.data as { ns?: string; from?: string; kind?: string; msg?: FromWorker; settings?: Settings; up?: boolean; orphaned?: boolean };
     if (!d || d.ns !== MSG_NS) return;
+    if (d.from === 'bridge' && e.source === window && d.kind === 'link') {
+      const was = link.up;
+      link.up = !!d.up;
+      link.orphaned = !!d.orphaned;
+      // the grace timer starts when the page first needs the processor (send) or the link drops
+      if (link.up) link.downSince = 0;
+      else if (was) link.downSince = performance.now();
+      tick();
+      return;
+    }
     if (d.from === 'bridge' && e.source === window && d.kind === 'settings' && d.settings) {
       settings = { ...DEFAULT_SETTINGS, ...d.settings };
       tick();
@@ -150,7 +165,7 @@ declare global {
       } else if (msg.type === 'tiling') {
         tileSeconds = msg.tileSeconds;
       } else if (msg.type === 'status') {
-        workerStatus = msg.status;
+        if (msg.session === undefined || msg.session === player.session) workerStatus = msg.status;
       } else if (msg.type === 'tile') {
         player.onTile(msg);
       }
@@ -172,12 +187,13 @@ declare global {
   } catch {
     /* storage blocked */
   }
-  const dbg = { reanchors: 0, lastDrift: 0, maxDrift: 0, tilesReceived: 0, scheduledTotal: 0 };
+  const dbg = { reanchors: 0, lastDrift: 0, maxDrift: 0, tilesReceived: 0, scheduledTotal: 0, arrivals: [] as string[] };
   interface Attached {
     orig: GainNode;
   }
 
   let lastPosSent = 0;
+  let lastPos = { time: 0, playing: false, rate: 1, session: 0 };
 
   const player = new (class Player {
     ctx: AudioContext | null = null;
@@ -193,6 +209,10 @@ declare global {
 
     onTile(msg: Extract<FromWorker, { type: 'tile' }>): void {
       if (msg.session !== this.session) return;
+      if (debugMode) {
+        dbg.arrivals.push(`k${msg.k}@${(this.video?.currentTime ?? 0).toFixed(1)} ${Math.round(msg.computeMs ?? 0)}ms vf=${msg.validFrom.toFixed(1)}`);
+        if (dbg.arrivals.length > 30) dbg.arrivals.shift();
+      }
       const buf = new AudioBuffer({ numberOfChannels: 2, length: msg.left.length, sampleRate: msg.sampleRate });
       buf.copyToChannel(msg.left as Float32Array<ArrayBuffer>, 0);
       buf.copyToChannel(msg.right as Float32Array<ArrayBuffer>, 1);
@@ -321,6 +341,18 @@ declare global {
       const a = this.attach(v);
       const ctx = this.ctx;
       if (!a || !ctx || !this.clean) return;
+
+      // Processor unreachable or broken: never leave the viewer in silence — play the original.
+      const offline =
+        link.orphaned || (!link.up && link.downSince > 0 && performance.now() - link.downSince > LINK_GRACE_MS);
+      if (offline || workerStatus?.model === 'error') {
+        a.orig.gain.setTargetAtTime(1, ctx.currentTime, 0.015);
+        this.stopAll();
+        this.state = 'offline';
+        badge.update(v, this.state);
+        this.sendPosition(v, true);
+        return;
+      }
       if (ctx.state === 'suspended') void ctx.resume().catch(() => undefined);
 
       const t = v.currentTime;
@@ -388,8 +420,13 @@ declare global {
 
     sendPosition(v: HTMLVideoElement, enabled: boolean): void {
       const now = performance.now();
-      if (now - lastPosSent < 250) return;
+      // A jump (seek, new video) goes out at once so the processor stops working on the old spot.
+      const expected = lastPos.time + (lastPos.playing ? ((now - lastPosSent) / 1000) * lastPos.rate : 0);
+      const jumped = Math.abs(v.currentTime - expected) > 0.5 || this.session !== lastPos.session;
+      if (now - lastPosSent < 250 && !jumped) return;
       lastPosSent = now;
+      const playing = !v.paused && !v.ended && !v.seeking && v.readyState >= 3;
+      lastPos = { time: v.currentTime, playing, rate: v.playbackRate || 1, session: this.session };
       if (!this.session) return;
       send({
         type: 'position',
@@ -397,6 +434,8 @@ declare global {
         time: v.currentTime,
         duration: Number.isFinite(v.duration) ? v.duration : Infinity,
         enabled,
+        playing,
+        rate: v.playbackRate || 1,
         have: [...this.tiles.keys()],
         debug: debugMode,
       });
@@ -436,9 +475,12 @@ declare global {
 
       const ws = workerStatus;
       let text: string;
-      if (ws?.model === 'error') text = `⚠ Music Remover: ${ws.error ?? 'ошибка модели'}`;
+      if (ws?.model === 'error') text = `⚠ Music Remover: ${ws.error ?? 'ошибка модели'} — играет оригинал`;
+      else if (link.orphaned) text = '⚠ Расширение обновилось — обновите страницу (сейчас играет оригинал)';
+      else if (state === 'offline') text = '⚠ Нет связи с обработчиком — играет оригинал';
       else if (state === 'suspended') text = '🔇 Нажмите на страницу, чтобы включить звук без музыки';
       else if (!ws || ws.model === 'loading' || ws.model === 'idle') text = '⏳ Загружаю модель…';
+      else if (state === 'waiting' && ws.waitFor === 'input') text = '⏳ Жду звук от YouTube…';
       else if (state === 'waiting') text = '⏳ Убираю музыку…';
       else text = '🎙 Без музыки';
 
@@ -490,6 +532,7 @@ declare global {
           worker: workerStatus,
           time: player.video?.currentTime,
           procConnected: procReady,
+          link: { ...link },
           hookLog: hookLog.slice(-8),
           hookStats,
           videoSrc: player.video?.currentSrc?.slice(0, 60),
