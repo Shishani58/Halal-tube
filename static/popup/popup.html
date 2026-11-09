@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Music Remover</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <img src="../icons/icon48.png" width="28" height="28" alt="" />
+    <h1>Без музыки</h1>
+    <label class="switch" title="Включить / выключить">
+      <input id="enabled" type="checkbox" />
+      <span></span>
+    </label>
+  </header>
+
+  <section class="status" id="status">
+    <div class="row"><span>Состояние</span><b id="st-state">—</b></div>
+    <div class="row"><span>Модель</span><b id="st-model">—</b></div>
+    <div class="row"><span>Скорость обработки</span><b id="st-speed">—</b></div>
+    <div class="row"><span>Готово вперёд</span><b id="st-ahead">—</b></div>
+  </section>
+
+  <section class="opts">
+    <label class="opt">
+      <input type="radio" name="mode" value="strict" />
+      <div><b>Строгий режим</b><small>Пока чистый звук не готов — тишина. Музыка не прозвучит никогда.</small></div>
+    </label>
+    <label class="opt">
+      <input type="radio" name="mode" value="lenient" />
+      <div><b>Мягкий режим</b><small>Пока чистый звук не готов — играет оригинал.</small></div>
+    </label>
+    <label class="check">
+      <input id="showBadge" type="checkbox" /> Показывать значок на видео
+    </label>
+  </section>
+
+  <footer>Работает на YouTube. Обработка идёт локально, на вашем компьютере.</footer>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

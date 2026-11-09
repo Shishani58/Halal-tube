@@ -1,0 +1,30 @@
+{
+  "name": "music-remover-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fetch-model": "node scripts/fetch-model.mjs",
+    "build": "node scripts/build.mjs",
+    "build:test": "node scripts/build.mjs --test",
+    "watch": "node scripts/build.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "sh tests/make-fixtures.sh && tsx tests/run-all.ts",
+    "test:separation": "tsx tests/separation.node.ts",
+    "test:e2e": "sh tests/e2e/make-media.sh && node scripts/build.mjs --test && node tests/e2e/local.mjs",
+    "bench": "node tests/e2e/bench.mjs webgpu",
+    "package": "node scripts/build.mjs && cd dist && zip -qr ../music-remover.zip . && echo music-remover.zip"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.7",
+    "@webgpu/types": "^0.1.74",
+    "esbuild": "^0.28.2",
+    "onnxruntime-node": "^1.31.1",
+    "playwright": "^1.65.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.31.1"
+  }
+}

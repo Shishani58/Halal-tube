@@ -1,0 +1,37 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>MSE test player</title>
+<style>body{font:14px system-ui;margin:20px;background:#0f0f0f;color:#eee}.html5-video-player{position:relative;width:640px}</style></head>
+<body>
+<h3>Local MSE player (YouTube-like: separate audio/video SourceBuffers, streamed appends)</h3>
+<div class="html5-video-player"><video id="v" width="640" height="360" controls></video></div>
+<script>
+// Streams DASH WebM files into MediaSource in random-sized pieces, keeping ~20 s buffered ahead.
+const v = document.getElementById('v');
+const ms = new MediaSource();
+v.src = URL.createObjectURL(ms);
+const ahead = (sb) => {
+  const b = sb.buffered, t = v.currentTime;
+  for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.1 && b.end(i) > t) return b.end(i) - t;
+  return 0;
+};
+let done = 0;
+function feeder(sb, bytes) {
+  let pos = 0;
+  const step = () => {
+    if (pos >= bytes.length) { if (++done === 2) { try { ms.endOfStream(); } catch {} } return; }
+    if (ahead(sb) > 20) return setTimeout(step, 250);
+    const n = Math.min(bytes.length - pos, 3000 + Math.floor(Math.random() * 20000));
+    sb.addEventListener('updateend', () => setTimeout(step, 20), { once: true });
+    sb.appendBuffer(bytes.subarray(pos, pos + n));
+    pos += n;
+  };
+  step();
+}
+ms.addEventListener('sourceopen', async () => {
+  const vsb = ms.addSourceBuffer('video/webm; codecs="vp9"');
+  const asb = ms.addSourceBuffer('audio/webm; codecs="opus"');
+  const [vd, ad] = await Promise.all(['video.webm', 'audio.webm'].map((f) => fetch(f).then((r) => r.arrayBuffer())));
+  feeder(vsb, new Uint8Array(vd));
+  feeder(asb, new Uint8Array(ad));
+});
+</script></body></html>

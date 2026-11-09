@@ -1,0 +1,533 @@
+/**
+ * Runs in the page's MAIN world at document_start.
+ *  1. Hooks Media Source Extensions to copy audio segments as the player buffers them.
+ *  2. Forwards them to the extension's processor iframe.
+ *  3. Mutes the original track and plays the separated (voice-only) audio in sync.
+ */
+import {
+  DEFAULT_SETTINGS,
+  MSG_NS,
+  type FromWorker,
+  type PageStatus,
+  type Settings,
+  type ToWorker,
+  type WorkerStatus,
+} from '../shared/messages';
+import { timeStretch } from '../core/stretch';
+
+declare global {
+  interface Window {
+    __musicRemoverMain?: boolean;
+  }
+}
+
+(() => {
+  if (window.__musicRemoverMain) return;
+  window.__musicRemoverMain = true;
+
+  // ───────────────────────── transport ─────────────────────────
+  let procWin: Window | null = null;
+  let procOrigin = '';
+  const queue: { msg: ToWorker; transfer: Transferable[] }[] = [];
+  let queuedBytes = 0;
+
+  function send(msg: ToWorker, transfer: Transferable[] = []): void {
+    if (procWin) {
+      try {
+        procWin.postMessage({ ns: MSG_NS, msg }, procOrigin, transfer);
+        return;
+      } catch {
+        procWin = null;
+      }
+    }
+    if (msg.type === 'position') return; // stale positions are useless
+    queue.push({ msg, transfer });
+    if (msg.type === 'append') queuedBytes += msg.data.byteLength;
+    // keep memory bounded if the processor never shows up
+    while (queuedBytes > 64 * 1024 * 1024 && queue.length) {
+      const old = queue.shift()!;
+      if (old.msg.type === 'append') queuedBytes -= old.msg.data.byteLength;
+    }
+  }
+
+  // ───────────────────────── MSE hooks ─────────────────────────
+  let nextId = 1;
+  const msIds = new WeakMap<MediaSource, number>();
+  const sbMeta = new WeakMap<SourceBuffer, { id: number; session: number; audio: boolean; mime: string }>();
+  const urlSession = new Map<string, number>();
+
+  const msId = (ms: MediaSource): number => {
+    let id = msIds.get(ms);
+    if (!id) {
+      id = nextId++;
+      msIds.set(ms, id);
+    }
+    return id;
+  };
+
+  const hookLog: string[] = [];
+  const hookStats = { appends: 0, audioAppends: 0, audioBytes: 0, unknownSb: 0 };
+  const toArrayBuffer = (data: BufferSource): ArrayBuffer => {
+    if (data instanceof ArrayBuffer) return data.slice(0);
+    const v = data as ArrayBufferView;
+    return (v.buffer as ArrayBuffer).slice(v.byteOffset, v.byteOffset + v.byteLength);
+  };
+
+  const MS = window.MediaSource;
+  const SB = window.SourceBuffer;
+  if (MS && SB) {
+    const origAdd = MS.prototype.addSourceBuffer;
+    MS.prototype.addSourceBuffer = function (this: MediaSource, mime: string): SourceBuffer {
+      const sb = origAdd.call(this, mime);
+      try {
+        const meta = { id: nextId++, session: msId(this), audio: /^audio\//i.test(mime), mime };
+        sbMeta.set(sb, meta);
+        hookLog.push(`addSourceBuffer(${mime}) ms=${meta.session}`);
+        if (meta.audio) send({ type: 'sb-init', session: meta.session, sb: meta.id, mime });
+      } catch {
+        /* never break the player */
+      }
+      return sb;
+    };
+
+    const origAppend = SB.prototype.appendBuffer;
+    SB.prototype.appendBuffer = function (this: SourceBuffer, data: BufferSource): void {
+      const meta = sbMeta.get(this);
+      hookStats.appends++;
+      if (!meta) hookStats.unknownSb++;
+      if (meta?.audio) {
+        hookStats.audioAppends++;
+        try {
+          const copy = toArrayBuffer(data);
+          hookStats.audioBytes += copy.byteLength;
+          send({ type: 'append', session: meta.session, sb: meta.id, data: copy, tsOffset: this.timestampOffset }, [copy]);
+        } catch {
+          /* ignore */
+        }
+      }
+      return origAppend.call(this, data);
+    };
+
+    const origAbort = SB.prototype.abort;
+    SB.prototype.abort = function (this: SourceBuffer): void {
+      const meta = sbMeta.get(this);
+      if (meta?.audio) send({ type: 'abort', session: meta.session, sb: meta.id });
+      return origAbort.call(this);
+    };
+
+    const origChangeType = SB.prototype.changeType;
+    if (origChangeType) {
+      SB.prototype.changeType = function (this: SourceBuffer, mime: string): void {
+        const meta = sbMeta.get(this);
+        if (meta) {
+          meta.audio = /^audio\//i.test(mime) || meta.audio;
+          meta.mime = mime;
+          if (meta.audio) send({ type: 'sb-init', session: meta.session, sb: meta.id, mime });
+        }
+        return origChangeType.call(this, mime);
+      };
+    }
+
+    const origCreate = URL.createObjectURL;
+    URL.createObjectURL = function (obj: Blob | MediaSource): string {
+      const url = origCreate.call(URL, obj);
+      try {
+        if (obj instanceof MS) urlSession.set(url, msId(obj));
+      } catch {
+        /* ignore */
+      }
+      return url;
+    };
+  }
+
+  const sessionOf = (v: HTMLVideoElement): number => {
+    const so = v.srcObject as unknown;
+    if (MS && so instanceof MS) return msId(so);
+    return urlSession.get(v.currentSrc || v.src) ?? 0;
+  };
+
+  // ───────────────────────── settings & messages ─────────────────────────
+  let settings: Settings = { ...DEFAULT_SETTINGS };
+  let workerStatus: WorkerStatus | null = null;
+  let tileSeconds = 253440 / 44100;
+
+  window.addEventListener('message', (e: MessageEvent) => {
+    const d = e.data as { ns?: string; from?: string; kind?: string; msg?: FromWorker; settings?: Settings };
+    if (!d || d.ns !== MSG_NS) return;
+    if (d.from === 'bridge' && e.source === window && d.kind === 'settings' && d.settings) {
+      settings = { ...DEFAULT_SETTINGS, ...d.settings };
+      tick();
+      return;
+    }
+    if (d.from === 'processor' && d.msg && typeof e.origin === 'string' && e.origin.startsWith('chrome-extension://')) {
+      const msg = d.msg;
+      if (msg.type === 'ready') {
+        procWin = e.source as Window;
+        procOrigin = e.origin;
+        const pending = queue.splice(0);
+        queuedBytes = 0;
+        for (const q of pending) send(q.msg, q.transfer);
+        lastPosSent = 0;
+        tick();
+      } else if (msg.type === 'tiling') {
+        tileSeconds = msg.tileSeconds;
+      } else if (msg.type === 'status') {
+        workerStatus = msg.status;
+      } else if (msg.type === 'tile') {
+        player.onTile(msg);
+      }
+    }
+  });
+  window.postMessage({ ns: MSG_NS, from: 'main', kind: 'get-settings' }, '*');
+
+  // ───────────────────────── player ─────────────────────────
+  interface Tile {
+    buf: AudioBuffer;
+    start: number;
+    mix?: Float32Array;
+    stretched?: { rate: number; buf: AudioBuffer };
+  }
+  let debugMode = false;
+  try {
+    debugMode = localStorage.getItem('__mr_debug') === '1';
+  } catch {
+    /* storage blocked */
+  }
+  const dbg = { reanchors: 0, lastDrift: 0, maxDrift: 0, tilesReceived: 0, scheduledTotal: 0 };
+  interface Attached {
+    orig: GainNode;
+  }
+
+  let lastPosSent = 0;
+
+  const player = new (class Player {
+    ctx: AudioContext | null = null;
+    clean: GainNode | null = null;
+    attached = new WeakMap<HTMLVideoElement, Attached>();
+    video: HTMLVideoElement | null = null;
+    session = 0;
+    tiles = new Map<number, Tile>();
+    scheduled = new Map<number, AudioBufferSourceNode>();
+    anchor: { c0: number; t0: number; rate: number } | null = null;
+    driftStrikes = 0;
+    state: PageStatus['state'] = 'no-video';
+
+    onTile(msg: Extract<FromWorker, { type: 'tile' }>): void {
+      if (msg.session !== this.session) return;
+      const buf = new AudioBuffer({ numberOfChannels: 2, length: msg.left.length, sampleRate: msg.sampleRate });
+      buf.copyToChannel(msg.left as Float32Array<ArrayBuffer>, 0);
+      buf.copyToChannel(msg.right as Float32Array<ArrayBuffer>, 1);
+      this.tiles.set(msg.k, { buf, start: msg.start, mix: msg.mixLeft });
+      dbg.tilesReceived++;
+      tick();
+    }
+
+    bufferFor(tile: Tile, rate: number): AudioBuffer {
+      if (Math.abs(rate - 1) < 1e-3) return tile.buf;
+      if (tile.stretched?.rate === rate) return tile.stretched.buf;
+      const [l, r] = timeStretch(tile.buf.getChannelData(0), tile.buf.getChannelData(1), rate);
+      const buf = new AudioBuffer({ numberOfChannels: 2, length: l.length, sampleRate: tile.buf.sampleRate });
+      buf.copyToChannel(l as Float32Array<ArrayBuffer>, 0);
+      buf.copyToChannel(r as Float32Array<ArrayBuffer>, 1);
+      tile.stretched = { rate, buf };
+      return buf;
+    }
+
+    ensureCtx(): AudioContext {
+      if (!this.ctx) {
+        this.ctx = new AudioContext({ latencyHint: 'playback' });
+        this.clean = this.ctx.createGain();
+        this.clean.connect(this.ctx.destination);
+      }
+      return this.ctx;
+    }
+
+    attach(v: HTMLVideoElement): Attached | null {
+      let a = this.attached.get(v);
+      if (a) return a;
+      const ctx = this.ensureCtx();
+      try {
+        const src = ctx.createMediaElementSource(v);
+        const orig = ctx.createGain();
+        src.connect(orig).connect(ctx.destination);
+        a = { orig };
+        this.attached.set(v, a);
+        return a;
+      } catch (e) {
+        console.warn('[music-remover] cannot attach to video', e);
+        return null;
+      }
+    }
+
+    stopAll(): void {
+      for (const s of this.scheduled.values()) {
+        try {
+          s.stop();
+          s.disconnect();
+        } catch {
+          /* already stopped */
+        }
+      }
+      this.scheduled.clear();
+      this.anchor = null;
+      this.driftStrikes = 0;
+    }
+
+    resetSession(id: number): void {
+      this.stopAll();
+      this.tiles.clear();
+      this.session = id;
+    }
+
+    pickVideo(): HTMLVideoElement | null {
+      const vids = Array.from(document.querySelectorAll('video'));
+      let best: HTMLVideoElement | null = null;
+      let bestScore = -1;
+      for (const v of vids) {
+        const r = v.getBoundingClientRect();
+        let score = r.width * r.height;
+        if (sessionOf(v)) score += 1e7;
+        if (!v.paused) score += 1e8;
+        if (score > bestScore) {
+          best = v;
+          bestScore = score;
+        }
+      }
+      return best;
+    }
+
+    tileAt(t: number): number {
+      return Math.floor(t / tileSeconds + 1e-9);
+    }
+
+    /** ctx time at which media time `m` should be heard, given current video state. */
+    ctxTimeFor(m: number, t: number, rate: number): number {
+      const ctx = this.ctx!;
+      const ts = ctx.getOutputTimestamp?.();
+      const nowPerf = performance.now();
+      if (ts && ts.contextTime && ts.performanceTime) {
+        const targetPerf = nowPerf + ((m - t) / rate) * 1000;
+        return ts.contextTime + (targetPerf - ts.performanceTime) / 1000;
+      }
+      const lat = (ctx.baseLatency || 0) + (ctx.outputLatency || 0);
+      return ctx.currentTime + (m - t) / rate - lat;
+    }
+
+    tick(): void {
+      const v = this.pickVideo();
+      if (v !== this.video) {
+        this.stopAll();
+        this.video = v;
+      }
+      if (!v) {
+        this.state = 'no-video';
+        badge.update(null, this.state);
+        return;
+      }
+      const sid = sessionOf(v);
+      if (sid !== this.session) this.resetSession(sid);
+
+      if (!settings.enabled || !sid) {
+        const a = this.attached.get(v);
+        if (a) a.orig.gain.value = 1;
+        this.stopAll();
+        this.state = settings.enabled ? 'no-video' : 'disabled';
+        badge.update(v, this.state);
+        this.sendPosition(v, false);
+        return;
+      }
+
+      const a = this.attach(v);
+      const ctx = this.ctx;
+      if (!a || !ctx || !this.clean) return;
+      if (ctx.state === 'suspended') void ctx.resume().catch(() => undefined);
+
+      const t = v.currentTime;
+      const rate = v.playbackRate || 1;
+      const k = this.tileAt(t);
+      const hasNow = this.tiles.has(k);
+      const origTarget = settings.mode === 'lenient' && !hasNow ? 1 : 0;
+      a.orig.gain.setTargetAtTime(origTarget, ctx.currentTime, 0.015);
+      this.clean.gain.value = v.muted ? 0 : v.volume;
+
+      const playing = !v.paused && !v.ended && !v.seeking && v.readyState >= 3;
+      if (!playing || ctx.state !== 'running') {
+        this.stopAll();
+        this.state = ctx.state !== 'running' ? 'suspended' : hasNow ? 'paused' : 'waiting';
+      } else {
+        if (this.anchor) {
+          const expected = this.anchor.c0 + (t - this.anchor.t0) / this.anchor.rate;
+          const actual = this.ctxTimeFor(t, t, rate);
+          const drift = Math.abs(expected - actual);
+          dbg.lastDrift = drift;
+          dbg.maxDrift = Math.max(dbg.maxDrift, drift);
+          if (this.anchor.rate !== rate || drift > 0.25) this.stopAll();
+          else if (drift > 0.05) {
+            if (++this.driftStrikes >= 3) this.stopAll();
+          } else this.driftStrikes = 0;
+        }
+        if (!this.anchor) {
+          this.anchor = { c0: this.ctxTimeFor(t, t, rate), t0: t, rate };
+          dbg.reanchors++;
+        }
+        const minWhen = ctx.currentTime + 0.01;
+        for (let kk = k; kk <= k + 1; kk++) {
+          const tile = this.tiles.get(kk);
+          if (!tile || this.scheduled.has(kk)) continue;
+          // Off 1×, play a pitch-preserving time-stretched copy at its natural speed.
+          const buf = this.bufferFor(tile, rate);
+          let when = this.anchor.c0 + (tile.start - this.anchor.t0) / rate;
+          let offset = 0;
+          if (when < minWhen) {
+            offset = minWhen - when;
+            when = minWhen;
+          }
+          if (offset >= buf.duration - 0.005) continue;
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.connect(this.clean);
+          src.start(when, offset);
+          src.onended = () => {
+            if (this.scheduled.get(kk) === src) this.scheduled.delete(kk);
+          };
+          this.scheduled.set(kk, src);
+          dbg.scheduledTotal++;
+        }
+        this.state = hasNow ? 'clean' : 'waiting';
+      }
+
+      for (const kk of this.tiles.keys()) if (kk < k - 3 || kk > k + 40) this.tiles.delete(kk);
+      badge.update(v, this.state);
+      this.sendPosition(v, true);
+    }
+
+    sendPosition(v: HTMLVideoElement, enabled: boolean): void {
+      const now = performance.now();
+      if (now - lastPosSent < 250) return;
+      lastPosSent = now;
+      if (!this.session) return;
+      send({
+        type: 'position',
+        session: this.session,
+        time: v.currentTime,
+        duration: Number.isFinite(v.duration) ? v.duration : Infinity,
+        enabled,
+        have: [...this.tiles.keys()],
+        debug: debugMode,
+      });
+    }
+  })();
+
+  // ───────────────────────── on-video badge ─────────────────────────
+  const badge = new (class Badge {
+    el: HTMLDivElement | null = null;
+    lastText = '';
+    cleanSince = 0;
+
+    update(v: HTMLVideoElement | null, state: PageStatus['state']): void {
+      if (!v || !settings.showBadge || state === 'disabled' || state === 'no-video') {
+        this.hide();
+        return;
+      }
+      const host = (v.closest('.html5-video-player') as HTMLElement | null) ?? v.parentElement;
+      if (!host) return;
+      if (!this.el) {
+        this.el = document.createElement('div');
+        Object.assign(this.el.style, {
+          position: 'absolute',
+          top: '12px',
+          left: '12px',
+          zIndex: '70',
+          padding: '5px 10px',
+          borderRadius: '14px',
+          background: 'rgba(0,0,0,.72)',
+          color: '#fff',
+          font: '500 13px/1.3 system-ui, -apple-system, Roboto, Arial, sans-serif',
+          pointerEvents: 'none',
+          transition: 'opacity .4s',
+        } satisfies Partial<CSSStyleDeclaration>);
+      }
+      if (this.el.parentElement !== host) host.appendChild(this.el);
+
+      const ws = workerStatus;
+      let text: string;
+      if (ws?.model === 'error') text = `⚠ Music Remover: ${ws.error ?? 'ошибка модели'}`;
+      else if (state === 'suspended') text = '🔇 Нажмите на страницу, чтобы включить звук без музыки';
+      else if (!ws || ws.model === 'loading' || ws.model === 'idle') text = '⏳ Загружаю модель…';
+      else if (state === 'waiting') text = '⏳ Убираю музыку…';
+      else text = '🎙 Без музыки';
+
+      if (state === 'clean' || state === 'paused') {
+        if (!this.cleanSince) this.cleanSince = performance.now();
+      } else this.cleanSince = 0;
+      const fade = this.cleanSince && performance.now() - this.cleanSince > 2500;
+      this.el.style.opacity = fade ? '0' : '1';
+      if (text !== this.lastText) {
+        this.el.textContent = text;
+        this.lastText = text;
+      }
+    }
+
+    hide(): void {
+      if (this.el) this.el.style.opacity = '0';
+      this.cleanSince = 0;
+    }
+  })();
+
+  // ───────────────────────── loop & events ─────────────────────────
+  function tick(): void {
+    try {
+      player.tick();
+    } catch (e) {
+      console.warn('[music-remover] tick error', e);
+    }
+  }
+
+  for (const ev of ['play', 'playing', 'pause', 'seeking', 'seeked', 'ratechange', 'waiting', 'emptied', 'loadstart', 'volumechange', 'ended']) {
+    document.addEventListener(ev, tick, true);
+  }
+  const resume = () => {
+    if (player.ctx?.state === 'suspended') void player.ctx.resume().then(tick, () => undefined);
+  };
+  for (const ev of ['pointerdown', 'keydown']) window.addEventListener(ev, resume, true);
+  setInterval(tick, 100);
+
+  if (debugMode) {
+    (window as unknown as Record<string, unknown>).__musicRemoverDebug = {
+      get info() {
+        return {
+          ...dbg,
+          state: player.state,
+          session: player.session,
+          tiles: [...player.tiles.keys()].sort((a, b) => a - b),
+          scheduled: [...player.scheduled.keys()],
+          ctxState: player.ctx?.state,
+          worker: workerStatus,
+          time: player.video?.currentTime,
+          procConnected: !!procWin,
+          hookLog: hookLog.slice(-8),
+          hookStats,
+          videoSrc: player.video?.currentSrc?.slice(0, 60),
+          paused: player.video?.paused,
+          readyState: player.video?.readyState,
+        };
+      },
+      tile(k: number) {
+        const t = player.tiles.get(k);
+        if (!t) return null;
+        const q = (a: Float32Array) => Array.from(a, (x) => Math.round(Math.max(-1, Math.min(1, x)) * 32767));
+        return { start: t.start, clean: q(t.buf.getChannelData(0)), mix: t.mix ? q(t.mix) : null };
+      },
+    };
+  }
+
+  setInterval(() => {
+    const status: PageStatus = {
+      worker: workerStatus,
+      state: player.state,
+      videoTime: player.video?.currentTime ?? 0,
+      sessions: nextId,
+    };
+    window.postMessage({ ns: MSG_NS, from: 'main', kind: 'status', status }, '*');
+  }, 1000);
+})();
