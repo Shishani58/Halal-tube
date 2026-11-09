@@ -28,6 +28,13 @@ const ID = {
   Attachments: 0x1941a469,
 } as const;
 
+/** Elements that may legitimately appear inside a Cluster. */
+const CLUSTER_CHILDREN = new Set<number>([ID.Timecode, ID.SimpleBlock, ID.BlockGroup, 0xec /* Void */, 0xbf /* CRC-32 */, 0xab /* PrevSize */, 0xa7 /* Position */, 0x5854 /* SilentTracks */, 0xaf /* EncryptedBlock */]);
+const MAX_SKIP = 32 * 1024 * 1024;
+
+const startsWith = (b: Uint8Array, id: number) =>
+  b.length >= 4 && b[0] === id >>> 24 && b[1] === ((id >>> 16) & 0xff) && b[2] === ((id >>> 8) & 0xff) && b[3] === (id & 0xff);
+
 /** Level-1 children of Segment: seeing one closes any open (unknown-size) Cluster. */
 const LEVEL1 = new Set<number>([ID.SeekHead, ID.Info, ID.Tracks, ID.Cluster, ID.Cues, ID.Tags, ID.Chapters, ID.Attachments]);
 
@@ -54,6 +61,14 @@ export class WebmDemuxer implements Demuxer {
 
   push(bytes: Uint8Array, timestampOffset: number): Packet[] {
     const out: Packet[] = [];
+    // Players (YouTube SABR) append clusters in pieces and may abandon a partially appended
+    // cluster on seek / quality switch. An append that begins with a Cluster or EBML header
+    // always starts a new element: drop whatever partial element we were waiting on.
+    if (startsWith(bytes, ID.Cluster) || startsWith(bytes, ID.EBML)) {
+      this.q.clear();
+      this.skip = 0;
+      this.stack = this.config && !startsWith(bytes, ID.EBML) ? [{ id: ID.Segment, end: Infinity }] : [];
+    }
     this.q.push(bytes);
     for (;;) {
       if (this.skip > 0) {
@@ -76,6 +91,15 @@ export class WebmDemuxer implements Demuxer {
       const id = idv.value;
       const hdr = idv.len + szv.len;
       const size = szv.value; // -1 = unknown
+      const inCluster = this.stack.length > 0 && this.stack[this.stack.length - 1].id === ID.Cluster;
+      const garbage =
+        id < 0 ||
+        size > MAX_SKIP ||
+        (inCluster && !CLUSTER_CHILDREN.has(id) && !LEVEL1.has(id) && id !== ID.EBML && id !== ID.Segment);
+      if (garbage) {
+        if (!this.resync()) break;
+        continue;
+      }
 
       if (id === ID.EBML) {
         this.stack = [];
@@ -135,6 +159,23 @@ export class WebmDemuxer implements Demuxer {
       this.q.consume(hdr + size);
     }
     return out;
+  }
+
+  /** Lost sync: jump to the next Cluster/EBML header. Returns false if none is buffered yet. */
+  private resync(): boolean {
+    const v = this.q.view();
+    for (let i = 1; i + 4 <= v.length; i++) {
+      if (
+        (v[i] === 0x1f && v[i + 1] === 0x43 && v[i + 2] === 0xb6 && v[i + 3] === 0x75) ||
+        (v[i] === 0x1a && v[i + 1] === 0x45 && v[i + 2] === 0xdf && v[i + 3] === 0xa3)
+      ) {
+        this.q.consume(i);
+        this.stack = this.config ? [{ id: ID.Segment, end: Infinity }] : [];
+        return true;
+      }
+    }
+    this.q.consume(Math.max(0, v.length - 3));
+    return false;
   }
 
   private parseInfo(body: Uint8Array): void {

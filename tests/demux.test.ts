@@ -72,3 +72,47 @@ test('Opus TOC duration', () => {
   assert(opusPacketDuration(new Uint8Array([0xfd])) === 0.04, 'two frames');
   assert(opusPacketDuration(new Uint8Array([0x18])) === 0.06, 'SILK 60ms');
 });
+
+// YouTube (SABR) appends clusters in ~16 KB pieces and, on seek / quality switch, abandons a
+// partially appended cluster and continues with a fresh cluster (sometimes after a new init).
+function clusterStarts(b: Uint8Array): number[] {
+  const out: number[] = [];
+  for (let i = 0; i + 4 <= b.length; i++) if (b[i] === 0x1f && b[i + 1] === 0x43 && b[i + 2] === 0xb6 && b[i + 3] === 0x75) out.push(i);
+  return out;
+}
+
+test('WebM: recovers after an abandoned partial cluster (SABR-style)', () => {
+  if (!have) return;
+  const data = new Uint8Array(readFileSync(`${FIX}/a.webm`));
+  const cs = clusterStarts(data);
+  assert(cs.length >= 4, `clusters ${cs.length}`);
+  const init = data.subarray(0, cs[0]);
+  const d = createDemuxer('audio/webm')!;
+  const out: Packet[] = [];
+  out.push(...d.push(init.slice(), 0));
+  // cluster 0 fully, in 16 KB pieces
+  for (let p = cs[0]; p < cs[1]; p += 16384) out.push(...d.push(data.slice(p, Math.min(p + 16384, cs[1])), 0));
+  // cluster 1: only the first 5000 bytes, then abandoned
+  out.push(...d.push(data.slice(cs[1], cs[1] + 5000), 0));
+  // jump: cluster 3 complete (no init), then a re-sent init + cluster 4 piecewise
+  out.push(...d.push(data.slice(cs[3], cs[4]), 0));
+  out.push(...d.push(init.slice(), 0));
+  const end4 = cs[5] ?? data.length;
+  for (let p = cs[4]; p < end4; p += 16384) out.push(...d.push(data.slice(p, Math.min(p + 16384, end4)), 0));
+  const ref = feed('a.webm', 'audio/webm', whole);
+  // reference packets of a cluster = demux(init + that cluster) alone
+  const clusterPk = (k: number) => {
+    const dd = createDemuxer('audio/webm')!;
+    dd.push(init.slice(), 0);
+    return dd.push(data.slice(cs[k], cs[k + 1] ?? data.length), 0);
+  };
+  const want = [...feed('a.webm', 'audio/webm', whole).filter((p) => p.ts < clusterPk(1)[0].ts - 1e-6), ...clusterPk(3), ...clusterPk(4)];
+  const firstOf1 = clusterPk(1)[0].ts;
+  const got = out.filter((p) => p.ts < firstOf1 - 1e-6 || p.ts >= clusterPk(3)[0].ts - 1e-6);
+  assert(got.length >= want.length, `packets ${got.length} vs expected ≥ ${want.length}`);
+  for (const w of want) {
+    const g = out.find((x) => Math.abs(x.ts - w.ts) < 1e-6);
+    assert(g && g.data.length === w.data.length, `packet @${w.ts.toFixed(3)} present`);
+  }
+  void ref;
+});

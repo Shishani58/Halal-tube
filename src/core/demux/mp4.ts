@@ -1,5 +1,7 @@
 import { ByteQueue, configKey, type Demuxer, type Packet, type TrackConfig } from './types';
 
+const SEGMENT_START = new Set(['moof', 'styp', 'ftyp', 'sidx', 'emsg', 'moov', 'prft']);
+
 interface TrackInfo {
   id: number;
   timescale: number;
@@ -31,6 +33,12 @@ export class Mp4Demuxer implements Demuxer {
 
   push(bytes: Uint8Array, timestampOffset: number): Packet[] {
     const out: Packet[] = [];
+    // A new top-level box at the start of an append means any partially appended
+    // fragment was abandoned (seek / quality switch): start clean.
+    if (bytes.length >= 8 && SEGMENT_START.has(fourcc(bytes, 4))) {
+      this.q.clear();
+      this.pending = null;
+    }
     this.q.push(bytes);
     for (;;) {
       const v = this.q.view();
@@ -38,6 +46,17 @@ export class Mp4Demuxer implements Demuxer {
       const dv = new DataView(v.buffer, v.byteOffset, v.byteLength);
       let size = dv.getUint32(0);
       const type = fourcc(v, 4);
+      if (!/^[a-z0-9 ]{4}$/i.test(type) || (size !== 1 && size !== 0 && size < 8)) {
+        // lost sync: look for the next fragment / init box
+        let found = -1;
+        for (let i = 1; i + 8 <= v.length; i++) {
+          if (SEGMENT_START.has(fourcc(v, i + 4))) { found = i; break; }
+        }
+        if (found < 0) { this.q.consume(Math.max(0, v.length - 7)); break; }
+        this.q.consume(found);
+        this.pending = null;
+        continue;
+      }
       let hdr = 8;
       if (size === 1) {
         if (v.length < 16) break;
