@@ -1,6 +1,7 @@
 node_modules/
 dist/
 models/*.onnx
+models/whisper-*/
 *.zip
 dist-test/
 .DS_Store

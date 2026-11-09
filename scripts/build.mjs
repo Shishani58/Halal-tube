@@ -4,6 +4,7 @@ import { cpSync, existsSync, mkdirSync, rmSync, copyFileSync, statSync, readFile
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeIcons } from './icons.mjs';
+import { ASR_DEFAULT, ASR_MODELS } from './asr-models.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const test = process.argv.includes('--test');
@@ -25,6 +26,22 @@ function copyStatic() {
   mkdirSync(join(dist, 'models'), { recursive: true });
   const target = join(dist, 'models', MODEL);
   if (!existsSync(target) || statSync(target).size !== statSync(model).size) copyFileSync(model, target);
+  // speech recognition for the profanity filter (optional: without it the filter reports an error)
+  // ASR_BENCH=1 also ships the other downloaded sizes, for the benchmark page.
+  const asrNames = process.env.ASR_BENCH ? Object.keys(ASR_MODELS) : [ASR_DEFAULT];
+  for (const name of asrNames) {
+    const src = join(root, 'models', name);
+    const missing = ASR_MODELS[name].files.filter((f) => !existsSync(join(src, f)));
+    if (missing.length) {
+      if (name === ASR_DEFAULT) console.warn(`\n⚠ ${name} not found: the profanity filter will not work. Run: npm run fetch-asr-model\n`);
+      continue;
+    }
+    for (const f of ASR_MODELS[name].files) {
+      const target = join(dist, 'models', name, f);
+      mkdirSync(dirname(target), { recursive: true });
+      if (!existsSync(target) || statSync(target).size !== statSync(join(src, f)).size) copyFileSync(join(src, f), target);
+    }
+  }
   makeIcons(join(dist, 'icons'));
   if (test) {
     // test build: also run on the local MSE test page
@@ -46,7 +63,14 @@ const common = {
 
 const builds = [
   { entryPoints: { 'content/main': 'src/content/main.ts', 'content/bridge': 'src/content/bridge.ts', }, format: 'iife' },
-  { entryPoints: { background: 'src/background.ts', 'processor/offscreen': 'src/processor/offscreen.ts', 'processor/worker': 'src/processor/worker.ts', 'popup/popup': 'src/popup/popup.ts', 'bench/bench': 'src/bench/bench.ts' }, format: 'esm' },
+  // transformers.js (speech recognition), loaded by the worker only when the profanity filter is on;
+  // it reuses the ONNX Runtime the worker already loaded (see src/processor/ort-shim.ts)
+  {
+    entryPoints: { 'processor/asr-lib': 'src/processor/asr-lib.ts' },
+    format: 'esm',
+    alias: { 'onnxruntime-web/webgpu': './src/processor/ort-shim.ts', 'onnxruntime-common': './src/processor/ort-shim.ts' },
+  },
+  { entryPoints: { background: 'src/background.ts', 'processor/offscreen': 'src/processor/offscreen.ts', 'processor/worker': 'src/processor/worker.ts', 'popup/popup': 'src/popup/popup.ts', 'bench/bench': 'src/bench/bench.ts', 'bench/asr-bench': 'src/bench/asr-bench.ts' }, format: 'esm' },
 ];
 
 if (!watch) rmSync(dist, { recursive: true, force: true });
