@@ -10,21 +10,23 @@ const test = process.argv.includes('--test');
 const dist = join(root, test ? 'dist-test' : 'dist');
 const watch = process.argv.includes('--watch');
 
-const MODEL = 'Kim_Vocal_2.onnx';
+const MODELS = ['Kim_Vocal_2.onnx', 'nudenet-320n.onnx', 'genderage.onnx'];
 const ORT_FILES = ['ort.webgpu.min.mjs', 'ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.asyncify.wasm'];
 
 function copyStatic() {
   cpSync(join(root, 'static'), dist, { recursive: true });
   mkdirSync(join(dist, 'ort'), { recursive: true });
   for (const f of ORT_FILES) copyFileSync(join(root, 'node_modules/onnxruntime-web/dist', f), join(dist, 'ort', f));
-  const model = join(root, 'models', MODEL);
-  if (!existsSync(model)) {
-    console.error(`\n✗ ${MODEL} not found. Run: npm run fetch-model\n`);
-    process.exit(1);
-  }
   mkdirSync(join(dist, 'models'), { recursive: true });
-  const target = join(dist, 'models', MODEL);
-  if (!existsSync(target) || statSync(target).size !== statSync(model).size) copyFileSync(model, target);
+  for (const name of MODELS) {
+    const model = join(root, 'models', name);
+    if (!existsSync(model)) {
+      console.error(`\n✗ ${name} not found. Run: npm run fetch-model\n`);
+      process.exit(1);
+    }
+    const target = join(dist, 'models', name);
+    if (!existsSync(target) || statSync(target).size !== statSync(model).size) copyFileSync(model, target);
+  }
   makeIcons(join(dist, 'icons'));
   if (test) {
     // test build: also run on the local MSE test page
@@ -46,7 +48,7 @@ const common = {
 
 const builds = [
   { entryPoints: { 'content/main': 'src/content/main.ts', 'content/bridge': 'src/content/bridge.ts', }, format: 'iife' },
-  { entryPoints: { background: 'src/background.ts', 'processor/offscreen': 'src/processor/offscreen.ts', 'processor/worker': 'src/processor/worker.ts', 'popup/popup': 'src/popup/popup.ts', 'bench/bench': 'src/bench/bench.ts' }, format: 'esm' },
+  { entryPoints: { background: 'src/background.ts', 'processor/offscreen': 'src/processor/offscreen.ts', 'processor/worker': 'src/processor/worker.ts', 'processor/vision-worker': 'src/processor/vision-worker.ts', 'popup/popup': 'src/popup/popup.ts', 'bench/bench': 'src/bench/bench.ts' }, format: 'esm' },
 ];
 
 if (!watch) rmSync(dist, { recursive: true, force: true });

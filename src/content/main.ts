@@ -14,6 +14,8 @@ import {
   type WorkerStatus,
 } from '../shared/messages';
 import { timeStretch } from '../core/stretch';
+import type { FromVision } from '../shared/vision-messages';
+import { VisionController } from './blur';
 
 declare global {
   interface Window {
@@ -31,6 +33,12 @@ declare global {
   function send(msg: ToWorker): void {
     window.postMessage({ ns: MSG_NS, from: 'main', kind: 'to-worker', msg }, '*');
   }
+
+  // Blurring: video track → frame classifier; CSS blur on flagged / unchecked frames.
+  const vision = new VisionController(
+    () => settings,
+    (v) => sessionOf(v),
+  );
 
   // ───────────────────────── MSE hooks ─────────────────────────
   let nextId = 1;
@@ -66,6 +74,7 @@ declare global {
         sbMeta.set(sb, meta);
         hookLog.push(`addSourceBuffer(${mime}) ms=${meta.session}`);
         if (meta.audio) send({ type: 'sb-init', session: meta.session, sb: meta.id, mime });
+        else if (/^video\//i.test(mime)) vision.onSourceBuffer(meta.id, meta.session, mime);
       } catch {
         /* never break the player */
       }
@@ -86,6 +95,12 @@ declare global {
         } catch {
           /* ignore */
         }
+      } else if (meta && vision.isVideo(meta.id)) {
+        try {
+          vision.onAppend(meta.id, data, this.timestampOffset);
+        } catch {
+          /* never break the player */
+        }
       }
       return origAppend.call(this, data);
     };
@@ -94,6 +109,7 @@ declare global {
     SB.prototype.abort = function (this: SourceBuffer): void {
       const meta = sbMeta.get(this);
       if (meta?.audio) send({ type: 'abort', session: meta.session, sb: meta.id });
+      else if (meta) vision.onAbort(meta.id);
       return origAbort.call(this);
     };
 
@@ -105,6 +121,7 @@ declare global {
           meta.audio = /^audio\//i.test(mime) || meta.audio;
           meta.mime = mime;
           if (meta.audio) send({ type: 'sb-init', session: meta.session, sb: meta.id, mime });
+          else if (/^video\//i.test(mime)) vision.onSourceBuffer(meta.id, meta.session, mime);
         }
         return origChangeType.call(this, mime);
       };
@@ -136,6 +153,11 @@ declare global {
   window.addEventListener('message', (e: MessageEvent) => {
     const d = e.data as { ns?: string; from?: string; kind?: string; msg?: FromWorker; settings?: Settings };
     if (!d || d.ns !== MSG_NS) return;
+    if (d.from === 'vision' && d.msg && e.source === window) {
+      vision.onMessage(d.msg as unknown as FromVision);
+      if ((d.msg as unknown as FromVision).type === 'result') tick();
+      return;
+    }
     if (d.from === 'bridge' && e.source === window && d.kind === 'settings' && d.settings) {
       settings = { ...DEFAULT_SETTINGS, ...d.settings };
       tick();
@@ -410,7 +432,9 @@ declare global {
     cleanSince = 0;
 
     update(v: HTMLVideoElement | null, state: PageStatus['state']): void {
-      if (!v || !settings.showBadge || state === 'disabled' || state === 'no-video') {
+      const musicOn = state !== 'disabled' && state !== 'no-video';
+      const blurNote = v ? vision.badgeText() : '';
+      if (!v || !settings.showBadge || (!musicOn && !blurNote)) {
         this.hide();
         return;
       }
@@ -435,14 +459,16 @@ declare global {
       if (this.el.parentElement !== host) host.appendChild(this.el);
 
       const ws = workerStatus;
-      let text: string;
-      if (ws?.model === 'error') text = `⚠ Music Remover: ${ws.error ?? 'ошибка модели'}`;
+      let text = '';
+      if (!musicOn) text = '';
+      else if (ws?.model === 'error') text = `⚠ Music Remover: ${ws.error ?? 'ошибка модели'}`;
       else if (state === 'suspended') text = '🔇 Нажмите на страницу, чтобы включить звук без музыки';
       else if (!ws || ws.model === 'loading' || ws.model === 'idle') text = '⏳ Загружаю модель…';
       else if (state === 'waiting') text = '⏳ Убираю музыку…';
       else text = '🎙 Без музыки';
+      if (blurNote) text = text ? `${text} · ${blurNote}` : blurNote;
 
-      if (state === 'clean' || state === 'paused') {
+      if ((!musicOn || state === 'clean' || state === 'paused') && !blurNote) {
         if (!this.cleanSince) this.cleanSince = performance.now();
       } else this.cleanSince = 0;
       const fade = this.cleanSince && performance.now() - this.cleanSince > 2500;
@@ -461,6 +487,12 @@ declare global {
 
   // ───────────────────────── loop & events ─────────────────────────
   function tick(): void {
+    // blur decision first: the badge (drawn by player.tick) reports it
+    try {
+      vision.tick(player.pickVideo());
+    } catch (e) {
+      console.warn('[music-remover] blur tick error', e);
+    }
     try {
       player.tick();
     } catch (e) {
@@ -495,7 +527,11 @@ declare global {
           videoSrc: player.video?.currentSrc?.slice(0, 60),
           paused: player.video?.paused,
           readyState: player.video?.readyState,
+          vision: { ...vision.pageState(), samples: player.session ? vision.timeline(player.session)?.sampleCount ?? 0 : 0, checked: player.session ? vision.timeline(player.session)?.checked.spans : [] },
         };
+      },
+      visionSamples() {
+        return vision.timeline(player.session)?.dump() ?? [];
       },
       tile(k: number) {
         const t = player.tiles.get(k);
@@ -512,6 +548,7 @@ declare global {
       state: player.state,
       videoTime: player.video?.currentTime ?? 0,
       sessions: nextId,
+      vision: vision.pageState(),
     };
     window.postMessage({ ns: MSG_NS, from: 'main', kind: 'status', status }, '*');
   }, 1000);

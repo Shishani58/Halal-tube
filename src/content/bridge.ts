@@ -8,6 +8,7 @@
  */
 import { DEFAULT_SETTINGS, MSG_NS, type PageStatus, type Settings, type ToWorker } from '../shared/messages';
 import { decodeFromWorker, encodeToWorker, type FromWorkerWire, type ToWorkerWire } from '../shared/wire';
+import './bridge-vision';
 
 let settings: Settings = { ...DEFAULT_SETTINGS };
 let lastStatus: PageStatus | null = null;

@@ -36,6 +36,23 @@
     </label>
   </section>
 
+  <section class="blur">
+    <div class="blur-head">
+      <h2>Размытие видео</h2>
+      <label class="switch" title="Размывать неподобающие кадры">
+        <input id="blur" type="checkbox" />
+        <span></span>
+      </label>
+    </div>
+    <div class="status">
+      <div class="row"><span>Кадр сейчас</span><b id="vs-state">—</b></div>
+      <div class="row"><span>Проверено вперёд</span><b id="vs-ahead">—</b></div>
+    </div>
+    <label class="check"><input id="blurWomen" type="checkbox" /> Размывать, когда в кадре женщина</label>
+    <label class="check"><input id="blurStrict" type="checkbox" /> Размывать, пока кадр не проверен</label>
+    <small class="note">Обнажённое тело (мужчин и женщин) размывается всегда, пока функция включена.</small>
+  </section>
+
   <footer>Работает на YouTube. Обработка идёт локально, на вашем компьютере.</footer>
   <script src="popup.js" type="module"></script>
 </body>

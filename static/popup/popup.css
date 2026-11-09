@@ -53,4 +53,9 @@ h1 { font-size: 16px; margin: 0; flex: 1; font-weight: 650; }
 .opt small { display: block; color: var(--muted); margin-top: 2px; }
 .check { display: flex; gap: 8px; align-items: center; padding: 4px 2px; cursor: pointer; }
 .check input { accent-color: var(--accent); }
+.blur { margin: 4px 16px 10px; padding-top: 10px; border-top: 1px solid var(--line); display: grid; gap: 6px; }
+.blur-head { display: flex; align-items: center; justify-content: space-between; }
+.blur h2 { font-size: 14px; margin: 0; font-weight: 650; }
+.blur .status { margin: 0; }
+.note { color: var(--muted); font-size: 11.5px; }
 footer { padding: 10px 16px 14px; color: var(--muted); font-size: 11.5px; border-top: 1px solid var(--line); }

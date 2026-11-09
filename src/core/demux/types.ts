@@ -1,10 +1,15 @@
 export interface TrackConfig {
-  /** WebCodecs codec string, e.g. "opus" or "mp4a.40.2". */
+  /** WebCodecs codec string, e.g. "opus", "mp4a.40.2", "vp09.00.10.08", "avc1.4d401f". */
   codec: string;
+  /** Audio only (0 for video). */
   sampleRate: number;
+  /** Audio only (0 for video). */
   channels: number;
-  /** Codec-specific setup (OpusHead / AudioSpecificConfig). */
+  /** Codec-specific setup (OpusHead / AudioSpecificConfig / avcC / av1C). */
   description?: Uint8Array;
+  kind?: 'audio' | 'video';
+  width?: number;
+  height?: number;
   /** Stable identity for grouping packets that share a decoder config. */
   key: string;
 }
@@ -16,6 +21,18 @@ export interface Packet {
   dur: number;
   data: Uint8Array;
   config: TrackConfig;
+  /** Video: decode timestamp (differs from ts with B-frames). */
+  dts?: number;
+  /** Video: sync sample (decoding can start here). Audio packets are always decodable. */
+  key?: boolean;
+}
+
+export type TrackKind = 'audio' | 'video';
+
+/** The `codecs="…"` parameter of a MIME type, if any. */
+export function codecParam(mimeType: string): string {
+  const m = /codecs\s*=\s*"?([^";]+)"?/i.exec(mimeType);
+  return m ? m[1].trim() : '';
 }
 
 export interface Demuxer {

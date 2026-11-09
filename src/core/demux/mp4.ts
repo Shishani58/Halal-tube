@@ -1,4 +1,5 @@
-import { ByteQueue, configKey, type Demuxer, type Packet, type TrackConfig } from './types';
+import { ByteQueue, configKey, type Demuxer, type Packet, type TrackConfig, type TrackKind } from './types';
+import { av1CodecString, avcCodecString, vp9CodecString } from './video-codecs';
 
 const SEGMENT_START = new Set(['moof', 'styp', 'ftyp', 'sidx', 'emsg', 'moov', 'prft']);
 
@@ -8,19 +9,33 @@ interface TrackInfo {
   config: TrackConfig;
   defaultDuration: number;
   defaultSize: number;
+  defaultFlags: number;
+  /** Edit-list media_time (timescale units) subtracted from presentation times, like Chromium's MSE. */
+  startOffset: number;
 }
+
+/** sample_is_non_sync_sample bit of ISO-BMFF sample flags. */
+const NON_SYNC = 0x10000;
 
 interface PendingSamples {
   trackId: number;
   /** Absolute stream offsets of each sample. */
   offsets: number[];
   sizes: number[];
-  times: number[]; // in timescale units
+  times: number[]; // decode time, in timescale units
   durations: number[];
+  /** Composition time offsets (pts − dts), timescale units. */
+  ctos: number[];
+  flags: number[];
 }
 
-/** Streaming fragmented-MP4 audio demuxer (AAC). */
+/** Streaming fragmented-MP4 demuxer for one audio (AAC) or video (H.264 / VP9 / AV1) track. */
 export class Mp4Demuxer implements Demuxer {
+  constructor(
+    private readonly kind: TrackKind = 'audio',
+    private readonly codecHint = '',
+  ) {}
+
   private q = new ByteQueue();
   private tracks = new Map<number, TrackInfo>();
   private audioTrackId = -1;
@@ -91,36 +106,47 @@ export class Mp4Demuxer implements Demuxer {
     for (; i < p.offsets.length; i++) {
       const rel = p.offsets[i] - bufAbs;
       if (rel < 0 || rel + p.sizes[i] > buf.length) break;
-      out.push({
-        ts: p.times[i] / tr.timescale + tsOffset,
+      const dts = p.times[i] / tr.timescale + tsOffset;
+      const pk: Packet = {
+        ts: dts + (p.ctos[i] - tr.startOffset) / tr.timescale,
         dur: p.durations[i] / tr.timescale,
         data: buf.slice(rel, rel + p.sizes[i]),
         config: tr.config,
-      });
+      };
+      if (tr.config.kind === 'video') {
+        pk.dts = dts;
+        pk.key = (p.flags[i] & NON_SYNC) === 0;
+      }
+      out.push(pk);
     }
     p.offsets.splice(0, i);
     p.sizes.splice(0, i);
     p.times.splice(0, i);
     p.durations.splice(0, i);
+    p.ctos.splice(0, i);
+    p.flags.splice(0, i);
     if (final || p.offsets.length === 0) this.pending = final ? null : p;
   }
 
   private parseMoov(b: Uint8Array): void {
-    const trex = new Map<number, { dur: number; size: number }>();
+    const trex = new Map<number, { dur: number; size: number; flags: number }>();
     for (const [type, body] of boxes(b)) {
       if (type === 'mvex') {
         for (const [t2, bb] of boxes(body)) {
           if (t2 !== 'trex') continue;
           const dv = view(bb);
-          trex.set(dv.getUint32(4), { dur: dv.getUint32(12), size: dv.getUint32(16) });
+          trex.set(dv.getUint32(4), { dur: dv.getUint32(12), size: dv.getUint32(16), flags: dv.getUint32(20) });
         }
       }
     }
     for (const [type, trak] of boxes(b)) {
       if (type !== 'trak') continue;
-      let id = -1, timescale = 0, handler = '', config: TrackConfig | null = null;
+      let id = -1, timescale = 0, handler = '', config: TrackConfig | null = null, startOffset = 0;
       for (const [t, body] of boxes(trak)) {
-        if (t === 'tkhd') {
+        if (t === 'edts') {
+          const elst = findPath(body, ['elst']);
+          if (elst) startOffset = editStart(elst);
+        } else if (t === 'tkhd') {
           const dv = view(body);
           id = body[0] === 1 ? dv.getUint32(20) : dv.getUint32(12);
         } else if (t === 'mdia') {
@@ -129,14 +155,14 @@ export class Mp4Demuxer implements Demuxer {
             else if (t2 === 'hdlr') handler = fourcc(mb, 8);
             else if (t2 === 'minf') {
               const stsd = findPath(mb, ['stbl', 'stsd']);
-              if (stsd) config = parseStsd(stsd);
+              if (stsd) config = this.kind === 'video' ? parseVideoStsd(stsd, this.codecHint) : parseStsd(stsd);
             }
           }
         }
       }
-      if (handler !== 'soun' || !config) continue;
-      const d = trex.get(id) ?? { dur: 1024, size: 0 };
-      this.tracks.set(id, { id, timescale, config, defaultDuration: d.dur, defaultSize: d.size });
+      if (handler !== (this.kind === 'video' ? 'vide' : 'soun') || !config) continue;
+      const d = trex.get(id) ?? { dur: 1024, size: 0, flags: 0 };
+      this.tracks.set(id, { id, timescale, config, defaultDuration: d.dur, defaultSize: d.size, defaultFlags: d.flags, startOffset: this.kind === 'video' ? startOffset : 0 });
       this.audioTrackId = id;
     }
   }
@@ -144,8 +170,8 @@ export class Mp4Demuxer implements Demuxer {
   private parseMoof(b: Uint8Array, moofAbs: number): void {
     for (const [type, traf] of boxes(b)) {
       if (type !== 'traf') continue;
-      let trackId = -1, baseOffset = moofAbs, defDur = 0, defSize = 0, baseTime = 0;
-      const samples: PendingSamples = { trackId: -1, offsets: [], sizes: [], times: [], durations: [] };
+      let trackId = -1, baseOffset = moofAbs, defDur = 0, defSize = 0, defFlags = 0, baseTime = 0;
+      const samples: PendingSamples = { trackId: -1, offsets: [], sizes: [], times: [], durations: [], ctos: [], flags: [] };
       for (const [t, body] of boxes(traf)) {
         const dv = view(body);
         if (t === 'tfhd') {
@@ -154,32 +180,38 @@ export class Mp4Demuxer implements Demuxer {
           const tr = this.tracks.get(trackId);
           defDur = tr?.defaultDuration ?? 1024;
           defSize = tr?.defaultSize ?? 0;
+          defFlags = tr?.defaultFlags ?? 0;
           let p = 8;
           if (flags & 0x01) { baseOffset = Number(dv.getBigUint64(p)); p += 8; }
           if (flags & 0x02) p += 4;
           if (flags & 0x08) { defDur = dv.getUint32(p); p += 4; }
           if (flags & 0x10) { defSize = dv.getUint32(p); p += 4; }
+          if (flags & 0x20) { defFlags = dv.getUint32(p); p += 4; }
         } else if (t === 'tfdt') {
           baseTime = body[0] === 1 ? Number(dv.getBigUint64(4)) : dv.getUint32(4);
         } else if (t === 'trun') {
+          const version = body[0];
           const flags = dv.getUint32(0) & 0xffffff;
           const count = dv.getUint32(4);
           let p = 8;
           let dataOffset = 0;
+          let firstFlags = -1;
           if (flags & 0x01) { dataOffset = dv.getInt32(p); p += 4; }
-          if (flags & 0x04) p += 4;
+          if (flags & 0x04) { firstFlags = dv.getUint32(p); p += 4; }
           let off = baseOffset + dataOffset;
           let time = baseTime + samples.durations.reduce((a, x) => a + x, 0);
           for (let i = 0; i < count; i++) {
-            let dur = defDur, size = defSize;
+            let dur = defDur, size = defSize, sflags = i === 0 && firstFlags >= 0 ? firstFlags : defFlags, cto = 0;
             if (flags & 0x100) { dur = dv.getUint32(p); p += 4; }
             if (flags & 0x200) { size = dv.getUint32(p); p += 4; }
-            if (flags & 0x400) p += 4;
-            if (flags & 0x800) p += 4;
+            if (flags & 0x400) { sflags = dv.getUint32(p); p += 4; }
+            if (flags & 0x800) { cto = version === 1 ? dv.getInt32(p) : dv.getUint32(p); p += 4; }
             samples.offsets.push(off);
             samples.sizes.push(size);
             samples.times.push(time);
             samples.durations.push(dur);
+            samples.ctos.push(cto);
+            samples.flags.push(sflags);
             off += size;
             time += dur;
           }
@@ -210,7 +242,52 @@ function parseStsd(stsd: Uint8Array): TrackConfig | null {
     if (freqIdx < rates.length) rate = rates[freqIdx];
     const codec = `mp4a.40.${aot}`;
     const description = asc.slice();
-    return { codec, sampleRate: rate, channels, description, key: configKey(codec, rate, channels, description) };
+    return { codec, sampleRate: rate, channels, description, kind: 'audio', key: configKey(codec, rate, channels, description) };
+  }
+  return null;
+}
+
+/** media_time of the first non-empty edit (B-frame presentation delay), 0 if none. */
+function editStart(elst: Uint8Array): number {
+  const dv = view(elst);
+  const version = elst[0];
+  const count = dv.getUint32(4);
+  let p = 8;
+  for (let i = 0; i < count && p + (version === 1 ? 20 : 12) <= elst.length; i++) {
+    const mediaTime = version === 1 ? Number(dv.getBigInt64(p + 8)) : dv.getInt32(p + 4);
+    p += version === 1 ? 20 : 12;
+    if (mediaTime >= 0) return mediaTime;
+  }
+  return 0;
+}
+
+/** First supported visual sample entry: avc1/avc3 (H.264), vp09, av01. */
+function parseVideoStsd(stsd: Uint8Array, hint: string): TrackConfig | null {
+  for (const [type, entry] of boxes(stsd.subarray(8))) {
+    // VisualSampleEntry: 6 reserved + 2 dref index + 16 predefined + width(2) height(2) + … = 78 bytes
+    if (entry.length < 78) continue;
+    const dv = view(entry);
+    const width = dv.getUint16(24);
+    const height = dv.getUint16(26);
+    const child = new Map<string, Uint8Array>();
+    for (const [t, b] of boxes(entry.subarray(78))) child.set(t, b);
+    let codec: string | null = null;
+    let description: Uint8Array | undefined;
+    if (type === 'avc1' || type === 'avc3') {
+      const avcC = child.get('avcC');
+      if (!avcC) continue;
+      codec = avcCodecString(avcC, type);
+      description = avcC.slice();
+    } else if (type === 'vp09') {
+      const vpcC = child.get('vpcC');
+      codec = hint.toLowerCase().startsWith('vp09.') ? hint : vpcC ? vp9CodecString(vpcC) : 'vp09.00.10.08';
+    } else if (type === 'av01') {
+      const av1C = child.get('av1C');
+      codec = hint.toLowerCase().startsWith('av01.') ? hint : (av1C && av1CodecString(av1C)) || 'av01.0.08M.08';
+      description = av1C?.slice();
+    }
+    if (!codec) continue;
+    return { codec, sampleRate: 0, channels: 0, description, kind: 'video', width, height, key: configKey(codec, width, height, description) };
   }
   return null;
 }

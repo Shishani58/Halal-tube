@@ -4,17 +4,28 @@ const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as 
 const enabledEl = $<HTMLInputElement>('enabled');
 const badgeEl = $<HTMLInputElement>('showBadge');
 const modeEls = Array.from(document.querySelectorAll<HTMLInputElement>('input[name=mode]'));
+const blurEls = (['blur', 'blurWomen', 'blurStrict'] as const).map((k) => [k, $<HTMLInputElement>(k)] as const);
 
 async function load(): Promise<void> {
   const s = (await chrome.storage.sync.get(DEFAULT_SETTINGS)) as Settings;
   enabledEl.checked = s.enabled;
   badgeEl.checked = s.showBadge;
   for (const m of modeEls) m.checked = m.value === s.mode;
+  for (const [k, el] of blurEls) el.checked = s[k];
 }
 
 enabledEl.addEventListener('change', () => void chrome.storage.sync.set({ enabled: enabledEl.checked }));
 badgeEl.addEventListener('change', () => void chrome.storage.sync.set({ showBadge: badgeEl.checked }));
 for (const m of modeEls) m.addEventListener('change', () => m.checked && void chrome.storage.sync.set({ mode: m.value }));
+for (const [k, el] of blurEls) el.addEventListener('change', () => void chrome.storage.sync.set({ [k]: el.checked }));
+
+const VISION_TEXT = {
+  off: 'Выключено',
+  'no-video': 'Видео не найдено',
+  checking: 'Проверяется…',
+  hidden: 'Размыт',
+  clear: 'Чистый',
+} as const;
 
 const STATE_TEXT: Record<PageStatus['state'], string> = {
   disabled: 'Выключено',
@@ -41,8 +52,17 @@ async function refresh(): Promise<void> {
     set('st-model', '—');
     set('st-speed', '—');
     set('st-ahead', '—');
+    set('vs-state', '—');
+    set('vs-ahead', '—');
     return;
   }
+  const vis = st.vision;
+  const vw = vis?.status;
+  set(
+    'vs-state',
+    !vis ? '—' : vw?.model === 'error' ? `Ошибка: ${vw.error ?? ''}` : vw?.model === 'loading' && vis.state !== 'off' ? 'Загрузка модели…' : VISION_TEXT[vis.state],
+  );
+  set('vs-ahead', vw && vis?.state !== 'off' ? `${Math.round(vw.ahead)} с${vw.speed > 0 ? ` (${vw.speed.toFixed(0)}× реального времени)` : ''}` : '—');
   set('st-state', STATE_TEXT[st.state] ?? st.state);
   const w = st.worker;
   if (!w) {

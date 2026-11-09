@@ -54,9 +54,15 @@ export interface Settings {
   /** strict: silence while clean audio isn't ready; lenient: play original meanwhile. */
   mode: 'strict' | 'lenient';
   showBadge: boolean;
+  /** Blur video frames with nudity (men and women). */
+  blur: boolean;
+  /** Also blur frames where a woman is visible. */
+  blurWomen: boolean;
+  /** Keep the video blurred until its frames have been checked. */
+  blurStrict: boolean;
 }
 
-export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true };
+export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, blur: true, blurWomen: true, blurStrict: true };
 
 /** What the page reports for the popup. */
 export interface PageStatus {
@@ -64,6 +70,8 @@ export interface PageStatus {
   state: 'disabled' | 'no-video' | 'waiting' | 'clean' | 'paused' | 'suspended';
   videoTime: number;
   sessions: number;
+  /** Blurring (frame classifier) state. */
+  vision?: import('./vision-messages').PageVision;
 }
 
 export const MSG_NS = '__musicRemover';

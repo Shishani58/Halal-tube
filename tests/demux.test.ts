@@ -116,3 +116,39 @@ test('WebM: recovers after an abandoned partial cluster (SABR-style)', () => {
   }
   void ref;
 });
+
+// ───────── video tracks (for the frame classifier) ─────────
+const haveVideo = existsSync(`${FIX}/v.webm`) && existsSync(`${FIX}/v.mp4`);
+
+/** `t0`: presentation start (x264 B-frame delay without an edit list → 2 frames, as ffprobe reports). */
+function checkVideo(pk: Packet[], codecPrefix: string, t0 = 0) {
+  assert(pk.length === 250, `frames ${pk.length} != 250`);
+  assert(pk[0].config.kind === 'video' && pk[0].config.codec.startsWith(codecPrefix), `codec ${pk[0].config.codec}`);
+  assert(pk[0].config.width === 320 && pk[0].config.height === 180, `size ${pk[0].config.width}x${pk[0].config.height}`);
+  const keys = pk.filter((p) => p.key).map((p) => +(p.ts - t0).toFixed(3));
+  assert(keys.join() === '0,2,4,6,8', `keyframes at ${keys.join()}`);
+  // presentation times are exactly the 25 fps grid
+  const pts = pk.map((p) => p.ts).sort((a, b) => a - b);
+  for (let i = 0; i < pts.length; i++) assert(Math.abs(pts[i] - t0 - i / 25) < 0.002, `pts[${i}] = ${pts[i]}`);
+  // decode order: dts strictly increasing
+  for (let i = 1; i < pk.length; i++) assert(pk[i].dts! > pk[i - 1].dts!, 'dts increasing');
+}
+
+test('WebM VP9 video track demux, any chunking', () => {
+  if (!haveVideo) return console.log('    (skipped: no video fixtures)');
+  for (const s of [whole, random, tiny]) checkVideo(feed('v.webm', 'video/webm; codecs="vp9"', s), 'vp09.');
+  // an audio demuxer on the same stream yields nothing
+  assert(feed('v.webm', 'audio/webm', whole).length === 0, 'no audio track');
+  // exact codec string from the MIME type wins
+  assert(feed('v.webm', 'video/webm; codecs="vp09.00.21.08"', whole)[0].config.codec === 'vp09.00.21.08', 'codec hint');
+});
+
+test('fMP4 H.264 (B-frames) video track demux, any chunking', () => {
+  if (!haveVideo) return;
+  for (const s of [whole, random, tiny]) {
+    const pk = feed('v.mp4', 'video/mp4; codecs="avc1.640014"', s);
+    checkVideo(pk, 'avc1.64', 0.08);
+    assert(pk[0].config.description && pk[0].config.description[0] === 1, 'avcC description');
+    assert(pk.some((p) => Math.abs(p.ts - p.dts!) > 0.01), 'B-frames reorder (pts ≠ dts)');
+  }
+});
