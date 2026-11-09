@@ -124,6 +124,13 @@ test('censor: mute silences word + pads, leaves the rest untouched', () => {
   assert(maxStep < 0.02, `no click at the fade (max step ${maxStep.toFixed(4)})`);
 });
 
+test('censor: default padding is wider before the word (recognized starts run late)', () => {
+  const R = 8000;
+  const L = new Float32Array(R * 2).fill(0.2);
+  const [sp] = applyCensor([L], R, 0, [{ start: 1, end: 1.3 }], { mode: 'mute' });
+  assert(Math.abs(sp.start - 0.9) < 1e-9 && Math.abs(sp.end - 1.38) < 1e-9, `default span ${JSON.stringify(sp)}`);
+});
+
 test('censor: beep replaces the word at speech loudness, phase-continuous across tiles', () => {
   const R = 44100;
   const amp = 0.2;

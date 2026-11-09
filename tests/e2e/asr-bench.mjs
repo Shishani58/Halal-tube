@@ -13,6 +13,14 @@ const list = (models.length ? models : all).filter((m) => existsSync(`${dist}/mo
 const truth = JSON.parse(readFileSync('/tmp/mr/prof/truth.json', 'utf8'));
 const b64 = (f) => readFileSync(f).toString('base64');
 const inputs = { speech: b64('/tmp/mr/prof/speech16k.f32'), mix: b64('/tmp/mr/prof/mix16k.f32') };
+// separated voice from the extension (node tests/e2e/profanity.mjs capture), resampled to 16 kHz
+if (existsSync('/tmp/mr/prof/vocals16k.f32')) inputs.vocals = b64('/tmp/mr/prof/vocals16k.f32');
+// extra inputs: ASR_INPUTS=name:/path/16k.f32,...  (name containing "mix" = treated as the original mix)
+for (const e of (process.env.ASR_INPUTS ?? '').split(',').filter(Boolean)) {
+  const [k, f] = e.split(':');
+  inputs[k] = b64(f);
+}
+if (process.env.ASR_ONLY) for (const k of Object.keys(inputs)) if (!process.env.ASR_ONLY.split(',').includes(k)) delete inputs[k];
 
 const ctx = await chromium.launchPersistentContext('', {
   channel: 'chromium',
@@ -33,7 +41,7 @@ const summary = [];
 for (const m of list) {
   const { loadMs } = await page.evaluate((n) => window.__asr.load(n), m);
   for (const [label, audio] of Object.entries(inputs)) {
-    const res = await page.evaluate(([a, l]) => window.__asr.run(a, l, l === 'speech'), [audio, label]);
+    const res = await page.evaluate(([a, l]) => window.__asr.run(a, l, !l.includes('mix')), [audio, label]);
     const times = res.slice(1).map((r) => r.detectMs + r.transcribeMs); // first call includes shader compile
     const hits = res.flatMap((r) => r.hits);
     // a profane word counts as found if some hit overlaps it; timing error = |hit edge − truth edge|

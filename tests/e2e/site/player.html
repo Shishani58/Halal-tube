@@ -55,7 +55,8 @@ v.addEventListener('seeking', () => { for (const f of feeders) f.seek(v.currentT
 ms.addEventListener('sourceopen', async () => {
   const vsb = ms.addSourceBuffer('video/webm; codecs="vp9"');
   const asb = ms.addSourceBuffer('audio/webm; codecs="opus"');
-  const [vd, ad] = await Promise.all(['video.webm', 'audio.webm'].map((f) => fetch(f).then((r) => r.arrayBuffer())));
+  const audioFile = new URLSearchParams(location.search).get('audio') || 'audio.webm';
+  const [vd, ad] = await Promise.all(['video.webm', audioFile].map((f) => fetch(f).then((r) => r.arrayBuffer())));
   feeder(vsb, new Uint8Array(vd));
   feeder(asb, new Uint8Array(ad));
 });

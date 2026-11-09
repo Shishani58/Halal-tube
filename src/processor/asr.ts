@@ -47,11 +47,11 @@ export interface AsrResult {
 export interface Asr {
   name: string;
   /**
-   * lang: skip detection. voiceSpan: [from, to] seconds of the input that are a separated voice
-   * track (silence between phrases), where stretches of speech without recognized words reveal
-   * a second language.
+   * lang: skip detection. voice: a separated voice track (16 kHz, silence between phrases)
+   * covering the input from `offset` seconds, where stretches of speech without recognized
+   * words reveal a second language.
    */
-  transcribe(audio16k: Float32Array, opts?: { lang?: AsrLang; voiceSpan?: [number, number] }): Promise<AsrResult>;
+  transcribe(audio16k: Float32Array, opts?: { lang?: AsrLang; voice?: { audio: Float32Array; offset: number } }): Promise<AsrResult>;
   release(): Promise<void>;
 }
 
@@ -144,7 +144,10 @@ export async function loadAsr(base: string, name = ASR_MODEL): Promise<Asr> {
       const [s, e] = c.timestamp;
       if (s == null || !Number.isFinite(s)) continue;
       const end = e != null && Number.isFinite(e) && e > s ? e : Math.min(seconds, s + 0.5);
-      words.push({ text: c.text, start: Math.max(0, s - START_SHIFT), end: Math.max(0, end - END_SHIFT) });
+      // the last word before a pause sometimes gets the pause too: cap by its length in letters
+      const letters = c.text.replace(/[^\p{L}]/gu, '').length;
+      const e2 = Math.min(end, s + 0.3 + 0.09 * letters);
+      words.push({ text: c.text, start: Math.max(0, s - START_SHIFT), end: Math.max(0, e2 - END_SHIFT) });
     }
     return { text: out.text, words };
   }
@@ -158,7 +161,7 @@ export async function loadAsr(base: string, name = ASR_MODEL): Promise<Asr> {
       let halvesDisagree = false;
       let nospeech = 0;
       if (opts.lang) langs = [opts.lang];
-      else if (opts.voiceSpan) {
+      else if (opts.voice) {
         const p = await detect(audio);
         const top = p.ru >= p.en ? 'ru' : 'en';
         prob = p[top];
@@ -182,20 +185,23 @@ export async function loadAsr(base: string, name = ASR_MODEL): Promise<Asr> {
         return { lang: langs[0], langProb: prob, passes: 0, text: '', words: [], ms: { detect: t1 - t0, transcribe: 0 } };
       }
       const passes = [await pass(audio, langs[0], 9)];
+      const looped = repetitive(passes[0].words);
+      if (looped) {
+        // A hallucination loop ("что, что, что…"). Whisper is chaotic here; the same speech
+        // without the first second of context usually decodes fine.
+        const retry = await pass(audio.subarray(16000), langs[0], 9);
+        if (!repetitive(retry.words)) passes[0] = { text: retry.text, words: retry.words.map((w) => ({ ...w, start: w.start + 1, end: w.end + 1 })) };
+        else passes[0] = { text: '', words: [] };
+      }
       // Whisper forced to one language skips speech in the other. When the window may mix
       // Russian and English — the detector is unsure, or (on a clean voice track) a second or
       // more of speech got no words — transcribe it in the other language too and merge.
       if (!opts.lang) {
         const unsure = prob < BOTH_BELOW || halvesDisagree;
-        const vs = opts.voiceSpan;
-        const gap = vs
-          ? uncoveredSpeech(
-              audio.subarray(Math.round(vs[0] * 16000), Math.round(vs[1] * 16000)),
-              16000,
-              passes[0].words.map((w) => ({ start: w.start - vs[0], end: w.end - vs[0] })),
-            )
-          : 0;
-        if ((unsure || gap >= 1) && !repetitive(passes[0].words)) {
+        const v = opts.voice;
+        const gap = v ? uncoveredSpeech(v.audio, 16000, passes[0].words.map((w) => ({ start: w.start - v.offset, end: w.end - v.offset }))) : 0;
+        // (not after a loop retry: that window already took three decodes' worth of time)
+        if ((unsure || gap >= 1) && !looped) {
           langs.push(langs[0] === 'ru' ? 'en' : 'ru');
           passes.push(await pass(audio, langs[1], 6));
         }

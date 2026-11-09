@@ -40,7 +40,7 @@ async function run(audioB64: string, label: string, voiceOnly = false) {
     const win = new Float32Array(Math.round((b - a) * R));
     const off = Math.round(a * R);
     for (let i = 0; i < win.length; i++) win[i] = audio[off + i] ?? 0;
-    const r = await asr.transcribe(win, voiceOnly ? { voiceSpan: [0, win.length / R] } : {});
+    const r = await asr.transcribe(win, voiceOnly ? { voice: { audio: win, offset: 0 } } : {});
     const words = r.words.map((w) => ({ ...w, start: w.start + a, end: w.end + a }));
     const hits = findProfanity(words).filter((w) => w.end > k * TILE && w.start < (k + 1) * TILE);
     res.push({ k, lang: r.lang, langProb: r.langProb, passes: r.passes, text: r.text, detectMs: r.ms.detect, transcribeMs: r.ms.transcribe, words, hits });

@@ -3,10 +3,11 @@ import { createDemuxer, type Demuxer } from '../core/demux';
 import { KIM_VOCAL_2, MdxProcessor } from '../core/mdx';
 import { resampleCubic } from '../core/resample';
 import { Tiling, separateWindow } from '../core/tiles';
-import type { FromWorker, ToWorker, WorkerStatus } from '../shared/messages';
+import { DEFAULT_FILTER, filterKey, type FromWorker, type ToWorker, type WorkerStatus } from '../shared/messages';
 import { decodePackets } from './decode';
 import { loadModel, type LoadedModel } from './model';
 import { PacketStore } from './packet-store';
+import { CONTEXT_S, ProfanityStage } from './profanity-stage';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -22,6 +23,15 @@ const base = new URL('../', self.location.href).href;
 const mdx = new MdxProcessor(KIM_VOCAL_2);
 const tiling = new Tiling(mdx);
 const scratch = new Float32Array(4 * KIM_VOCAL_2.dimF * KIM_VOCAL_2.dimT);
+/** Model loads run one at a time (concurrent first session creation hangs ONNX Runtime). */
+let loadChain: Promise<unknown> = Promise.resolve();
+function serial<T>(load: () => Promise<T>): Promise<T> {
+  const p = loadChain.then(load);
+  loadChain = p.catch(() => undefined);
+  return p;
+}
+const profanity = new ProfanityStage(base, serial);
+let cfgKey = filterKey(DEFAULT_FILTER);
 
 interface Session {
   store: PacketStore;
@@ -107,7 +117,15 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
         s.lastUsed = Date.now();
         s.store.evictBefore(m.time - KEEP_BEHIND_S);
       }
-      if (m.enabled && status.model === 'idle') void initModel();
+      const f = m.filter ?? DEFAULT_FILTER;
+      if (filterKey(f) !== cfgKey) {
+        // settings changed: tiles the page holds are stale (it stops reporting them in `have`)
+        cfgKey = filterKey(f);
+        sentAt.clear();
+        failedAt.clear();
+      }
+      if (m.enabled && f.musicRemoval && status.model === 'idle') void initModel();
+      if (m.enabled && f.profanity !== 'off') profanity.ensure(() => (updateStatus(true), schedule()));
       schedule();
       updateStatus();
       break;
@@ -119,7 +137,7 @@ async function initModel(): Promise<void> {
   status.model = 'loading';
   updateStatus(true);
   try {
-    model = await loadModel({ base, modelFile: MODEL_FILE, shape: mdx.tensorShape });
+    model = await serial(() => loadModel({ base, modelFile: MODEL_FILE, shape: mdx.tensorShape }));
     status.model = 'ready';
     status.backend = model.backend;
   } catch (e) {
@@ -156,7 +174,9 @@ function pickTile(): { k: number; validFrom: number } | null {
     const failed = failedAt.get(key);
     if (failed && now - failed < 5000) continue;
     const [a, b] = tiling.inputRange(k);
-    if (s.store.covers(a, b, pos.duration)) return { k, validFrom: tiling.tileStart(k) };
+    // with the profanity filter, tiles ahead of the playhead also wait for the recognition context
+    const after = k > kNow && pos.filter && pos.filter.profanity !== 'off' ? CONTEXT_S : 0;
+    if (s.store.covers(a, b + after, pos.duration)) return { k, validFrom: tiling.tileStart(k) };
     // Right after a seek the player has no audio before the new position. For the tile under
     // the playhead, separate what exists (the unheard part before it is treated as silence)
     // instead of waiting for the next tile boundary.
@@ -169,7 +189,11 @@ function pickTile(): { k: number; validFrom: number } | null {
 }
 
 async function pump(): Promise<void> {
-  if (busy || !model || !pos) return;
+  if (busy || !pos) return;
+  const f = pos.filter ?? DEFAULT_FILTER;
+  if (f.musicRemoval && !model) return;
+  // wait for the recognizer; if it failed to load, tiles go out unfiltered (the page shows why)
+  if (f.profanity !== 'off' && (profanity.state === 'idle' || profanity.state === 'loading')) return;
   const pick = pickTile();
   if (pick === null) return;
   const { k, validFrom } = pick;
@@ -180,12 +204,19 @@ async function pump(): Promise<void> {
   try {
     const t0 = performance.now();
     const [a, b] = tiling.inputRange(k);
-    const decoded = await decodePackets(s.store.range(a - 0.12, b + 0.05));
+    const ctxS = f.profanity !== 'off' ? CONTEXT_S : 0; // speech recognition also hears around the tile
+    const decoded = await decodePackets(s.store.range(a - 0.12 - ctxS, b + 0.05 + ctxS));
     if (!decoded) throw new Error('nothing decoded');
     const L = resampleCubic(decoded.left, decoded.sampleRate, decoded.start, tiling.rate, a, tiling.chunkSize);
     const R = resampleCubic(decoded.right, decoded.sampleRate, decoded.start, tiling.rate, a, tiling.chunkSize);
     const mixLeft = pos.debug ? L.slice(tiling.trim, tiling.trim + tiling.genSize) : undefined;
-    const [left, right] = await separateWindow(mdx, model.run, L, R, scratch);
+    const [left, right] = f.musicRemoval
+      ? await separateWindow(mdx, model!.run, L, R, scratch)
+      : [L.slice(tiling.trim, tiling.trim + tiling.genSize), R.slice(tiling.trim, tiling.trim + tiling.genSize)];
+    const { report, patch } =
+      f.profanity !== 'off'
+        ? await profanity.filterTile({ session: sessionId, k, start: tiling.tileStart(k), validFrom, rate: tiling.rate, left, right, decoded, separated: f.musicRemoval, mode: f.profanity, debug: pos.debug })
+        : {};
     const dt = (performance.now() - t0) / 1000;
     computeSec += dt;
     audioSec += tiling.tileSeconds;
@@ -195,9 +226,10 @@ async function pump(): Promise<void> {
     const transfer: Transferable[] = [left.buffer, right.buffer];
     if (mixLeft) transfer.push(mixLeft.buffer);
     post(
-      { type: 'tile', session: sessionId, k, start: tiling.tileStart(k), validFrom, sampleRate: tiling.rate, left, right, mixLeft, computeMs: dt * 1000 },
+      { type: 'tile', session: sessionId, k, start: tiling.tileStart(k), validFrom, sampleRate: tiling.rate, left, right, mixLeft, computeMs: dt * 1000, cfg: filterKey(f), profanity: report },
       transfer,
     );
+    if (patch) post({ ...patch, type: 'tile', session: sessionId, sampleRate: tiling.rate, cfg: filterKey(f) }, [patch.left.buffer, patch.right.buffer]);
   } catch (e) {
     console.warn('[music-remover] tile failed', k, e);
     failedAt.set(key, Date.now());
@@ -213,6 +245,9 @@ function updateStatus(force = false): void {
   const now = Date.now();
   if (!force && now - lastStatus < 500) return;
   lastStatus = now;
+  status.asr = profanity.state;
+  status.asrError = profanity.error;
+  status.asrMs = profanity.avgMs;
   if (pos) {
     const kNow = Math.max(0, tiling.tileAt(pos.time));
     let k = kNow;
@@ -230,6 +265,10 @@ function updateStatus(force = false): void {
 }
 
 setInterval(() => {
+  if (!busy && Date.now() - lastEnabledAt > IDLE_RELEASE_MS && profanity.state === 'ready') {
+    void profanity.release();
+    updateStatus(true);
+  }
   if (model && !busy && Date.now() - lastEnabledAt > IDLE_RELEASE_MS) {
     const m = model;
     model = null;

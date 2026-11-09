@@ -7,9 +7,12 @@
 import {
   DEFAULT_SETTINGS,
   MSG_NS,
+  filterKey,
+  type FilterConfig,
   type FromWorker,
   type PageStatus,
   type Settings,
+  type TileProfanityReport,
   type ToWorker,
   type WorkerStatus,
 } from '../shared/messages';
@@ -132,6 +135,9 @@ declare global {
   let settings: Settings = { ...DEFAULT_SETTINGS };
   let workerStatus: WorkerStatus | null = null;
   let tileSeconds = 253440 / 44100;
+  const filterCfg = (): FilterConfig => ({ musicRemoval: settings.musicRemoval, profanity: settings.profanity });
+  /** Master switch on and at least one of the two features selected. */
+  const active = (): boolean => settings.enabled && (settings.musicRemoval || settings.profanity !== 'off');
 
   window.addEventListener('message', (e: MessageEvent) => {
     const d = e.data as { ns?: string; from?: string; kind?: string; msg?: FromWorker; settings?: Settings };
@@ -165,6 +171,9 @@ declare global {
     validFrom: number;
     mix?: Float32Array;
     stretched?: { rate: number; buf: AudioBuffer };
+    /** Settings the tile was made with; tiles of older settings play until replaced. */
+    cfg?: string;
+    profanity?: TileProfanityReport;
   }
   let debugMode = false;
   try {
@@ -197,8 +206,19 @@ declare global {
       buf.copyToChannel(msg.left as Float32Array<ArrayBuffer>, 0);
       buf.copyToChannel(msg.right as Float32Array<ArrayBuffer>, 1);
       const prev = this.tiles.get(msg.k);
-      if (prev && prev.validFrom <= msg.validFrom && this.scheduled.has(msg.k)) return; // keep what's playing
-      this.tiles.set(msg.k, { buf, start: msg.start, validFrom: msg.validFrom, mix: msg.mixLeft });
+      if (prev && prev.cfg === msg.cfg && prev.validFrom <= msg.validFrom && this.scheduled.has(msg.k)) return; // keep what's playing
+      const old = this.scheduled.get(msg.k);
+      if (prev && prev.cfg !== msg.cfg && old) {
+        // settings changed: swap in the new version from the current position
+        try {
+          old.stop();
+          old.disconnect();
+        } catch {
+          /* already stopped */
+        }
+        this.scheduled.delete(msg.k);
+      }
+      this.tiles.set(msg.k, { buf, start: msg.start, validFrom: msg.validFrom, mix: msg.mixLeft, cfg: msg.cfg, profanity: msg.profanity });
       dbg.tilesReceived++;
       tick();
     }
@@ -308,11 +328,11 @@ declare global {
       const sid = sessionOf(v);
       if (sid !== this.session) this.resetSession(sid);
 
-      if (!settings.enabled || !sid) {
+      if (!active() || !sid) {
         const a = this.attached.get(v);
         if (a) a.orig.gain.value = 1;
         this.stopAll();
-        this.state = settings.enabled ? 'no-video' : 'disabled';
+        this.state = active() ? 'no-video' : 'disabled';
         badge.update(v, this.state);
         this.sendPosition(v, false);
         return;
@@ -397,8 +417,9 @@ declare global {
         time: v.currentTime,
         duration: Number.isFinite(v.duration) ? v.duration : Infinity,
         enabled,
-        have: [...this.tiles.keys()],
+        have: [...this.tiles].filter(([, tl]) => tl.cfg === filterKey(filterCfg())).map(([kk]) => kk),
         debug: debugMode,
+        filter: filterCfg(),
       });
     }
   })();
@@ -435,12 +456,16 @@ declare global {
       if (this.el.parentElement !== host) host.appendChild(this.el);
 
       const ws = workerStatus;
+      const music = settings.musicRemoval;
+      const filter = settings.profanity !== 'off';
       let text: string;
-      if (ws?.model === 'error') text = `⚠ Music Remover: ${ws.error ?? 'ошибка модели'}`;
-      else if (state === 'suspended') text = '🔇 Нажмите на страницу, чтобы включить звук без музыки';
-      else if (!ws || ws.model === 'loading' || ws.model === 'idle') text = '⏳ Загружаю модель…';
-      else if (state === 'waiting') text = '⏳ Убираю музыку…';
-      else text = '🎙 Без музыки';
+      if (music && ws?.model === 'error') text = `⚠ Music Remover: ${ws.error ?? 'ошибка модели'}`;
+      else if (state === 'suspended') text = `🔇 Нажмите на страницу, чтобы включить ${music ? 'звук без музыки' : 'фильтр мата'}`;
+      else if (!ws || (music && (ws.model === 'loading' || ws.model === 'idle')) || (filter && (ws.asr === 'loading' || ws.asr === 'idle' || !ws.asr)))
+        text = '⏳ Загружаю модель…';
+      else if (state === 'waiting') text = music ? '⏳ Убираю музыку…' : '⏳ Проверяю речь…';
+      else if (filter && ws.asr === 'error') text = `⚠ Фильтр мата не работает: ${ws.asrError ?? 'ошибка распознавания речи'}`;
+      else text = music && filter ? '🎙 Без музыки и мата' : music ? '🎙 Без музыки' : '🎙 Без мата';
 
       if (state === 'clean' || state === 'paused') {
         if (!this.cleanSince) this.cleanSince = performance.now();
@@ -501,7 +526,7 @@ declare global {
         const t = player.tiles.get(k);
         if (!t) return null;
         const q = (a: Float32Array) => Array.from(a, (x) => Math.round(Math.max(-1, Math.min(1, x)) * 32767));
-        return { start: t.start, clean: q(t.buf.getChannelData(0)), mix: t.mix ? q(t.mix) : null };
+        return { start: t.start, cfg: t.cfg, profanity: t.profanity ?? null, clean: q(t.buf.getChannelData(0)), mix: t.mix ? q(t.mix) : null };
       },
     };
   }

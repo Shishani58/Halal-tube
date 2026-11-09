@@ -14,8 +14,10 @@ export type CensorMode = 'mute' | 'beep';
 
 export interface CensorOptions {
   mode: CensorMode;
-  /** Extra time masked before and after each word (s). Word timestamps are ±tens of ms. */
+  /** Extra time masked after (and, unless padBefore is given, before) each word (s). */
   pad?: number;
+  /** Extra time masked before each word (s). */
+  padBefore?: number;
   /** Raised-cosine ramp length at each edge (s), inside the padded span. */
   fade?: number;
   /** Beep frequency (Hz). */
@@ -23,11 +25,12 @@ export interface CensorOptions {
 }
 
 /**
- * 80 ms: after the timing calibration in asr.ts, recognized word edges are within about
- * ±60–100 ms of the true ones (tests/e2e/asr-bench.mjs), so a slightly wider pad than 60 ms
- * keeps word onsets from leaking.
+ * After the timing calibration in asr.ts, recognized word edges are within about ±60–100 ms of
+ * the true ones (tests/e2e/asr-bench.mjs, profanity.mjs), starts more often late than early,
+ * so the pad is a bit wider than 60 ms, and wider before the word than after it.
  */
 export const CENSOR_PAD = 0.08;
+export const CENSOR_PAD_BEFORE = 0.1;
 export const CENSOR_FADE = 0.01;
 export const BEEP_HZ = 1000;
 /** Beep level bounds (peak amplitude) in case the measured speech level is silent or clipped. */
@@ -35,10 +38,10 @@ const BEEP_MIN = 0.03;
 const BEEP_MAX = 0.6;
 
 /** Pad every span and merge the ones that touch or overlap. Sorted output. */
-export function padAndMerge(spans: Span[], pad: number): Span[] {
+export function padAndMerge(spans: Span[], pad: number, padBefore = pad): Span[] {
   const s = spans
     .filter((x) => x.end > x.start - 1e-9)
-    .map((x) => ({ start: x.start - pad, end: x.end + pad }))
+    .map((x) => ({ start: x.start - padBefore, end: x.end + pad }))
     .sort((a, b) => a.start - b.start);
   const out: Span[] = [];
   for (const x of s) {
@@ -93,11 +96,12 @@ export function applyCensor(
   levelRef: Float32Array[] = channels,
 ): Span[] {
   const pad = opts.pad ?? CENSOR_PAD;
+  const padBefore = opts.padBefore ?? (opts.pad !== undefined ? opts.pad : CENSOR_PAD_BEFORE);
   const fade = opts.fade ?? CENSOR_FADE;
   const hz = opts.beepHz ?? BEEP_HZ;
   const n = channels[0]?.length ?? 0;
   const t1 = t0 + n / sampleRate;
-  const spans = padAndMerge(words, pad).filter((s) => s.end > t0 && s.start < t1);
+  const spans = padAndMerge(words, pad, padBefore).filter((s) => s.end > t0 && s.start < t1);
   // Beep level: match the RMS of the speech under each (unpadded) word, so the beep is as loud
   // as the word it replaces. A sine with peak A has RMS A/√2.
   const levels = spans.map((sp) => {
