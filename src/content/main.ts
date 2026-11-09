@@ -26,28 +26,10 @@ declare global {
   window.__musicRemoverMain = true;
 
   // ───────────────────────── transport ─────────────────────────
-  let procWin: Window | null = null;
-  let procOrigin = '';
-  const queue: { msg: ToWorker; transfer: Transferable[] }[] = [];
-  let queuedBytes = 0;
-
-  function send(msg: ToWorker, transfer: Transferable[] = []): void {
-    if (procWin) {
-      try {
-        procWin.postMessage({ ns: MSG_NS, msg }, procOrigin, transfer);
-        return;
-      } catch {
-        procWin = null;
-      }
-    }
-    if (msg.type === 'position') return; // stale positions are useless
-    queue.push({ msg, transfer });
-    if (msg.type === 'append') queuedBytes += msg.data.byteLength;
-    // keep memory bounded if the processor never shows up
-    while (queuedBytes > 64 * 1024 * 1024 && queue.length) {
-      const old = queue.shift()!;
-      if (old.msg.type === 'append') queuedBytes -= old.msg.data.byteLength;
-    }
+  // The ISOLATED-world bridge forwards these to the extension's offscreen processor.
+  let procReady = false;
+  function send(msg: ToWorker): void {
+    window.postMessage({ ns: MSG_NS, from: 'main', kind: 'to-worker', msg }, '*');
   }
 
   // ───────────────────────── MSE hooks ─────────────────────────
@@ -100,7 +82,7 @@ declare global {
         try {
           const copy = toArrayBuffer(data);
           hookStats.audioBytes += copy.byteLength;
-          send({ type: 'append', session: meta.session, sb: meta.id, data: copy, tsOffset: this.timestampOffset }, [copy]);
+          send({ type: 'append', session: meta.session, sb: meta.id, data: copy, tsOffset: this.timestampOffset });
         } catch {
           /* ignore */
         }
@@ -159,14 +141,10 @@ declare global {
       tick();
       return;
     }
-    if (d.from === 'processor' && d.msg && typeof e.origin === 'string' && e.origin.startsWith('chrome-extension://')) {
+    if (d.from === 'processor' && d.msg && e.source === window) {
       const msg = d.msg;
       if (msg.type === 'ready') {
-        procWin = e.source as Window;
-        procOrigin = e.origin;
-        const pending = queue.splice(0);
-        queuedBytes = 0;
-        for (const q of pending) send(q.msg, q.transfer);
+        procReady = true;
         lastPosSent = 0;
         tick();
       } else if (msg.type === 'tiling') {
@@ -504,7 +482,7 @@ declare global {
           ctxState: player.ctx?.state,
           worker: workerStatus,
           time: player.video?.currentTime,
-          procConnected: !!procWin,
+          procConnected: procReady,
           hookLog: hookLog.slice(-8),
           hookStats,
           videoSrc: player.video?.currentSrc?.slice(0, 60),

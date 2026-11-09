@@ -146,6 +146,23 @@ for (let i = 0; i < 5; i++) {
 }
 await page.evaluate(() => (document.getElementById('v').playbackRate = 1));
 
+// ── processor killed mid-playback: must come back by itself (replay of headers + recent audio) ──
+{
+  const swk = ctx.serviceWorkers()[0];
+  await swk.evaluate(() => chrome.offscreen.closeDocument());
+  const tk = Date.now();
+  let back = null;
+  await page.evaluate(() => { const v = document.getElementById('v'); v.currentTime = 12; });
+  while (Date.now() - tk < 20000) {
+    await page.waitForTimeout(500);
+    const x = await info();
+    if (x.state === 'clean' && Date.now() - tk > 1500) { back = (Date.now() - tk) / 1000; break; }
+  }
+  await page.waitForTimeout(2000);
+  const xr = await info();
+  console.log(`processor restart → clean again after ${back}s; new worker: model=${xr.worker?.model} tilesDone=${xr.worker?.tilesDone} inputAhead=${xr.worker?.inputAhead?.toFixed(0)}s (replayed audio)`);
+}
+
 // ── badge screenshot, then disable via storage (as the popup does) ──
 await page.screenshot({ path: '/tmp/mr/e2e/local-player.png', clip: { x: 0, y: 0, width: 700, height: 460 } });
 const sw = ctx.serviceWorkers()[0];

@@ -31,7 +31,6 @@ function copyStatic() {
     const mf = join(dist, 'manifest.json');
     const m = JSON.parse(readFileSync(mf, 'utf8'));
     for (const cs of m.content_scripts) cs.matches.push('http://localhost/*');
-    m.web_accessible_resources[0].matches.push('http://localhost/*');
     writeFileSync(mf, JSON.stringify(m, null, 2));
   }
 }
@@ -46,8 +45,8 @@ const common = {
 };
 
 const builds = [
-  { entryPoints: { 'content/main': 'src/content/main.ts', 'content/bridge': 'src/content/bridge.ts', 'processor/processor': 'src/processor/processor.ts' }, format: 'iife' },
-  { entryPoints: { background: 'src/background.ts', 'processor/worker': 'src/processor/worker.ts', 'popup/popup': 'src/popup/popup.ts', 'bench/bench': 'src/bench/bench.ts' }, format: 'esm' },
+  { entryPoints: { 'content/main': 'src/content/main.ts', 'content/bridge': 'src/content/bridge.ts', }, format: 'iife' },
+  { entryPoints: { background: 'src/background.ts', 'processor/offscreen': 'src/processor/offscreen.ts', 'processor/worker': 'src/processor/worker.ts', 'popup/popup': 'src/popup/popup.ts', 'bench/bench': 'src/bench/bench.ts' }, format: 'esm' },
 ];
 
 if (!watch) rmSync(dist, { recursive: true, force: true });

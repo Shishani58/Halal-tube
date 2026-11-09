@@ -34,7 +34,7 @@
 ## Как это работает
 
 ```
-YouTube player ──appendBuffer──► mse hook (MAIN world) ──postMessage──► iframe расширения ──► Worker
+YouTube player ──appendBuffer──► mse hook (MAIN world) ──► bridge ──Port──► offscreen-документ ──► Worker
      │                                                                                         │
      │ <video> → Web Audio: оригинал заглушён (gain 0)                    демукс WebM/MP4 → WebCodecs
      │                                                                    → ресемпл 44.1 кГц → STFT
@@ -42,7 +42,7 @@ YouTube player ──appendBuffer──► mse hook (MAIN world) ──postMessa
 ```
 
 1. **Перехват.** Скрипт в контексте страницы подменяет `SourceBuffer.appendBuffer` и копирует аудио-сегменты в момент, когда плеер YouTube их подгружает, то есть на 20–120 с вперёд.
-2. **Обработка** в скрытом iframe расширения (внутри Worker):
+2. **Обработка** в offscreen-документе расширения, вне страницы (внутри Worker):
    - разбор WebM/Opus или fMP4/AAC и декодирование через WebCodecs;
    - нарезка на фрагменты по 5,75 с;
    - нейросеть на WebGPU отделяет голос от музыки.
@@ -92,8 +92,8 @@ npm run package        # zip для установки / Chrome Web Store
 
 ```
 src/core/         FFT (смешанные основания), STFT/iSTFT для MDX, ресемплинг, WSOLA, демуксеры WebM/MP4
-src/processor/    iframe + Worker: хранилище пакетов, WebCodecs-декодер, ONNX Runtime (WebGPU)
-src/content/      main.ts (MAIN world: хук MSE + плеер + значок), bridge.ts (настройки, iframe)
+src/processor/    offscreen-документ + Worker: хранилище пакетов, WebCodecs-декодер, ONNX Runtime (WebGPU)
+src/content/      main.ts (MAIN world: хук MSE + плеер + значок), bridge.ts (настройки, связь с процессором, повтор заголовков)
 src/popup/        всплывающее окно
 static/           manifest.json, html/css
 tests/            юнит-тесты и e2e (Playwright)
