@@ -1,10 +1,12 @@
 /// <reference lib="webworker" />
 /**
  * Frame classifier for blurring. Receives the video track as the player buffers it (ahead of
- * playback), decodes it GOP by GOP with WebCodecs and classifies ~4 frames per second:
- *   1. NudeNet (YOLOv8n, WebGPU) on a 320×320 copy → nudity scores + face boxes;
- *   2. InsightFace genderage (1.3 MB, WASM) on each face crop → is it a woman.
- * Reports which time ranges were checked and what was found.
+ * playback) and decodes it GOP by GOP with WebCodecs. Every decoded frame is shrunk to a 32×18
+ * thumbnail to find shot cuts; frames are classified at each cut (the first frame of a new shot),
+ * when the picture has changed enough since the last look, and at least every 0.5 s:
+ *   1. NudeNet (YOLOv8n, WebGPU) on a 320×320 copy → nudity scores, face and body boxes;
+ *   2. InsightFace genderage (1.3 MB, WASM) on each face crop → is it a woman, and where she is.
+ * Reports which time ranges were checked, where the cuts are and what was found where.
  *
  * Every frame has to be decoded (inter-frame coding), but only sampled frames are copied (on the
  * GPU, into an ImageBitmap) and only 320×320 + 96×96 face crops are read back; everything else is
@@ -15,19 +17,28 @@
 import { createDemuxer, type Demuxer, type Packet } from '../core/demux';
 import { IntervalSet } from '../core/intervals';
 import {
+  BODY_CLASSES,
   GENDER_INPUT as GS,
+  GROUPS,
+  FEMALE_BODY_MIN,
   NUDENET_BATCH as B,
   NUDENET_INPUT as S,
+  detectBoxes,
   detectFaces,
   faceCrop,
   femaleProb,
   femaleScore,
   letterbox,
+  personFromBody,
+  personFromFace,
   rgbaToChw,
   rgbaToGenderInput,
   scoreFrames,
+  toFrame,
+  type Rect,
 } from '../core/nudenet';
-import type { FromVision, ToVision, VisionStatus } from '../shared/vision-messages';
+import { ShotTracker, THUMB_H, THUMB_W, isEdgeCut, makeThumb, type Thumb } from '../core/shots';
+import type { FromVision, ToVision, VisionFrame, VisionStatus } from '../shared/vision-messages';
 import { loadModel, type LoadedModel } from './model';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -38,12 +49,16 @@ const GENDER_FILE = 'genderage.onnx';
 const G = 8;
 /** Longest side of the frame copy kept for face crops. */
 const HI = 960;
+/** Faces the gender classifier calls a woman at least this surely are reported (the page applies the threshold). */
+const WOMAN_REPORT = 0.3;
+/** Analysed GOP edges remembered per session (cuts across GOP boundaries). */
+const MAX_EDGES = 256;
 /** Faces smaller than this (px in the HI copy) are too small to classify. */
 const MIN_FACE = 20;
-/** Seconds between classified frames. */
-const STEP = 0.25;
 /** A still-growing GOP under the playhead is re-analysed once this many new seconds arrived. */
 const PARTIAL_MIN = 1;
+/** …or, on its first pass, once it holds this much. */
+const PARTIAL_FIRST = 0.25;
 /** Analyse up to this far ahead of the playhead. */
 const LOOKAHEAD = 180;
 const KEEP_BEHIND = 5;
@@ -81,10 +96,23 @@ interface Sb {
   cur: Gop | null;
 }
 
+/** First and last frame thumbnails of an analysed GOP: cuts across GOP boundaries. */
+interface Edge {
+  start: number;
+  /** Time just past the last frame. */
+  end: number;
+  first: Thumb;
+  last: Thumb;
+  /** Frame-to-frame motion at the start / end (NaN: unknown). */
+  startRecent: number;
+  endRecent: number;
+}
+
 interface Session {
   sbs: Map<number, Sb>;
   gops: Gop[];
   checked: IntervalSet;
+  edges: Edge[];
   lastUsed: number;
 }
 
@@ -108,7 +136,7 @@ const post = (m: FromVision) => self.postMessage(m);
 function session(id: number): Session {
   let s = sessions.get(id);
   if (!s) {
-    s = { sbs: new Map(), gops: [], checked: new IntervalSet(), lastUsed: Date.now() };
+    s = { sbs: new Map(), gops: [], checked: new IntervalSet(), edges: [], lastUsed: Date.now() };
     sessions.set(id, s);
     if (sessions.size > MAX_SESSIONS) {
       const oldest = [...sessions.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
@@ -288,7 +316,7 @@ function pickGop(s: Session, t: number): Gop | null {
     // appends pause, or once enough new frames came in. Each pass re-decodes from the keyframe.
     if (g.start <= t + 3 && g.packets.length > g.analyzedCount) {
       const fresh = g.end - Math.max(g.start, g.analyzedTo);
-      if (now - g.lastAppend > 300 || fresh >= PARTIAL_MIN || (g.analyzedCount === 0 && fresh >= STEP)) return g;
+      if (now - g.lastAppend > 300 || fresh >= PARTIAL_MIN || (g.analyzedCount === 0 && fresh >= PARTIAL_FIRST)) return g;
     }
   }
   return null;
@@ -338,15 +366,16 @@ async function pump(): Promise<void> {
   schedule();
 }
 
-/** Classify shots: nudity scores and face boxes, then the gender of each face. → flat samples */
-async function classify(shots: Shot[]): Promise<number[]> {
+/** Classify frames: nudity scores, face and body boxes, then the gender of each face. */
+async function classify(shots: Shot[]): Promise<VisionFrame[]> {
   loCtx ??= ctx(S, S);
   faceCtx ??= ctx(GS, GS);
   const lo = loCtx, fc = faceCtx;
   const n = shots.length;
+  const boxes = shots.map((x) => letterbox(x.bmp.width, x.bmp.height));
   for (let j = 0; j < n; j++) {
     const { bmp } = shots[j];
-    const { dw, dh } = letterbox(bmp.width, bmp.height);
+    const { dw, dh } = boxes[j];
     lo.fillStyle = '#000';
     lo.fillRect(0, 0, S, S);
     lo.drawImage(bmp, 0, 0, dw, dh);
@@ -356,13 +385,13 @@ async function classify(shots: Shot[]): Promise<number[]> {
   const scores = scoreFrames(out, B, n);
 
   // face crops from the higher-resolution copies
-  const owners: number[] = [];
-  const probs: number[][] = shots.map(() => []);
+  const faces: { face: Rect; p: number }[][] = shots.map(() => []);
+  let queued: { j: number; face: Rect }[] = [];
   const flush = async () => {
-    if (!owners.length) return;
+    if (!queued.length) return;
     const g = await gender!.run(genIn);
-    owners.forEach((j, i) => probs[j].push(femaleProb(g, i)));
-    owners.length = 0;
+    queued.forEach((o, i) => faces[o.j].push({ face: o.face, p: femaleProb(g, i) }));
+    queued = [];
   };
   for (let j = 0; j < n; j++) {
     const { bmp } = shots[j];
@@ -373,20 +402,73 @@ async function classify(shots: Shot[]): Promise<number[]> {
       fc.fillStyle = '#000';
       fc.fillRect(0, 0, GS, GS);
       fc.drawImage(bmp, c.x * k, c.y * k, c.side * k, c.side * k, 0, 0, GS, GS);
-      rgbaToGenderInput(fc.getImageData(0, 0, GS, GS).data, GS, genIn, owners.length * 3 * GS * GS);
-      owners.push(j);
-      if (owners.length === G) await flush();
+      rgbaToGenderInput(fc.getImageData(0, 0, GS, GS).data, GS, genIn, queued.length * 3 * GS * GS);
+      queued.push({ j, face: toFrame(box, boxes[j].dw, boxes[j].dh) });
+      if (queued.length === G) await flush();
     }
   }
   await flush();
 
   const r = (x: number) => Math.round(x * 1000) / 1000;
-  const samples: number[] = [];
+  const frames: VisionFrame[] = [];
   for (let j = 0; j < n; j++) {
     const sc = scores[j];
-    samples.push(+shots[j].t.toFixed(3), r(sc.nude), r(sc.skin), r(femaleScore(probs[j], sc.femaleBody)));
+    const { dw, dh } = boxes[j];
+    const parts = detectBoxes(out, B, j, BODY_CLASSES, 0.3, 12).map((x) => toFrame(x, dw, dh));
+    const women: number[] = [];
+    const regions: Rect[] = [];
+    for (const f of faces[j]) {
+      if (f.p < WOMAN_REPORT) continue;
+      const reg = personFromFace(f.face, parts);
+      regions.push(reg);
+      women.push(r(reg.x), r(reg.y), r(reg.w), r(reg.h), r(f.p));
+    }
+    // a woman's body without a face found (turned away, face cut off)
+    for (const x of detectBoxes(out, B, j, GROUPS.femaleBody, FEMALE_BODY_MIN, 4)) {
+      const part = toFrame(x, dw, dh);
+      const cx = part.x + part.w / 2, cy = part.y + part.h / 2;
+      if (regions.some((q) => cx >= q.x && cx <= q.x + q.w && cy >= q.y && cy <= q.y + q.h)) continue;
+      const reg = personFromBody(part);
+      regions.push(reg);
+      women.push(r(reg.x), r(reg.y), r(reg.w), r(reg.h), r(x.score));
+    }
+    frames.push({
+      t: shots[j].t,
+      nude: r(sc.nude),
+      skin: r(sc.skin),
+      female: r(femaleScore(faces[j].map((f) => f.p), sc.femaleBody)),
+      women,
+    });
   }
-  return samples;
+  return frames;
+}
+
+let thumbCtx: OffscreenCanvasRenderingContext2D | null = null;
+
+/** 32×18 thumbnail of a decoded frame (one tiny GPU readback). */
+function thumbOf(f: VideoFrame): Thumb {
+  if (!thumbCtx) {
+    thumbCtx = new OffscreenCanvas(THUMB_W, THUMB_H).getContext('2d', { alpha: false })!;
+    thumbCtx.imageSmoothingQuality = 'high';
+  }
+  thumbCtx.drawImage(f, 0, 0, THUMB_W, THUMB_H);
+  return makeThumb(thumbCtx.getImageData(0, 0, THUMB_W, THUMB_H).data);
+}
+
+const ms = (t: number) => Math.round(t * 1000) / 1000;
+
+/** Remember a GOP's edge frames; decide the cuts at its boundaries with the GOPs around it. */
+function edgeCuts(s: Session, e: Edge, closed: boolean): [number, number][] {
+  const out: [number, number][] = [];
+  const list = s.edges.filter((x) => Math.abs(x.start - e.start) > 0.01);
+  for (const x of list) {
+    if (Math.abs(x.end - e.start) < 0.1) out.push([e.start, isEdgeCut(x.last, x.endRecent, e.first, e.startRecent) ? 1 : 0]);
+    if (closed && Math.abs(e.end - x.start) < 0.1) out.push([x.start, isEdgeCut(e.last, e.endRecent, x.first, x.startRecent) ? 1 : 0]);
+  }
+  list.push(e);
+  list.sort((p, q) => p.start - q.start);
+  s.edges = list.length > MAX_EDGES ? list.slice(-MAX_EDGES) : list;
+  return out;
 }
 
 async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
@@ -398,8 +480,8 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   hiCtx ??= ctx(16, 16);
   const hc = hiCtx;
   const pending: Shot[] = [];
-  const samples: number[] = [];
-  let next = from + STEP;
+  const frames: VisionFrame[] = [];
+  const shotsOf = new ShotTracker();
   let lastT = -Infinity;
   let lastShot = -Infinity;
   let lastDur = 0;
@@ -409,11 +491,11 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   const decoder = new VideoDecoder({
     output: (f) => {
       try {
-        const t = f.timestamp / 1e6;
+        const t = ms(f.timestamp / 1e6);
         lastT = Math.max(lastT, t);
         lastDur = (f.duration ?? 0) / 1e6 || lastDur;
-        if (t > from + 1e-3 && t >= next - 0.02) {
-          next = t + STEP;
+        const { sample } = shotsOf.push(t, thumbOf(f));
+        if (sample && t > from + 1e-3) {
           // GPU-side copy at ≤ HI px; the VideoFrame can be released immediately
           const k = Math.min(1, HI / Math.max(f.displayWidth, f.displayHeight));
           const w = Math.max(1, Math.round(f.displayWidth * k)), h = Math.max(1, Math.round(f.displayHeight * k));
@@ -436,7 +518,7 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   const runBatch = async () => {
     const batch = pending.splice(0, B);
     try {
-      samples.push(...(await classify(batch)));
+      frames.push(...(await classify(batch)));
       shots += batch.length;
     } finally {
       for (const x of batch) x.bmp.close();
@@ -470,12 +552,16 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   }
 
   const spanFrom = Number.isFinite(from) ? from : g.start;
-  const spanTo = wasClosed ? g.end : lastT + (lastDur || 1 / 30);
+  const frameEnd = lastT + (lastDur || 1 / 30);
+  const spanTo = wasClosed ? g.end : frameEnd;
   if (Number.isFinite(lastShot)) g.analyzedTo = lastShot;
   g.analyzedCount = packets.length;
+  const edges =
+    shotsOf.first && shotsOf.last ? edgeCuts(s, { start: ms(shotsOf.firstT), end: wasClosed ? g.end : frameEnd, first: shotsOf.first, last: shotsOf.last, startRecent: shotsOf.startRecent, endRecent: shotsOf.endRecent }, wasClosed) : [];
   if (spanTo > spanFrom) s.checked.add(spanFrom, spanTo);
   if (wasClosed) free(g);
-  if (spanTo > spanFrom) post({ type: 'result', session: sid, from: spanFrom, to: spanTo, samples });
+  if (spanTo > spanFrom)
+    post({ type: 'result', session: sid, from: spanFrom, to: spanTo, frames, cuts: shotsOf.cuts, cutRange: [g.start, spanTo], edges });
 
   status.frames += shots;
   workSec += (performance.now() - t0) / 1000;

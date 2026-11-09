@@ -1,12 +1,14 @@
 /**
  * MAIN world: blurring. Forwards the video track (as the player buffers it, i.e. ahead of
- * playback) to the frame classifier and blurs <video> elements whenever the frame on screen
- * is flagged — or, in strict mode, not checked yet. The blur is a CSS filter on the element:
- * composited on the GPU, no pixel work in the page.
+ * playback) to the frame classifier and blurs what the frame on screen must not show:
+ *  - women: only where they are — boxes laid over the video with `backdrop-filter: blur()`;
+ *  - nudity, and (strict mode) frames not checked yet: the whole frame, a CSS filter on <video>.
+ * Both are composited on the GPU, no pixel work in the page. While a video plays, the decision is
+ * remade every animation frame, so boxes follow the people and switch exactly at shot cuts.
  */
 import { MSG_NS, type Settings } from '../shared/messages';
 import { isInitSegment, type FromVision, type PageVision, type ToVision, type VisionStatus } from '../shared/vision-messages';
-import { VisionTimeline } from '../core/vision-timeline';
+import { VisionTimeline, type Decision } from '../core/vision-timeline';
 
 interface VideoSb {
   id: number;
@@ -20,6 +22,31 @@ interface VideoSb {
 
 const MAX_SBS = 8;
 const MAX_TIMELINES = 8;
+/**
+ * The frame on screen can be a little ahead of `currentTime` (and the boxes land on the next
+ * paint): decisions also look this far ahead (seconds of playback at 1×) and behind.
+ */
+const LEAD = 0.12;
+const LAG = 0.05;
+
+/** Boxes over one video (women's regions). */
+interface Overlay {
+  root: HTMLDivElement;
+  boxes: HTMLDivElement[];
+  fit: string;
+  fitAt: number;
+}
+
+/** Element-space rectangle the picture occupies inside a <video> (object-fit). */
+function contentBox(v: HTMLVideoElement, r: DOMRect, fit: string): { x: number; y: number; w: number; h: number } {
+  const W = r.width, H = r.height;
+  const vw = v.videoWidth || W, vh = v.videoHeight || H;
+  if (fit === 'fill' || !vw || !vh) return { x: 0, y: 0, w: W, h: H };
+  let k = fit === 'cover' ? Math.max(W / vw, H / vh) : fit === 'none' ? 1 : Math.min(W / vw, H / vh);
+  if (fit === 'scale-down') k = Math.min(1, Math.min(W / vw, H / vh));
+  const w = vw * k, h = vh * k;
+  return { x: (W - w) / 2, y: (H - h) / 2, w, h };
+}
 
 function copyOf(data: BufferSource): ArrayBuffer {
   if (data instanceof ArrayBuffer) return data.slice(0);
@@ -39,7 +66,12 @@ export class VisionController {
   private active = false;
   private lastPos = 0;
   private blurred = new Set<HTMLVideoElement>();
+  private overlays = new Map<HTMLVideoElement, Overlay>();
   private ambientHidden = false;
+  private activeVideo: HTMLVideoElement | null = null;
+  private raf = 0;
+  /** Women boxes on the active video right now. */
+  private regions = 0;
   status: VisionStatus | null = null;
   state: PageVision['state'] = 'off';
 
@@ -104,7 +136,7 @@ export class VisionController {
       else tl = new VisionTimeline();
       this.timelines.set(msg.session, tl);
       if (this.timelines.size > MAX_TIMELINES) this.timelines.delete(this.timelines.keys().next().value!);
-      tl.add(msg.from, msg.to, msg.samples);
+      tl.add(msg);
     } else if (msg.type === 'ready') this.lastPos = 0;
   }
 
@@ -121,23 +153,8 @@ export class VisionController {
       for (const sb of this.sbs.values()) sb.announced = false;
       if (on) for (const sb of this.sbs.values()) this.announce(sb);
     }
-    let activeBlurred = false;
-    const seen = new Set<HTMLVideoElement>();
-    if (on) {
-      for (const v of Array.from(document.querySelectorAll('video'))) {
-        seen.add(v);
-        const verdict = this.verdict(v, s);
-        const blur = verdict === 'unsafe' || (verdict === 'unknown' && s.blurStrict);
-        this.apply(v, blur);
-        if (v === activeVideo) {
-          activeBlurred = blur;
-          this.state = verdict === 'unsafe' ? 'hidden' : verdict === 'unknown' ? 'checking' : 'clear';
-        }
-      }
-      if (!activeVideo) this.state = 'no-video';
-    } else this.state = 'off';
-    for (const v of this.blurred) if (!seen.has(v)) this.apply(v, false);
-    this.hideAmbient(activeBlurred);
+    this.activeVideo = activeVideo;
+    this.frame();
 
     const now = performance.now();
     if (activeVideo && now - this.lastPos > 250) {
@@ -151,10 +168,67 @@ export class VisionController {
     }
   }
 
-  private verdict(v: HTMLVideoElement, s: Settings): 'unsafe' | 'safe' | 'unknown' {
+  /** Decide and apply the blur for every video; repeats each animation frame while one plays. */
+  private frame(): void {
+    const s = this.getSettings();
+    const on = this.active;
+    let activeBlurred = false;
+    let playing = false;
+    const seen = new Set<HTMLVideoElement>();
+    if (on) {
+      for (const v of Array.from(document.getElementsByTagName('video'))) {
+        seen.add(v);
+        if (!v.paused && !v.ended) playing = true;
+        const d = this.decision(v, s);
+        let full = d.verdict === 'full' || (d.verdict === 'unknown' && s.blurStrict);
+        // boxes are page elements: a <video> shown fullscreen by itself (or in PiP) would leave them behind
+        if (d.verdict === 'region' && (document.fullscreenElement === v || document.pictureInPictureElement === v)) full = true;
+        this.apply(v, full);
+        this.place(v, !full && d.verdict === 'region' ? d.rects : []);
+        if (v === this.activeVideo) {
+          activeBlurred = full || d.verdict === 'region';
+          this.regions = full ? 0 : d.rects.length;
+          this.state = d.verdict === 'full' || d.verdict === 'region' ? 'hidden' : d.verdict === 'unknown' ? 'checking' : 'clear';
+        }
+      }
+      if (!this.activeVideo) this.state = 'no-video';
+    } else this.state = 'off';
+    for (const v of this.blurred) if (!seen.has(v)) this.apply(v, false);
+    for (const v of this.overlays.keys()) if (!seen.has(v)) this.place(v, []);
+    this.hideAmbient(activeBlurred);
+
+    if (on && playing && !document.hidden && !this.raf) {
+      this.raf = requestAnimationFrame(() => {
+        this.raf = 0;
+        try {
+          this.frame();
+        } catch (e) {
+          console.warn('[music-remover] blur frame error', e);
+        }
+      });
+    }
+  }
+
+  /**
+   * What to blur on v now: the shown frame and its neighbours within LEAD / LAG, so a cut or a
+   * woman coming in is covered from the first frame whatever the paint timing.
+   */
+  private decision(v: HTMLVideoElement, s: Settings): Decision {
     const sid = this.sessionOf(v);
     const tl = sid ? this.timelines.get(sid) : undefined;
-    return tl ? tl.decide(v.currentTime, { women: s.blurWomen }) : 'unknown';
+    if (!tl) return { verdict: 'unknown', rects: [] };
+    const t = v.currentTime;
+    const d = Number.isFinite(v.duration) ? v.duration : Infinity;
+    const p = { women: s.blurWomen };
+    const lead = v.paused ? 0.04 : LEAD * Math.max(1, v.playbackRate);
+    const out: Decision = { verdict: 'clear', rects: [] };
+    const rank = { clear: 0, region: 1, unknown: 2, full: 3 } as const;
+    for (const x of [t, Math.max(0, t - LAG), Math.min(t + lead, d - 0.01)]) {
+      const r = tl.decide(x, p, d);
+      if (rank[r.verdict] > rank[out.verdict]) out.verdict = r.verdict;
+      out.rects.push(...r.rects);
+    }
+    return out;
   }
 
   private apply(v: HTMLVideoElement, blur: boolean): void {
@@ -170,6 +244,64 @@ export class VisionController {
     }
   }
 
+  /** Lay blur boxes over v at the frame-relative `rects` (none: hide them). */
+  private place(v: HTMLVideoElement, rects: number[][]): void {
+    let o = this.overlays.get(v);
+    if (!rects.length) {
+      if (o) for (const b of o.boxes) b.style.display = 'none';
+      return;
+    }
+    if (!o) {
+      const root = document.createElement('div');
+      root.dataset.mrBlur = '';
+      root.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;overflow:visible;pointer-events:none;margin:0;padding:0;border:0';
+      o = { root, boxes: [], fit: 'contain', fitAt: 0 };
+      this.overlays.set(v, o);
+    }
+    if (o.root.previousSibling !== v) v.after(o.root);
+    const now = performance.now();
+    if (now - o.fitAt > 1000) {
+      const cs = getComputedStyle(v);
+      o.fit = cs.objectFit || 'contain';
+      const z = parseInt(cs.zIndex, 10);
+      o.root.style.zIndex = Number.isFinite(z) ? String(z + 1) : '';
+      o.fitAt = now;
+    }
+    const vr = v.getBoundingClientRect();
+    const origin = o.root.getBoundingClientRect();
+    const c = contentBox(v, vr, o.fit);
+    const ox = vr.left - origin.left + c.x, oy = vr.top - origin.top + c.y;
+    // clipped to the element (object-fit: cover crops the picture)
+    const minX = vr.left - origin.left, minY = vr.top - origin.top;
+    const maxX = minX + vr.width, maxY = minY + vr.height;
+    while (o.boxes.length < rects.length) {
+      const b = document.createElement('div');
+      b.style.cssText = 'position:absolute;pointer-events:none;border-radius:10px;background:rgba(120,120,120,.25)';
+      o.root.appendChild(b);
+      o.boxes.push(b);
+    }
+    o.boxes.forEach((b, i) => {
+      const r = rects[i];
+      const x0 = r ? Math.max(minX, ox + r[0] * c.w) : 0, y0 = r ? Math.max(minY, oy + r[1] * c.h) : 0;
+      const x1 = r ? Math.min(maxX, ox + (r[0] + r[2]) * c.w) : 0, y1 = r ? Math.min(maxY, oy + (r[1] + r[3]) * c.h) : 0;
+      if (x1 <= x0 || y1 <= y0) {
+        b.style.display = 'none';
+        return;
+      }
+      const w = x1 - x0, h = y1 - y0;
+      const f = `blur(${Math.max(16, Math.round(Math.min(w, h) / 5))}px)`;
+      b.style.display = 'block';
+      b.style.left = `${x0}px`;
+      b.style.top = `${y0}px`;
+      b.style.width = `${w}px`;
+      b.style.height = `${h}px`;
+      if (b.style.getPropertyValue('backdrop-filter') !== f) {
+        b.style.setProperty('backdrop-filter', f);
+        b.style.setProperty('-webkit-backdrop-filter', f);
+      }
+    });
+  }
+
   /** YouTube's ambient mode paints the current frame around the player: hide it while blurred. */
   private hideAmbient(hide: boolean): void {
     if (hide === this.ambientHidden) return;
@@ -181,7 +313,7 @@ export class VisionController {
   }
 
   pageState(): PageVision {
-    return { status: this.status, state: this.state };
+    return { status: this.status, state: this.state, regions: this.regions };
   }
 
   /** Short note for the on-video badge ('' = nothing to say). */

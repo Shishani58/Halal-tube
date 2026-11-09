@@ -14,9 +14,23 @@ export type ToVision =
 /** Vision worker → page. */
 export type FromVision =
   | { type: 'ready' }
-  /** Frames in [from, to] were analysed; samples = flat [t, nude, skin, female, …]. */
-  | { type: 'result'; session: number; from: number; to: number; samples: number[] }
+  /**
+   * Frames in [from, to] were analysed. `cuts`: shot cuts found strictly inside `cutRange` (the list
+   * replaces what was known there); `edges`: cut or not at GOP boundaries ([time, 1 | 0]).
+   */
+  | { type: 'result'; session: number; from: number; to: number; frames: VisionFrame[]; cuts: number[]; cutRange: [number, number]; edges: [number, number][] }
   | { type: 'status'; status: VisionStatus };
+
+/** One classified frame. */
+export interface VisionFrame {
+  t: number;
+  nude: number;
+  skin: number;
+  /** Most confident woman in the frame (0 when none). */
+  female: number;
+  /** Women in the frame: flat [x, y, w, h, score, …], frame-relative (0–1), one whole person each. */
+  women: number[];
+}
 
 export interface VisionStatus {
   model: 'idle' | 'loading' | 'ready' | 'error';
@@ -35,6 +49,8 @@ export interface PageVision {
   status: VisionStatus | null;
   /** off: feature disabled · checking: frame not analysed yet (blurred in strict mode) · hidden: blurred by a detection · clear */
   state: 'off' | 'checking' | 'hidden' | 'clear' | 'no-video';
+  /** Women's boxes blurred on the active video (0: none, or the whole frame is blurred). */
+  regions?: number;
 }
 
 export type ToVisionWire = Exclude<ToVision, { type: 'append' }> | (Omit<Extract<ToVision, { type: 'append' }>, 'data'> & { data: string });

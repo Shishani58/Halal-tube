@@ -620,6 +620,9 @@ declare global {
       visionSamples() {
         return vision.timeline(player.session)?.dump() ?? [];
       },
+      visionCuts() {
+        return vision.timeline(player.session)?.cutTimes ?? [];
+      },
       tile(k: number) {
         const t = player.tiles.get(k);
         if (!t) return null;

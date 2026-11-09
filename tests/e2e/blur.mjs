@@ -64,7 +64,15 @@ const snap = () =>
   page.evaluate(() => {
     const v = document.getElementById('v');
     const i = window.__musicRemoverDebug.info;
-    return { t: v.currentTime, filter: v.style.getPropertyValue('filter'), vision: i.vision, paused: v.paused };
+    const vr = v.getBoundingClientRect();
+    const boxes = [...document.querySelectorAll('[data-mr-blur] > div')]
+      .filter((b) => b.style.display !== 'none')
+      .map((b) => {
+        const r = b.getBoundingClientRect();
+        // video-relative 0–1
+        return [(r.left - vr.left) / vr.width, (r.top - vr.top) / vr.height, r.width / vr.width, r.height / vr.height].map((x) => +x.toFixed(2));
+      });
+    return { t: v.currentTime, filter: v.style.getPropertyValue('filter'), boxes, vision: i.vision, paused: v.paused };
   });
 
 // ── time to the first checked frame, from a cold start (model load included) ──
@@ -105,19 +113,25 @@ for (const r of rows) {
   const kind = kindAt(r.t);
   const k = segAt(r.t);
   if (k < 0) continue;
-  // ignore the margins around cuts: blur deliberately starts 0.6 s early and ends 1 s late
-  if (r.t < segs[k][0] + 1.1 || r.t > segs[k][1] - 0.7) continue;
-  const blurred = !!r.filter;
-  const want = kind === 'woman';
+  // decisions switch at the cut itself; allow for the sampling jitter of this test
+  if (r.t < segs[k][0] + 0.25 || r.t > segs[k][1] - 0.25) continue;
+  const full = !!r.filter;
+  const region = r.boxes.length > 0;
+  // a woman: blurred where she is (the photo sits in the middle), never the whole frame; others: nothing
+  const want = kind === 'woman' ? region && !full && r.boxes.some((b) => b[0] < 0.5 && b[0] + b[2] > 0.5 && b[1] < 0.4) : !region && !full;
   total++;
-  if (blurred !== want) wrong++;
-  seg[k] ??= { kind, n: 0, blurred: 0, states: new Set() };
+  if (!want) wrong++;
+  seg[k] ??= { kind, n: 0, region: 0, full: 0, states: new Set(), box: null };
   seg[k].n++;
-  seg[k].blurred += blurred ? 1 : 0;
+  seg[k].region += region ? 1 : 0;
+  seg[k].full += full ? 1 : 0;
+  seg[k].box ??= r.boxes[0] ?? null;
   seg[k].states.add(r.vision.state);
 }
-console.table(Object.entries(seg).map(([k, v]) => ({ seg: `${segs[k][0]}-${segs[k][1]}s`, kind: v.kind, blurred: `${v.blurred}/${v.n}`, states: [...v.states].join(',') })));
-console.log(`women/men/scenes: ${total - wrong}/${total} samples as expected`);
+console.table(Object.entries(seg).map(([k, v]) => ({ seg: `${segs[k][0]}-${segs[k][1]}s`, kind: v.kind, region: `${v.region}/${v.n}`, full: v.full, box: JSON.stringify(v.box), states: [...v.states].join(',') })));
+console.log(`women/men/scenes: ${total - wrong}/${total} samples as expected (margin around cuts: 0.25 s)`);
+const cuts = await page.evaluate(() => window.__musicRemoverDebug.visionCuts());
+console.log(`shot cuts found: ${cuts.map((c) => c.toFixed(2)).join(' ')}`);
 
 // ── "women" off: same spot stays clear (nudity-only mode) ──
 await page.evaluate((t) => {
@@ -130,7 +144,7 @@ const withWomen = await snap();
 await setSettings({ blurWomen: false });
 await page.waitForTimeout(500);
 const withoutWomen = await snap();
-console.log(`woman on screen: women on → ${withWomen.vision.state} ${withWomen.filter || 'no blur'}; women off → ${withoutWomen.vision.state} ${withoutWomen.filter || 'no blur'}`);
+console.log(`woman on screen: women on → ${withWomen.vision.state} boxes=${JSON.stringify(withWomen.boxes)} ${withWomen.filter || 'no full blur'}; women off → ${withoutWomen.vision.state} boxes=${withoutWomen.boxes.length} ${withoutWomen.filter || 'no full blur'}`);
 await setSettings({ blurWomen: true });
 
 // ── jump into an unchecked region: strict blur until checked ──
@@ -148,7 +162,7 @@ while (Date.now() - tj < 15000) {
   const s = await snap();
   jumpStates.push(`${s.vision.state}${s.filter ? '*' : ''}`);
   if (s.t >= jumpTo && s.vision.state !== 'checking') {
-    afterJump = { s: (Date.now() - tj) / 1000, state: s.vision.state, blurred: !!s.filter };
+    afterJump = { s: (Date.now() - tj) / 1000, state: s.vision.state, blurred: s.filter ? 'full' : s.boxes.length ? 'region' : 'no' };
     break;
   }
 }
@@ -159,7 +173,7 @@ await page.screenshot({ path: '/tmp/mr/e2e/blur-woman.png', clip: { x: 0, y: 0, 
 await setSettings({ blur: false });
 await page.waitForTimeout(500);
 const off = await snap();
-console.log(`blur off → state=${off.vision.state} filter="${off.filter}"`);
+console.log(`blur off → state=${off.vision.state} filter="${off.filter}" boxes=${off.boxes.length}`);
 
 // popup
 const extId = new URL(sw.url()).host;

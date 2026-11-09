@@ -111,13 +111,18 @@ const FACE_CLASSES = idx('FACE_FEMALE', 'FACE_MALE');
  * so gender is decided by a separate classifier on these crops.
  */
 export function detectFaces(out: Float32Array, batch: number, b: number, minScore = 0.35, maxFaces = 6): Box[] {
+  return detectBoxes(out, batch, b, FACE_CLASSES, minScore, maxFaces);
+}
+
+/** Boxes of the given classes in image `b` (320×320 letterboxed input space), after NMS. */
+export function detectBoxes(out: Float32Array, batch: number, b: number, classes: number[], minScore: number, max: number): Box[] {
   const rows = 4 + NUDENET_LABELS.length;
   const A = out.length / (batch * rows);
   const at = (r: number, a: number) => out[(b * rows + r) * A + a];
   const cand: Box[] = [];
   for (let a = 0; a < A; a++) {
     let s = 0;
-    for (const c of FACE_CLASSES) s = Math.max(s, at(4 + c, a));
+    for (const c of classes) s = Math.max(s, at(4 + c, a));
     if (s < minScore) continue;
     const w = at(2, a), h = at(3, a);
     cand.push({ x: at(0, a) - w / 2, y: at(1, a) - h / 2, w, h, score: s });
@@ -126,9 +131,60 @@ export function detectFaces(out: Float32Array, batch: number, b: number, minScor
   const keep: Box[] = [];
   for (const c of cand) {
     if (keep.every((k) => iou(k, c) < 0.45)) keep.push(c);
-    if (keep.length >= maxFaces) break;
+    if (keep.length >= max) break;
   }
   return keep;
+}
+
+/** Body regions that help outline a person (clothed or not); never used to decide "woman" alone. */
+export const BODY_CLASSES = idx(
+  'FEMALE_BREAST_COVERED', 'FEMALE_BREAST_EXPOSED', 'FEMALE_GENITALIA_COVERED', 'FEMALE_GENITALIA_EXPOSED',
+  'BELLY_COVERED', 'BELLY_EXPOSED', 'ARMPITS_COVERED', 'ARMPITS_EXPOSED', 'BUTTOCKS_COVERED', 'BUTTOCKS_EXPOSED',
+  'FEET_COVERED', 'FEET_EXPOSED',
+);
+
+/** A rectangle in frame-relative units: 0–1 on both axes. */
+export interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** Detector-space box (letterboxed into dw×dh) → frame-relative rect. */
+export function toFrame(b: Box, dw: number, dh: number): Rect {
+  return { x: b.x / dw, y: b.y / dh, w: b.w / dw, h: b.h / dh };
+}
+
+export function clampRect(r: Rect): Rect {
+  const x0 = Math.max(0, r.x), y0 = Math.max(0, r.y);
+  const x1 = Math.min(1, r.x + r.w), y1 = Math.min(1, r.y + r.h);
+  return { x: x0, y: y0, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
+}
+
+export function unionRect(a: Rect, b: Rect): Rect {
+  const x0 = Math.min(a.x, b.x), y0 = Math.min(a.y, b.y);
+  return { x: x0, y: y0, w: Math.max(a.x + a.w, b.x + b.w) - x0, h: Math.max(a.y + a.h, b.y + b.h) - y0 };
+}
+
+/**
+ * The whole person around a face: hair and head above it, shoulders and arms to the sides, the body
+ * below (about 7 head heights — a standing person to the knees; cut off by the frame edge), grown
+ * further to take in detected body regions that lie under the face.
+ */
+export function personFromFace(face: Rect, parts: Rect[]): Rect {
+  const cx = face.x + face.w / 2;
+  let r: Rect = { x: cx - 1.8 * face.w, y: face.y - 0.6 * face.h, w: 3.6 * face.w, h: 8.6 * face.h };
+  for (const p of parts) {
+    const px = p.x + p.w / 2, py = p.y + p.h / 2;
+    if (Math.abs(px - cx) < 3 * face.w && py > face.y + face.h / 2 && py < face.y + 10 * face.h) r = unionRect(r, p);
+  }
+  return clampRect(r);
+}
+
+/** A woman seen by her body alone (no face found): the region, grown to where the head and legs would be. */
+export function personFromBody(part: Rect): Rect {
+  return clampRect({ x: part.x - 0.8 * part.w, y: part.y - 2.5 * part.h, w: 2.6 * part.w, h: 6 * part.h });
 }
 
 function iou(a: Box, b: Box): number {
