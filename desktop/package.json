@@ -1,0 +1,14 @@
+{
+  "name": "music-remover-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "cd app && tauri build --bundles app && sh ../scripts/make-dmg.sh",
+    "dev": "cd app && tauri dev",
+    "icons": "tauri icon app/icons/source.png --output app/icons && rm -rf app/icons/android app/icons/ios app/icons/Square*.png app/icons/StoreLogo.png",
+    "test": "cargo test -p mr-core --release"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Music Remover",
+  "version": "0.1.0",
+  "identifier": "app.musicremover.desktop",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Music Remover",
+        "width": 760,
+        "height": 600,
+        "minWidth": 560,
+        "minHeight": 460,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app"
+    ],
+    "category": "Utility",
+    "shortDescription": "Removes background music, keeps the voice",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../../models/Kim_Vocal_2.onnx": "models/Kim_Vocal_2.onnx"
+    },
+    "macOS": {
+      "minimumSystemVersion": "14.0"
+    },
+    "fileAssociations": [
+      {
+        "ext": [
+          "mp4",
+          "m4v",
+          "mov",
+          "mkv",
+          "webm",
+          "avi",
+          "wmv",
+          "flv",
+          "mpg",
+          "mpeg",
+          "ts",
+          "mts",
+          "m2ts",
+          "3gp"
+        ],
+        "name": "Video",
+        "description": "Video",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": [
+          "mp3",
+          "wav",
+          "m4a",
+          "aac",
+          "flac",
+          "ogg",
+          "oga",
+          "opus",
+          "wma",
+          "aiff",
+          "aif",
+          "mka"
+        ],
+        "name": "Audio",
+        "description": "Audio",
+        "role": "Viewer",
+        "rank": "Alternate"
+      }
+    ]
+  }
+}
