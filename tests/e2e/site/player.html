@@ -15,18 +15,43 @@ const ahead = (sb) => {
   return 0;
 };
 let done = 0;
+// Index of WebM clusters (byte offset + timecode in seconds) so a seek can jump like YouTube does.
+function clusterIndex(b) {
+  const out = [];
+  for (let i = 0; i + 12 < b.length; i++) {
+    if (b[i] === 0x1f && b[i + 1] === 0x43 && b[i + 2] === 0xb6 && b[i + 3] === 0x75) {
+      let p = i + 4, len = 1; while (len <= 8 && !(b[p] & (0x80 >> (len - 1)))) len++; p += len;
+      if (b[p] === 0xe7) { const n = b[p + 1] & 0x7f; let v = 0; for (let k = 0; k < n; k++) v = v * 256 + b[p + 2 + k]; out.push({ off: i, t: v / 1000 }); }
+    }
+  }
+  return out;
+}
+const feeders = [];
 function feeder(sb, bytes) {
-  let pos = 0;
+  const idx = clusterIndex(bytes);
+  const initEnd = idx.length ? idx[0].off : 0;
+  const f = { pos: 0, jumpTo: null };
   const step = () => {
-    if (pos >= bytes.length) { if (++done === 2) { try { ms.endOfStream(); } catch {} } return; }
+    if (f.jumpTo !== null) {
+      // abandon the partially appended cluster, re-send init, continue at the cluster for the target
+      const c = [...idx].reverse().find((x) => x.t <= f.jumpTo) ?? idx[0];
+      f.jumpTo = null;
+      sb.addEventListener('updateend', () => { f.pos = c.off; setTimeout(step, 20); }, { once: true });
+      sb.appendBuffer(bytes.subarray(0, initEnd));
+      return;
+    }
+    if (f.pos >= bytes.length) { if (++done === 2) { try { ms.endOfStream(); } catch {} } return; }
     if (ahead(sb) > 20) return setTimeout(step, 250);
-    const n = Math.min(bytes.length - pos, 3000 + Math.floor(Math.random() * 20000));
+    const n = Math.min(bytes.length - f.pos, 3000 + Math.floor(Math.random() * 20000));
     sb.addEventListener('updateend', () => setTimeout(step, 20), { once: true });
-    sb.appendBuffer(bytes.subarray(pos, pos + n));
-    pos += n;
+    sb.appendBuffer(bytes.subarray(f.pos, f.pos + n));
+    f.pos += n;
   };
+  f.seek = (t) => { if (ahead(sb) <= 0) f.jumpTo = t; };
+  feeders.push(f);
   step();
 }
+v.addEventListener('seeking', () => { for (const f of feeders) f.seek(v.currentTime); });
 ms.addEventListener('sourceopen', async () => {
   const vsb = ms.addSourceBuffer('video/webm; codecs="vp9"');
   const asb = ms.addSourceBuffer('audio/webm; codecs="opus"');

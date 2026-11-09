@@ -162,6 +162,7 @@ declare global {
   interface Tile {
     buf: AudioBuffer;
     start: number;
+    validFrom: number;
     mix?: Float32Array;
     stretched?: { rate: number; buf: AudioBuffer };
   }
@@ -195,7 +196,9 @@ declare global {
       const buf = new AudioBuffer({ numberOfChannels: 2, length: msg.left.length, sampleRate: msg.sampleRate });
       buf.copyToChannel(msg.left as Float32Array<ArrayBuffer>, 0);
       buf.copyToChannel(msg.right as Float32Array<ArrayBuffer>, 1);
-      this.tiles.set(msg.k, { buf, start: msg.start, mix: msg.mixLeft });
+      const prev = this.tiles.get(msg.k);
+      if (prev && prev.validFrom <= msg.validFrom && this.scheduled.has(msg.k)) return; // keep what's playing
+      this.tiles.set(msg.k, { buf, start: msg.start, validFrom: msg.validFrom, mix: msg.mixLeft });
       dbg.tilesReceived++;
       tick();
     }
@@ -323,7 +326,10 @@ declare global {
       const t = v.currentTime;
       const rate = v.playbackRate || 1;
       const k = this.tileAt(t);
-      const hasNow = this.tiles.has(k);
+      // a partial tile (made right after a seek) only counts once the playhead is past its start
+      for (const [kk, tl] of this.tiles) if (tl.validFrom > tl.start && t < tl.validFrom - 0.5) this.tiles.delete(kk);
+      const cur = this.tiles.get(k);
+      const hasNow = !!cur && t >= cur.validFrom - 0.02;
       const origTarget = settings.mode === 'lenient' && !hasNow ? 1 : 0;
       a.orig.gain.setTargetAtTime(origTarget, ctx.currentTime, 0.015);
       this.clean.gain.value = v.muted ? 0 : v.volume;
@@ -352,6 +358,7 @@ declare global {
         for (let kk = k; kk <= k + 1; kk++) {
           const tile = this.tiles.get(kk);
           if (!tile || this.scheduled.has(kk)) continue;
+          if (kk === k && t < tile.validFrom - 0.02) continue;
           // Off 1×, play a pitch-preserving time-stretched copy at its natural speed.
           const buf = this.bufferFor(tile, rate);
           let when = this.anchor.c0 + (tile.start - this.anchor.t0) / rate;

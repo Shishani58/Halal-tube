@@ -44,8 +44,26 @@ const fmt = (i) =>
   `tiles=[${i.tiles}] sched=[${i.scheduled}] ahead=${i.worker?.ahead?.toFixed(0)}s in=${i.worker?.inputAhead?.toFixed(0)}s ` +
   `drift=${(i.lastDrift * 1000).toFixed(0)}ms max=${(i.maxDrift * 1000).toFixed(0)}ms reanchors=${i.reanchors}`;
 
-const tStart = Date.now();
 await page.evaluate(() => document.getElementById('v').play());
+// ── seek into a not-yet-buffered spot in the middle of a tile (YouTube-like jump) ──
+while ((await info()).state !== 'clean') await page.waitForTimeout(200);
+const before = await info();
+console.log(`before mid-tile seek: t=${before.time.toFixed(1)} tiles=[${before.tiles}] inputAhead=${before.worker?.inputAhead?.toFixed(0)}s`);
+await page.evaluate(() => (document.getElementById('v').currentTime = 33.2));
+{
+  const ts = Date.now();
+  let ok = null;
+  while (Date.now() - ts < 15000) {
+    await page.waitForTimeout(200);
+    const x = await info();
+    if (x.state === 'clean' && x.time >= 33) { ok = (Date.now() - ts) / 1000; break; }
+  }
+  console.log(`mid-tile seek to unbuffered 33.2 s → clean after ${ok}s`);
+}
+
+await page.evaluate(() => (document.getElementById('v').currentTime = 0));
+
+const tStart = Date.now();
 let firstClean = null;
 const states = [];
 while (Date.now() - tStart < 14000) {

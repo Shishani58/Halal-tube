@@ -24,6 +24,8 @@ export type FromWorker =
       session: number;
       k: number;
       start: number;
+      /** Media time from which this tile is valid (> start for a partial tile after a seek). */
+      validFrom: number;
       sampleRate: number;
       left: Float32Array;
       right: Float32Array;

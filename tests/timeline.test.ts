@@ -38,6 +38,6 @@ test('Port wire codec round-trips appends and tiles', () => {
   const back = decodeToWorker(JSON.parse(JSON.stringify(encodeToWorker({ type: 'append', session: 1, sb: 2, data: data.buffer, tsOffset: 0 }))));
   assert(back.type === 'append' && new Uint8Array(back.data).every((x, i) => x === data[i]), 'append bytes');
   const left = new Float32Array(1000).map((_, i) => Math.sin(i / 10) * 0.9);
-  const t = decodeFromWorker(JSON.parse(JSON.stringify(encodeFromWorker({ type: 'tile', session: 1, k: 3, start: 1, sampleRate: 44100, left, right: left }))));
+  const t = decodeFromWorker(JSON.parse(JSON.stringify(encodeFromWorker({ type: 'tile', session: 1, k: 3, start: 1, validFrom: 1, sampleRate: 44100, left, right: left }))));
   assert(t.type === 'tile' && t.left.every((x, i) => Math.abs(x - left[i]) < 1e-4), 'tile pcm16');
 });

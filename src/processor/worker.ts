@@ -141,7 +141,7 @@ function schedule(): void {
   }, 0);
 }
 
-function pickTile(): number | null {
+function pickTile(): { k: number; validFrom: number } | null {
   if (!pos || !pos.enabled) return null;
   const s = sessions.get(pos.session);
   if (!s) return null;
@@ -156,15 +156,23 @@ function pickTile(): number | null {
     const failed = failedAt.get(key);
     if (failed && now - failed < 5000) continue;
     const [a, b] = tiling.inputRange(k);
-    if (s.store.covers(a, b, pos.duration)) return k;
+    if (s.store.covers(a, b, pos.duration)) return { k, validFrom: tiling.tileStart(k) };
+    // Right after a seek the player has no audio before the new position. For the tile under
+    // the playhead, separate what exists (the unheard part before it is treated as silence)
+    // instead of waiting for the next tile boundary.
+    if (k === kNow) {
+      const from = Math.max(a, pos.time - 0.3);
+      if (from > a && s.store.covers(from, b, pos.duration)) return { k, validFrom: Math.max(tiling.tileStart(k), from + 0.1) };
+    }
   }
   return null;
 }
 
 async function pump(): Promise<void> {
   if (busy || !model || !pos) return;
-  const k = pickTile();
-  if (k === null) return;
+  const pick = pickTile();
+  if (pick === null) return;
+  const { k, validFrom } = pick;
   const sessionId = pos.session;
   const s = sessions.get(sessionId)!;
   busy = true;
@@ -187,7 +195,7 @@ async function pump(): Promise<void> {
     const transfer: Transferable[] = [left.buffer, right.buffer];
     if (mixLeft) transfer.push(mixLeft.buffer);
     post(
-      { type: 'tile', session: sessionId, k, start: tiling.tileStart(k), sampleRate: tiling.rate, left, right, mixLeft, computeMs: dt * 1000 },
+      { type: 'tile', session: sessionId, k, start: tiling.tileStart(k), validFrom, sampleRate: tiling.rate, left, right, mixLeft, computeMs: dt * 1000 },
       transfer,
     );
   } catch (e) {
