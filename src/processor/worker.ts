@@ -102,7 +102,7 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
       const s = session(m.session);
       const prev = s.sbs.get(m.sb);
       if (prev && prev.mime === m.mime) break;
-      s.sbs.set(m.sb, { mime: m.mime, demuxer: createDemuxer(m.mime) });
+      s.sbs.set(m.sb, { mime: m.mime, demuxer: createDemuxer(m.mime, 'audio') });
       break;
     }
     case 'append': {

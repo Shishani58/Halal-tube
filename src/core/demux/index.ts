@@ -1,12 +1,15 @@
 import { Mp4Demuxer } from './mp4';
-import type { Demuxer } from './types';
+import { codecParam, type Demuxer, type TrackKind } from './types';
 import { WebmDemuxer } from './webm';
 
 export * from './types';
 
-export function createDemuxer(mimeType: string): Demuxer | null {
+/** Demuxer for the audio or video track of a SourceBuffer, chosen by its MIME type. */
+export function createDemuxer(mimeType: string, kind?: TrackKind): Demuxer | null {
   const m = mimeType.toLowerCase();
-  if (m.includes('webm')) return new WebmDemuxer();
-  if (m.includes('mp4')) return new Mp4Demuxer();
+  const k: TrackKind = kind ?? (m.startsWith('video/') ? 'video' : 'audio');
+  const hint = codecParam(mimeType);
+  if (m.includes('webm')) return new WebmDemuxer(k, hint);
+  if (m.includes('mp4')) return new Mp4Demuxer(k, hint);
   return null;
 }

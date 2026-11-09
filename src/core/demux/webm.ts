@@ -1,4 +1,5 @@
-import { ByteQueue, configKey, type Demuxer, type Packet, type TrackConfig } from './types';
+import { ByteQueue, configKey, type Demuxer, type Packet, type TrackConfig, type TrackKind } from './types';
+import { av1CodecString } from './video-codecs';
 
 const ID = {
   EBML: 0x1a45dfa3,
@@ -13,6 +14,11 @@ const ID = {
   CodecID: 0x86,
   CodecPrivate: 0x63a2,
   CodecDelay: 0x56aa,
+  DefaultDuration: 0x23e383,
+  Video: 0xe0,
+  PixelWidth: 0xb0,
+  PixelHeight: 0xba,
+  ReferenceBlock: 0xfb,
   Audio: 0xe1,
   SamplingFrequency: 0xb5,
   Channels: 0x9f,
@@ -40,8 +46,14 @@ const LEVEL1 = new Set<number>([ID.SeekHead, ID.Info, ID.Tracks, ID.Cluster, ID.
 
 interface Container { id: number; end: number } // end = absolute offset or Infinity
 
-/** Streaming WebM (Matroska) audio demuxer tolerant to arbitrary chunk boundaries. */
+/** Streaming WebM (Matroska) demuxer for one audio or video track, tolerant to arbitrary chunk boundaries. */
 export class WebmDemuxer implements Demuxer {
+  /** @param codecHint the `codecs` parameter of the SourceBuffer MIME type (exact VP9/AV1 profile). */
+  constructor(
+    private readonly kind: TrackKind = 'audio',
+    private readonly codecHint = '',
+  ) {}
+
   private q = new ByteQueue();
   private stack: Container[] = [];
   private skip = 0;
@@ -50,6 +62,8 @@ export class WebmDemuxer implements Demuxer {
   private audioTrack = -1;
   private config: TrackConfig | null = null;
   private codecDelay = 0;
+  /** Video frame duration (s) from DefaultDuration, else a 30 fps guess. */
+  private frameDur = 1 / 30;
   private nextTs: number | null = null;
 
   resetParser(): void {
@@ -153,7 +167,13 @@ export class WebmDemuxer implements Demuxer {
           this.parseBlock(body, out, timestampOffset);
           break;
         case ID.BlockGroup: {
-          for (const [cid, cbody] of children(body)) if (cid === ID.Block) this.parseBlock(cbody, out, timestampOffset);
+          let block: Uint8Array | null = null;
+          let ref = false;
+          for (const [cid, cbody] of children(body)) {
+            if (cid === ID.Block) block = cbody;
+            else if (cid === ID.ReferenceBlock) ref = true;
+          }
+          if (block) this.parseBlock(block, out, timestampOffset, !ref);
           break;
         }
       }
@@ -187,18 +207,36 @@ export class WebmDemuxer implements Demuxer {
     for (const [id, entry] of children(body)) {
       if (id !== ID.TrackEntry) continue;
       let num = -1, type = -1, codecId = '', priv: Uint8Array | undefined, rate = 48000, ch = 2, delay = 0;
+      let defDur = 0, width = 0, height = 0;
       for (const [cid, b] of children(entry)) {
         if (cid === ID.TrackNumber) num = readUint(b);
         else if (cid === ID.TrackType) type = readUint(b);
         else if (cid === ID.CodecID) codecId = new TextDecoder().decode(b);
         else if (cid === ID.CodecPrivate) priv = b.slice();
         else if (cid === ID.CodecDelay) delay = readUint(b);
+        else if (cid === ID.DefaultDuration) defDur = readUint(b);
         else if (cid === ID.Audio) {
           for (const [aid, ab] of children(b)) {
             if (aid === ID.SamplingFrequency) rate = readFloat(ab);
             else if (aid === ID.Channels) ch = readUint(ab);
           }
+        } else if (cid === ID.Video) {
+          for (const [vid, vb] of children(b)) {
+            if (vid === ID.PixelWidth) width = readUint(vb);
+            else if (vid === ID.PixelHeight) height = readUint(vb);
+          }
         }
+      }
+      if (this.kind === 'video') {
+        if (type !== 1 && !codecId.startsWith('V_')) continue;
+        const codec = this.videoCodec(codecId, priv);
+        if (!codec) continue;
+        // VP8/VP9 need no description; for AV1 CodecPrivate is the av1C record.
+        const description = codecId === 'V_AV1' && priv && priv.length > 4 ? priv : undefined;
+        this.audioTrack = num;
+        if (defDur > 0) this.frameDur = defDur / 1e9;
+        this.config = { codec, sampleRate: 0, channels: 0, description, kind: 'video', width, height, key: configKey(codec, width, height, description) };
+        return;
       }
       if (type !== 2 && !codecId.startsWith('A_')) continue;
       let codec: string;
@@ -209,12 +247,36 @@ export class WebmDemuxer implements Demuxer {
       if (codec === 'opus') rate = 48000;
       this.audioTrack = num;
       this.codecDelay = delay / 1e9;
-      this.config = { codec, sampleRate: rate, channels: ch, description: priv, key: configKey(codec, rate, ch, priv) };
+      this.config = { codec, sampleRate: rate, channels: ch, description: priv, kind: 'audio', key: configKey(codec, rate, ch, priv) };
       return;
     }
   }
 
-  private parseBlock(b: Uint8Array, out: Packet[], tsOffset: number): void {
+  /** WebCodecs codec string for a Matroska video CodecID. */
+  private videoCodec(codecId: string, priv: Uint8Array | undefined): string | null {
+    const hint = this.codecHint.toLowerCase();
+    if (codecId === 'V_VP8') return 'vp8';
+    if (codecId === 'V_VP9') {
+      if (hint.startsWith('vp09.')) return this.codecHint;
+      // CodecPrivate (optional): [id, len, value] features — 1 profile, 2 level, 3 bit depth
+      let profile = 0, level = 10, depth = 8;
+      for (let p = 0; priv && p + 3 <= priv.length && p + 2 + priv[p + 1] <= priv.length; p += 2 + priv[p + 1]) {
+        const v = priv[p + 2];
+        if (priv[p] === 1) profile = v;
+        else if (priv[p] === 2) level = v;
+        else if (priv[p] === 3) depth = v;
+      }
+      const two = (n: number) => String(n).padStart(2, '0');
+      return `vp09.${two(profile)}.${two(level)}.${two(depth)}`;
+    }
+    if (codecId === 'V_AV1') {
+      if (hint.startsWith('av01.')) return this.codecHint;
+      return (priv && av1CodecString(priv)) || 'av01.0.08M.08';
+    }
+    return null;
+  }
+
+  private parseBlock(b: Uint8Array, out: Packet[], tsOffset: number, groupKey?: boolean): void {
     if (!this.config) return;
     const tn = readVint(b, 0);
     if (!tn || tn.value !== this.audioTrack) return;
@@ -224,6 +286,13 @@ export class WebmDemuxer implements Demuxer {
     const flags = b[p++];
     const lacing = (flags >> 1) & 3;
     const ts = ((this.clusterTime + rel) * this.timecodeScale) / 1e9 + tsOffset;
+    if (this.config.kind === 'video') {
+      // SimpleBlock: keyframe flag 0x80; BlockGroup: keyframe when it has no ReferenceBlock.
+      const key = groupKey ?? (flags & 0x80) !== 0;
+      if (lacing !== 0) return; // video is never laced in practice
+      out.push({ ts, dts: ts, dur: this.frameDur, data: b.slice(p), config: this.config, key });
+      return;
+    }
     const frames: Uint8Array[] = [];
     if (lacing === 0) {
       frames.push(b.slice(p));

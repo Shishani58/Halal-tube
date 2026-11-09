@@ -130,9 +130,15 @@ export interface Settings {
   musicRemoval: boolean;
   /** Profanity (мат) filter: off, silence the word, or beep over it. */
   profanity: ProfanityMode;
+  /** Blur video frames with nudity (men and women). */
+  blur: boolean;
+  /** Also blur frames where a woman is visible. */
+  blurWomen: boolean;
+  /** Keep the video blurred until its frames have been checked. */
+  blurStrict: boolean;
 }
 
-export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, musicRemoval: true, profanity: 'off' };
+export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, musicRemoval: true, profanity: 'off', blur: true, blurWomen: true, blurStrict: true };
 
 /** What the page reports for the popup. */
 export interface PageStatus {
@@ -141,6 +147,8 @@ export interface PageStatus {
   state: 'disabled' | 'no-video' | 'waiting' | 'clean' | 'paused' | 'suspended' | 'offline';
   videoTime: number;
   sessions: number;
+  /** Blurring (frame classifier) state. */
+  vision?: import('./vision-messages').PageVision;
 }
 
 export const MSG_NS = '__musicRemover';

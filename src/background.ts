@@ -28,7 +28,7 @@ async function ensureOffscreen(): Promise<void> {
       .createDocument({
         url: 'processor/offscreen.html',
         reasons: [chrome.offscreen.Reason.WORKERS],
-        justification: 'Runs the voice/music separation model on audio from the video being watched.',
+        justification: 'Runs the voice/music separation model on audio, and the frame classifier for blurring on video, of the video being watched.',
       })
       .finally(() => {
         creating = null;
