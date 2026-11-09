@@ -94,7 +94,8 @@ export class WebmDemuxer implements Demuxer {
       const inCluster = this.stack.length > 0 && this.stack[this.stack.length - 1].id === ID.Cluster;
       const garbage =
         id < 0 ||
-        size > MAX_SKIP ||
+        // the Segment spans the whole file (≈150 MB for a 3-hour audio track): no size limit
+        (size > MAX_SKIP && id !== ID.Segment) ||
         (inCluster && !CLUSTER_CHILDREN.has(id) && !LEVEL1.has(id) && id !== ID.EBML && id !== ID.Segment);
       if (garbage) {
         if (!this.resync()) break;

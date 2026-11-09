@@ -116,3 +116,18 @@ test('WebM: recovers after an abandoned partial cluster (SABR-style)', () => {
   }
   void ref;
 });
+
+test('WebM: a Segment larger than the skip limit (hours-long track) still yields packets', () => {
+  if (!have) return;
+  const data = new Uint8Array(readFileSync(`${FIX}/a.webm`));
+  // Segment ID 18 53 80 67, then its size as an 8-byte vint (01 xx xx xx xx xx xx xx): claim 155 MB
+  let i = 0;
+  while (i + 4 < data.length && !(data[i] === 0x18 && data[i + 1] === 0x53 && data[i + 2] === 0x80 && data[i + 3] === 0x67)) i++;
+  assert(data[i + 4] === 0x01, `fixture segment size is an 8-byte vint (${data[i + 4]})`);
+  const big = 155_000_000;
+  for (let k = 0; k < 7; k++) data[i + 5 + k] = Math.floor(big / 256 ** (6 - k)) % 256;
+  const d = createDemuxer('audio/webm; codecs="opus"')!;
+  const out: Packet[] = [];
+  for (let p = 0; p < data.length; p += 16384) out.push(...d.push(data.subarray(p, p + 16384), 0));
+  assert(out.length === 601, `packets ${out.length}`);
+});
