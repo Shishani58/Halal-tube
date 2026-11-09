@@ -54,6 +54,13 @@ function isInitSegment(data: ArrayBuffer): boolean {
 function remember(msg: ToWorker, wire: ToWorkerWire): void {
   if (msg.type === 'sb-init') {
     log.push({ wire, bytes: 0, pinned: true });
+  } else if (msg.type === 'captions') {
+    // only the latest caption state per session matters
+    for (let i = log.length - 1; i >= 0; i--) {
+      const w = log[i].wire;
+      if (w.type === 'captions' && w.session === msg.session) log.splice(i, 1);
+    }
+    log.push({ wire, bytes: 0, pinned: true });
   } else if (msg.type === 'append') {
     const pinned = isInitSegment(msg.data);
     const bytes = msg.data.byteLength;
@@ -74,6 +81,16 @@ function remember(msg: ToWorker, wire: ToWorkerWire): void {
 let port: chrome.runtime.Port | null = null;
 let connecting = false;
 let wanted = false;
+
+/**
+ * Tell the page whether the processor is reachable. `orphaned`: this content script lost its
+ * extension (the extension was updated or reloaded while the tab stayed open) — only a page
+ * reload brings it back.
+ */
+function reportLink(): void {
+  const orphaned = !contextAlive();
+  window.postMessage({ ns: MSG_NS, from: 'bridge', kind: 'link', up: !!port && !orphaned, orphaned }, '*');
+}
 
 function contextAlive(): boolean {
   try {
@@ -100,13 +117,17 @@ async function connect(): Promise<void> {
     });
     p.onDisconnect.addListener(() => {
       port = null;
-      if (wanted && contextAlive()) setTimeout(() => void connect(), 1000);
+      reportLink();
+      if (wanted && contextAlive()) setTimeout(() => void connect(), 300);
     });
     port = p;
     for (const e of log) p.postMessage(e.wire); // catch the (new) processor up
+    reportLink();
   } catch (e) {
+    // The service worker may still be starting (fresh install / browser start): retry soon.
     console.warn('[music-remover] processor connect failed', e);
-    if (contextAlive()) setTimeout(() => void connect(), 2000);
+    reportLink();
+    if (contextAlive()) setTimeout(() => void connect(), 500);
   } finally {
     connecting = false;
   }
@@ -116,9 +137,16 @@ window.addEventListener('message', (e: MessageEvent) => {
   if (e.source !== window) return;
   const d = e.data as { ns?: string; from?: string; kind?: string; status?: PageStatus; msg?: ToWorker };
   if (!d || d.ns !== MSG_NS || d.from !== 'main') return;
-  if (d.kind === 'get-settings') pushSettings();
+  if (d.kind === 'get-settings') {
+    pushSettings();
+    reportLink();
+  }
   else if (d.kind === 'status' && d.status) lastStatus = d.status;
   else if (d.kind === 'to-worker' && d.msg) {
+    if (!contextAlive()) {
+      reportLink();
+      return;
+    }
     const wire = encodeToWorker(d.msg);
     remember(d.msg, wire);
     wanted = true;

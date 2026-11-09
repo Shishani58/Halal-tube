@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Music Remover — без музыки",
   "short_name": "Без музыки",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Убирает фоновую музыку из видео на YouTube, оставляя голос. Нейросеть работает локально.",
   "minimum_chrome_version": "116",
   "icons": {

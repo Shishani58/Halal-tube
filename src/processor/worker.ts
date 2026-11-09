@@ -1,44 +1,82 @@
 /// <reference lib="webworker" />
+/**
+ * One processing Worker for the whole browser (owned by the offscreen document): one model in
+ * GPU memory shared by every tab. Session ids arrive already made unique by the offscreen
+ * document. Each session reports its playhead; the worker always separates the tile that is
+ * needed soonest, playing videos first.
+ */
 import { createDemuxer, type Demuxer } from '../core/demux';
 import { KIM_VOCAL_2, MdxProcessor } from '../core/mdx';
+import { wordsIn } from '../core/captions';
+import type { Word } from '../core/profanity';
 import { resampleCubic } from '../core/resample';
 import { Tiling, separateWindow } from '../core/tiles';
-import type { FromWorker, ToWorker, WorkerStatus } from '../shared/messages';
+import { DEFAULT_FILTER, filterKey, type CaptionState, type FilterConfig, type FromWorker, type ToWorker, type WorkerStatus } from '../shared/messages';
 import { decodePackets } from './decode';
 import { loadModel, type LoadedModel } from './model';
 import { PacketStore } from './packet-store';
+import { CONTEXT_S, ProfanityStage } from './profanity-stage';
 
 declare const self: DedicatedWorkerGlobalScope;
 
 const MODEL_FILE = 'Kim_Vocal_2.onnx';
 const LOOKAHEAD_TILES = 16; // ≈ 92 s of clean audio prepared ahead
 const KEEP_BEHIND_S = 45;
-const MAX_SESSIONS = 4;
-/** Free the model (GPU memory) after this long without an enabled, active player. */
+const MAX_SESSIONS = 8;
+/** Free the model (GPU memory) after this long without any video playing. */
 const IDLE_RELEASE_MS = 3 * 60_000;
-let lastEnabledAt = Date.now();
+/** A session that stopped reporting its position (tab frozen / closed) is not worked on. */
+const POSITION_STALE_MS = 10_000;
+/** How long the profanity filter waits for a video's captions before using speech recognition. */
+const CAPTIONS_WAIT_MS = 10_000;
 
 const base = new URL('../', self.location.href).href;
 const mdx = new MdxProcessor(KIM_VOCAL_2);
 const tiling = new Tiling(mdx);
 const scratch = new Float32Array(4 * KIM_VOCAL_2.dimF * KIM_VOCAL_2.dimT);
+/** Model loads run one at a time (concurrent first session creation hangs ONNX Runtime). */
+let loadChain: Promise<unknown> = Promise.resolve();
+function serial<T>(load: () => Promise<T>): Promise<T> {
+  const p = loadChain.then(load);
+  loadChain = p.catch(() => undefined);
+  return p;
+}
+const profanity = new ProfanityStage(base, serial, (sid, from, to) => {
+  const c = sessions.get(sid)?.captions;
+  return c?.state === 'ready' ? wordsIn(c.words, from, to) : null;
+});
+let cfgKey = filterKey(DEFAULT_FILTER);
+
+type Position = Extract<ToWorker, { type: 'position' }>;
 
 interface Session {
   store: PacketStore;
   sbs: Map<number, { mime: string; demuxer: Demuxer | null }>;
   lastUsed: number;
+  pos: Position | null;
+  posAt: number;
+  have: Set<number>;
+  /** Caption words for the profanity filter (see ToWorker 'captions'). */
+  captions: { state: CaptionState; words: Word[] } | null;
+  /** When this session first asked for the profanity filter (start of the captions wait). */
+  filterSince: number;
 }
 
 const sessions = new Map<number, Session>();
-let pos: Extract<ToWorker, { type: 'position' }> | null = null;
-let have = new Set<number>();
 const sentAt = new Map<string, number>(); // `${session}:${k}` → time sent
+const failedAt = new Map<string, number>();
 let model: LoadedModel | null = null;
+let modelEverLoaded = false;
 let busy = false;
-const status: WorkerStatus = { model: 'idle', backend: '-', rtf: 0, tilesDone: 0, ahead: 0, inputAhead: 0 };
+let lastPlayingAt = Date.now();
+const model$: Pick<WorkerStatus, 'model' | 'backend' | 'error' | 'rtf' | 'tilesDone'> = {
+  model: 'idle',
+  backend: '-',
+  rtf: 0,
+  tilesDone: 0,
+};
 let computeSec = 0;
 let audioSec = 0;
-const failedAt = new Map<string, number>();
 
 function post(msg: FromWorker, transfer: Transferable[] = []): void {
   self.postMessage(msg, transfer);
@@ -47,7 +85,7 @@ function post(msg: FromWorker, transfer: Transferable[] = []): void {
 function session(id: number): Session {
   let s = sessions.get(id);
   if (!s) {
-    s = { store: new PacketStore(), sbs: new Map(), lastUsed: Date.now() };
+    s = { store: new PacketStore(), sbs: new Map(), lastUsed: Date.now(), pos: null, posAt: 0, have: new Set(), captions: null, filterSince: 0 };
     sessions.set(id, s);
     if (sessions.size > MAX_SESSIONS) {
       const oldest = [...sessions.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
@@ -88,26 +126,45 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
         console.warn('[music-remover] demux error', err);
         sb.demuxer.resetParser();
       }
-      if (pos?.enabled) schedule();
+      if (s.pos?.enabled) schedule();
       break;
     }
     case 'abort': {
       sessions.get(m.session)?.sbs.get(m.sb)?.demuxer?.resetParser();
       break;
     }
+    case 'captions': {
+      const s = session(m.session);
+      s.captions = { state: m.state, words: m.words ?? [] };
+      schedule();
+      updateStatus(true);
+      break;
+    }
     case 'drop-session':
       sessions.delete(m.session);
       break;
     case 'position': {
-      pos = m;
-      if (m.enabled) lastEnabledAt = Date.now();
-      have = new Set(m.have);
-      const s = sessions.get(m.session);
-      if (s) {
-        s.lastUsed = Date.now();
-        s.store.evictBefore(m.time - KEEP_BEHIND_S);
+      const s = session(m.session);
+      s.pos = m;
+      s.posAt = Date.now();
+      s.lastUsed = Date.now();
+      s.have = new Set(m.have);
+      s.store.evictBefore(m.time - KEEP_BEHIND_S);
+      if (m.enabled && m.playing) lastPlayingAt = Date.now();
+      const f = m.filter ?? DEFAULT_FILTER;
+      if (filterKey(f) !== cfgKey) {
+        // settings changed (they are global): tiles the pages hold are stale (they stop reporting them in `have`)
+        cfgKey = filterKey(f);
+        sentAt.clear();
+        failedAt.clear();
       }
-      if (m.enabled && status.model === 'idle') void initModel();
+      // Load the model as soon as a page has a video; after an idle release, only once one plays.
+      if (m.enabled && f.musicRemoval && model$.model === 'idle' && (m.playing || !modelEverLoaded)) void initModel();
+      if (f.profanity === 'off') s.filterSince = 0;
+      else if (!s.filterSince) s.filterSince = Date.now();
+      // speech recognition only for videos without captions
+      if (m.enabled && f.profanity !== 'off' && wordsFrom(s) === 'asr' && (m.playing || profanity.state !== 'idle'))
+        profanity.ensure(() => (updateStatus(true), schedule()));
       schedule();
       updateStatus();
       break;
@@ -116,15 +173,17 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
 };
 
 async function initModel(): Promise<void> {
-  status.model = 'loading';
+  model$.model = 'loading';
+  model$.error = undefined;
   updateStatus(true);
   try {
-    model = await loadModel({ base, modelFile: MODEL_FILE, shape: mdx.tensorShape });
-    status.model = 'ready';
-    status.backend = model.backend;
+    model = await serial(() => loadModel({ base, modelFile: MODEL_FILE, shape: mdx.tensorShape }));
+    modelEverLoaded = true;
+    model$.model = 'ready';
+    model$.backend = model.backend;
   } catch (e) {
-    status.model = 'error';
-    status.error = e instanceof Error ? e.message : String(e);
+    model$.model = 'error';
+    model$.error = e instanceof Error ? e.message : String(e);
     console.error('[music-remover] model load failed', e);
   }
   updateStatus(true);
@@ -141,100 +200,212 @@ function schedule(): void {
   }, 0);
 }
 
-function pickTile(): { k: number; validFrom: number } | null {
-  if (!pos || !pos.enabled) return null;
-  const s = sessions.get(pos.session);
-  if (!s) return null;
-  const kNow = Math.max(0, tiling.tileAt(pos.time));
+interface TilePick {
+  sessionId: number;
+  k: number;
+  validFrom: number;
+  /** Seconds of wall time until this tile is heard (lower = more urgent). */
+  due: number;
+}
+
+function activeSessions(): [number, Session][] {
   const now = Date.now();
+  return [...sessions.entries()].filter(([, s]) => s.pos?.enabled && now - s.posAt < POSITION_STALE_MS && canProcess(s));
+}
+
+/** Where the profanity filter takes this session's words from. */
+function wordsFrom(s: Session): 'captions' | 'asr' | 'pending' {
+  const st = s.captions?.state;
+  if (st === 'ready') return 'captions';
+  if (st === 'none') return 'asr';
+  return s.filterSince && Date.now() - s.filterSince < CAPTIONS_WAIT_MS ? 'pending' : 'asr';
+}
+
+/**
+ * What this session's config needs is there: the separation model; for the profanity filter the
+ * captions, or else the recognizer (a failed recognizer lets tiles go out unfiltered — the page
+ * shows why).
+ */
+function canProcess(s: Session): boolean {
+  const f = s.pos?.filter ?? DEFAULT_FILTER;
+  if (f.musicRemoval && !model) return false;
+  if (f.profanity !== 'off') {
+    const src = wordsFrom(s);
+    if (src === 'pending') return false;
+    if (src === 'asr' && (profanity.state === 'idle' || profanity.state === 'loading')) return false;
+  }
+  return true;
+}
+
+/** Where the playhead is now: the last reported time, advanced by the time since the report. */
+function playhead(s: Session): number {
+  const pos = s.pos!;
+  if (!pos.playing) return pos.time;
+  return pos.time + (Math.min(Date.now() - s.posAt, 2000) / 1000) * (pos.rate > 0 ? pos.rate : 1);
+}
+
+/** Expected wall time to separate one tile, seconds. */
+function tileComputeEstimate(): number {
+  return (model$.rtf > 0 ? model$.rtf : 0.3) * tiling.tileSeconds + 0.25;
+}
+
+/** Tile under the playhead and whether it is still missing (neither held by the page nor sent). */
+function nowTile(id: number, s: Session): { kNow: number; missing: boolean } {
+  const kNow = Math.max(0, tiling.tileAt(playhead(s)));
+  const sent = sentAt.get(`${id}:${kNow}`);
+  return { kNow, missing: !s.have.has(kNow) && !(sent && Date.now() - sent < 3000) };
+}
+
+function pickFor(id: number, s: Session): TilePick | null {
+  const pos = s.pos!;
+  const { kNow } = nowTile(id, s);
+  const now = Date.now();
+  const rate = pos.rate > 0 ? pos.rate : 1;
+  const t = playhead(s);
   for (let k = kNow; k <= kNow + LOOKAHEAD_TILES; k++) {
+    // A tile that will already be over when it's ready is wasted work: go for the next one
+    // (e.g. after a seek close to the end of a tile).
+    if (pos.playing && k === kNow && (tiling.tileStart(k + 1) - t) / rate < tileComputeEstimate()) continue;
     if (Number.isFinite(pos.duration) && pos.duration > 0 && tiling.tileStart(k) >= pos.duration) break;
-    if (have.has(k)) continue;
-    const key = `${pos.session}:${k}`;
+    if (s.have.has(k)) continue;
+    const key = `${id}:${k}`;
     const sent = sentAt.get(key);
     if (sent && now - sent < 3000) continue; // page hasn't acknowledged yet
     const failed = failedAt.get(key);
     if (failed && now - failed < 5000) continue;
+    const due = Math.max(0, tiling.tileStart(k) - t) / rate + (pos.playing ? 0 : 1000);
     const [a, b] = tiling.inputRange(k);
-    if (s.store.covers(a, b, pos.duration)) return { k, validFrom: tiling.tileStart(k) };
+    // with the profanity filter, tiles ahead of the playhead also wait for the recognition context
+    const after = k > kNow && pos.filter && pos.filter.profanity !== 'off' && wordsFrom(s) === 'asr' ? CONTEXT_S : 0;
+    if (s.store.covers(a, b + after, pos.duration)) return { sessionId: id, k, validFrom: tiling.tileStart(k), due };
     // Right after a seek the player has no audio before the new position. For the tile under
     // the playhead, separate what exists (the unheard part before it is treated as silence)
     // instead of waiting for the next tile boundary.
     if (k === kNow) {
-      const from = Math.max(a, pos.time - 0.3);
-      if (from > a && s.store.covers(from, b, pos.duration)) return { k, validFrom: Math.max(tiling.tileStart(k), from + 0.1) };
+      const from = Math.max(a, t - 0.3);
+      if (from > a && s.store.covers(from, b, pos.duration)) {
+        return { sessionId: id, k, validFrom: Math.max(tiling.tileStart(k), from + 0.1), due };
+      }
     }
   }
   return null;
 }
 
+function pickTile(): TilePick | null {
+  let best: TilePick | null = null;
+  for (const [id, s] of activeSessions()) {
+    const p = pickFor(id, s);
+    if (p && (!best || p.due < best.due)) best = p;
+  }
+  return best;
+}
+
 async function pump(): Promise<void> {
-  if (busy || !model || !pos) return;
+  if (busy) return;
   const pick = pickTile();
   if (pick === null) return;
-  const { k, validFrom } = pick;
-  const sessionId = pos.session;
+  const { sessionId, k, validFrom } = pick;
   const s = sessions.get(sessionId)!;
+  const debug = !!s.pos?.debug;
+  const f = s.pos?.filter ?? DEFAULT_FILTER;
   busy = true;
   const key = `${sessionId}:${k}`;
   try {
     const t0 = performance.now();
     const [a, b] = tiling.inputRange(k);
-    const decoded = await decodePackets(s.store.range(a - 0.12, b + 0.05));
+    const ctxS = f.profanity !== 'off' ? CONTEXT_S : 0; // speech recognition also hears around the tile
+    const decoded = await decodePackets(s.store.range(a - 0.12 - ctxS, b + 0.05 + ctxS));
     if (!decoded) throw new Error('nothing decoded');
+    // The viewer may have seeked while this was being decoded: don't spend the model on a tile
+    // that is no longer ahead of the playhead.
+    if (s.pos && (k < tiling.tileAt(playhead(s)) || tiling.tileStart(k) > playhead(s) + (LOOKAHEAD_TILES + 1) * tiling.tileSeconds)) return;
     const L = resampleCubic(decoded.left, decoded.sampleRate, decoded.start, tiling.rate, a, tiling.chunkSize);
     const R = resampleCubic(decoded.right, decoded.sampleRate, decoded.start, tiling.rate, a, tiling.chunkSize);
-    const mixLeft = pos.debug ? L.slice(tiling.trim, tiling.trim + tiling.genSize) : undefined;
-    const [left, right] = await separateWindow(mdx, model.run, L, R, scratch);
+    const mixLeft = debug ? L.slice(tiling.trim, tiling.trim + tiling.genSize) : undefined;
+    const [left, right] = f.musicRemoval
+      ? await separateWindow(mdx, model!.run, L, R, scratch)
+      : [L.slice(tiling.trim, tiling.trim + tiling.genSize), R.slice(tiling.trim, tiling.trim + tiling.genSize)];
+    const { report, patch } =
+      f.profanity !== 'off'
+        ? await profanity.filterTile({ session: sessionId, k, start: tiling.tileStart(k), validFrom, rate: tiling.rate, left, right, decoded, separated: f.musicRemoval, mode: f.profanity, debug })
+        : {};
     const dt = (performance.now() - t0) / 1000;
     computeSec += dt;
     audioSec += tiling.tileSeconds;
-    status.tilesDone++;
-    status.rtf = computeSec / audioSec;
+    model$.tilesDone++;
+    model$.rtf = computeSec / audioSec;
     sentAt.set(key, Date.now());
     const transfer: Transferable[] = [left.buffer, right.buffer];
     if (mixLeft) transfer.push(mixLeft.buffer);
     post(
-      { type: 'tile', session: sessionId, k, start: tiling.tileStart(k), validFrom, sampleRate: tiling.rate, left, right, mixLeft, computeMs: dt * 1000 },
+      { type: 'tile', session: sessionId, k, start: tiling.tileStart(k), validFrom, sampleRate: tiling.rate, left, right, mixLeft, computeMs: dt * 1000, cfg: filterKey(f), profanity: report },
       transfer,
     );
+    if (patch) post({ ...patch, type: 'tile', session: sessionId, sampleRate: tiling.rate, cfg: filterKey(f) }, [patch.left.buffer, patch.right.buffer]);
   } catch (e) {
     console.warn('[music-remover] tile failed', k, e);
     failedAt.set(key, Date.now());
   } finally {
     busy = false;
+    schedule();
   }
   updateStatus();
-  schedule();
+}
+
+function sessionStatus(id: number, s: Session): WorkerStatus {
+  const pos = s.pos!;
+  const { kNow, missing } = nowTile(id, s);
+  let k = kNow;
+  while (s.have.has(k) || sentAt.has(`${id}:${k}`)) k++;
+  let waitFor: WorkerStatus['waitFor'];
+  if (missing) {
+    const [a, b] = tiling.inputRange(kNow);
+    const from = Math.max(a, pos.time - 0.3);
+    const coverable = s.store.covers(a, b, pos.duration) || (from > a && s.store.covers(from, b, pos.duration));
+    waitFor = coverable ? 'compute' : 'input';
+  }
+  return {
+    ...model$,
+    words: (pos.filter ?? DEFAULT_FILTER).profanity !== 'off' ? wordsFrom(s) : undefined,
+    asr: profanity.state,
+    asrError: profanity.error,
+    asrMs: profanity.avgMs,
+    ahead: Math.max(0, tiling.tileStart(k) - pos.time),
+    inputAhead: Math.max(0, s.store.contiguousEnd(pos.time) - pos.time),
+    waitFor,
+  };
 }
 
 let lastStatus = 0;
 function updateStatus(force = false): void {
   const now = Date.now();
-  if (!force && now - lastStatus < 500) return;
+  if (!force && now - lastStatus < 400) return;
   lastStatus = now;
-  if (pos) {
-    const kNow = Math.max(0, tiling.tileAt(pos.time));
-    let k = kNow;
-    while (have.has(k) || sentAt.has(`${pos.session}:${k}`)) k++;
-    status.ahead = Math.max(0, tiling.tileStart(k) - pos.time);
-    const s = sessions.get(pos.session);
-    status.inputAhead = s ? Math.max(0, s.store.contiguousEnd(pos.time) - pos.time) : 0;
-    // forget acknowledgements far behind
-    for (const key of sentAt.keys()) {
-      const [sid, kk] = key.split(':').map(Number);
-      if (sid !== pos.session || kk < kNow - 4) sentAt.delete(key);
-    }
+  // forget acknowledgements far behind each playhead
+  for (const key of sentAt.keys()) {
+    const [sid, kk] = key.split(':').map(Number);
+    const s = sessions.get(sid);
+    if (!s?.pos || kk < tiling.tileAt(s.pos.time) - 4) sentAt.delete(key);
   }
-  post({ type: 'status', status: { ...status } });
+  let any = false;
+  for (const [id, s] of sessions) {
+    if (!s.pos) continue;
+    any = true;
+    post({ type: 'status', session: id, status: sessionStatus(id, s) });
+  }
+  if (!any) post({ type: 'status', status: { ...model$, asr: profanity.state, asrError: profanity.error, ahead: 0, inputAhead: 0 } });
 }
 
 setInterval(() => {
-  if (model && !busy && Date.now() - lastEnabledAt > IDLE_RELEASE_MS) {
+  if (!busy && Date.now() - lastPlayingAt > IDLE_RELEASE_MS && profanity.state === 'ready') {
+    void profanity.release();
+    updateStatus(true);
+  }
+  if (model && !busy && Date.now() - lastPlayingAt > IDLE_RELEASE_MS) {
     const m = model;
     model = null;
-    status.model = 'idle';
-    status.backend = '-';
+    model$.model = 'idle';
+    model$.backend = '-';
     void m.release().catch(() => undefined);
     updateStatus(true);
   }

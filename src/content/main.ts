@@ -7,15 +7,19 @@
 import {
   DEFAULT_SETTINGS,
   MSG_NS,
+  filterKey,
+  type FilterConfig,
   type FromWorker,
   type PageStatus,
   type Settings,
+  type TileProfanityReport,
   type ToWorker,
   type WorkerStatus,
 } from '../shared/messages';
 import { timeStretch } from '../core/stretch';
 import type { FromVision } from '../shared/vision-messages';
 import { VisionController } from './blur';
+import { Captions } from './captions';
 
 declare global {
   interface Window {
@@ -30,7 +34,12 @@ declare global {
   // ───────────────────────── transport ─────────────────────────
   // The ISOLATED-world bridge forwards these to the extension's offscreen processor.
   let procReady = false;
+  /** Link to the processor as reported by the bridge (see bridge.ts reportLink). */
+  const link = { up: false, orphaned: false, downSince: 0 };
+  /** No link for this long while a video needs processing → give up and play the original. */
+  const LINK_GRACE_MS = 4000;
   function send(msg: ToWorker): void {
+    if (!link.up && !link.downSince) link.downSince = performance.now();
     window.postMessage({ ns: MSG_NS, from: 'main', kind: 'to-worker', msg }, '*');
   }
 
@@ -149,13 +158,26 @@ declare global {
   let settings: Settings = { ...DEFAULT_SETTINGS };
   let workerStatus: WorkerStatus | null = null;
   let tileSeconds = 253440 / 44100;
+  const filterCfg = (): FilterConfig => ({ musicRemoval: settings.musicRemoval, profanity: settings.profanity });
+  /** Master switch on and at least one of the two features selected. */
+  const active = (): boolean => settings.enabled && (settings.musicRemoval || settings.profanity !== 'off');
 
   window.addEventListener('message', (e: MessageEvent) => {
-    const d = e.data as { ns?: string; from?: string; kind?: string; msg?: FromWorker; settings?: Settings };
+    const d = e.data as { ns?: string; from?: string; kind?: string; msg?: FromWorker; settings?: Settings; up?: boolean; orphaned?: boolean };
     if (!d || d.ns !== MSG_NS) return;
     if (d.from === 'vision' && d.msg && e.source === window) {
       vision.onMessage(d.msg as unknown as FromVision);
       if ((d.msg as unknown as FromVision).type === 'result') tick();
+      return;
+    }
+    if (d.from === 'bridge' && e.source === window && d.kind === 'link') {
+      const was = link.up;
+      link.up = !!d.up;
+      link.orphaned = !!d.orphaned;
+      // the grace timer starts when the page first needs the processor (send) or the link drops
+      if (link.up) link.downSince = 0;
+      else if (was) link.downSince = performance.now();
+      tick();
       return;
     }
     if (d.from === 'bridge' && e.source === window && d.kind === 'settings' && d.settings) {
@@ -172,7 +194,7 @@ declare global {
       } else if (msg.type === 'tiling') {
         tileSeconds = msg.tileSeconds;
       } else if (msg.type === 'status') {
-        workerStatus = msg.status;
+        if (msg.session === undefined || msg.session === player.session) workerStatus = msg.status;
       } else if (msg.type === 'tile') {
         player.onTile(msg);
       }
@@ -187,6 +209,9 @@ declare global {
     validFrom: number;
     mix?: Float32Array;
     stretched?: { rate: number; buf: AudioBuffer };
+    /** Settings the tile was made with; tiles of older settings play until replaced. */
+    cfg?: string;
+    profanity?: TileProfanityReport;
   }
   let debugMode = false;
   try {
@@ -194,12 +219,13 @@ declare global {
   } catch {
     /* storage blocked */
   }
-  const dbg = { reanchors: 0, lastDrift: 0, maxDrift: 0, tilesReceived: 0, scheduledTotal: 0 };
+  const dbg = { reanchors: 0, lastDrift: 0, maxDrift: 0, tilesReceived: 0, scheduledTotal: 0, arrivals: [] as string[] };
   interface Attached {
     orig: GainNode;
   }
 
   let lastPosSent = 0;
+  let lastPos = { time: 0, playing: false, rate: 1, session: 0 };
 
   const player = new (class Player {
     ctx: AudioContext | null = null;
@@ -215,12 +241,27 @@ declare global {
 
     onTile(msg: Extract<FromWorker, { type: 'tile' }>): void {
       if (msg.session !== this.session) return;
+      if (debugMode) {
+        dbg.arrivals.push(`k${msg.k}@${(this.video?.currentTime ?? 0).toFixed(1)} ${Math.round(msg.computeMs ?? 0)}ms vf=${msg.validFrom.toFixed(1)}`);
+        if (dbg.arrivals.length > 30) dbg.arrivals.shift();
+      }
       const buf = new AudioBuffer({ numberOfChannels: 2, length: msg.left.length, sampleRate: msg.sampleRate });
       buf.copyToChannel(msg.left as Float32Array<ArrayBuffer>, 0);
       buf.copyToChannel(msg.right as Float32Array<ArrayBuffer>, 1);
       const prev = this.tiles.get(msg.k);
-      if (prev && prev.validFrom <= msg.validFrom && this.scheduled.has(msg.k)) return; // keep what's playing
-      this.tiles.set(msg.k, { buf, start: msg.start, validFrom: msg.validFrom, mix: msg.mixLeft });
+      if (prev && prev.cfg === msg.cfg && prev.validFrom <= msg.validFrom && this.scheduled.has(msg.k)) return; // keep what's playing
+      const old = this.scheduled.get(msg.k);
+      if (prev && prev.cfg !== msg.cfg && old) {
+        // settings changed: swap in the new version from the current position
+        try {
+          old.stop();
+          old.disconnect();
+        } catch {
+          /* already stopped */
+        }
+        this.scheduled.delete(msg.k);
+      }
+      this.tiles.set(msg.k, { buf, start: msg.start, validFrom: msg.validFrom, mix: msg.mixLeft, cfg: msg.cfg, profanity: msg.profanity });
       dbg.tilesReceived++;
       tick();
     }
@@ -330,11 +371,11 @@ declare global {
       const sid = sessionOf(v);
       if (sid !== this.session) this.resetSession(sid);
 
-      if (!settings.enabled || !sid) {
+      if (!active() || !sid) {
         const a = this.attached.get(v);
         if (a) a.orig.gain.value = 1;
         this.stopAll();
-        this.state = settings.enabled ? 'no-video' : 'disabled';
+        this.state = active() ? 'no-video' : 'disabled';
         badge.update(v, this.state);
         this.sendPosition(v, false);
         return;
@@ -343,6 +384,18 @@ declare global {
       const a = this.attach(v);
       const ctx = this.ctx;
       if (!a || !ctx || !this.clean) return;
+
+      // Processor unreachable or broken: never leave the viewer in silence — play the original.
+      const offline =
+        link.orphaned || (!link.up && link.downSince > 0 && performance.now() - link.downSince > LINK_GRACE_MS);
+      if (offline || workerStatus?.model === 'error') {
+        a.orig.gain.setTargetAtTime(1, ctx.currentTime, 0.015);
+        this.stopAll();
+        this.state = 'offline';
+        badge.update(v, this.state);
+        this.sendPosition(v, true);
+        return;
+      }
       if (ctx.state === 'suspended') void ctx.resume().catch(() => undefined);
 
       const t = v.currentTime;
@@ -410,8 +463,13 @@ declare global {
 
     sendPosition(v: HTMLVideoElement, enabled: boolean): void {
       const now = performance.now();
-      if (now - lastPosSent < 250) return;
+      // A jump (seek, new video) goes out at once so the processor stops working on the old spot.
+      const expected = lastPos.time + (lastPos.playing ? ((now - lastPosSent) / 1000) * lastPos.rate : 0);
+      const jumped = Math.abs(v.currentTime - expected) > 0.5 || this.session !== lastPos.session;
+      if (now - lastPosSent < 250 && !jumped) return;
       lastPosSent = now;
+      const playing = !v.paused && !v.ended && !v.seeking && v.readyState >= 3;
+      lastPos = { time: v.currentTime, playing, rate: v.playbackRate || 1, session: this.session };
       if (!this.session) return;
       send({
         type: 'position',
@@ -419,8 +477,11 @@ declare global {
         time: v.currentTime,
         duration: Number.isFinite(v.duration) ? v.duration : Infinity,
         enabled,
-        have: [...this.tiles.keys()],
+        playing,
+        rate: v.playbackRate || 1,
+        have: [...this.tiles].filter(([, tl]) => tl.cfg === filterKey(filterCfg())).map(([kk]) => kk),
         debug: debugMode,
+        filter: filterCfg(),
       });
     }
   })();
@@ -459,13 +520,21 @@ declare global {
       if (this.el.parentElement !== host) host.appendChild(this.el);
 
       const ws = workerStatus;
+      const music = settings.musicRemoval;
+      const filter = settings.profanity !== 'off';
       let text = '';
       if (!musicOn) text = '';
-      else if (ws?.model === 'error') text = `⚠ Music Remover: ${ws.error ?? 'ошибка модели'}`;
-      else if (state === 'suspended') text = '🔇 Нажмите на страницу, чтобы включить звук без музыки';
-      else if (!ws || ws.model === 'loading' || ws.model === 'idle') text = '⏳ Загружаю модель…';
-      else if (state === 'waiting') text = '⏳ Убираю музыку…';
-      else text = '🎙 Без музыки';
+      else if (music && ws?.model === 'error') text = `⚠ Music Remover: ${ws.error ?? 'ошибка модели'} — играет оригинал`;
+      else if (link.orphaned) text = '⚠ Расширение обновилось — обновите страницу (сейчас играет оригинал)';
+      else if (state === 'offline') text = '⚠ Нет связи с обработчиком — играет оригинал';
+      else if (state === 'suspended') text = `🔇 Нажмите на страницу, чтобы включить ${music ? 'звук без музыки' : 'фильтр мата'}`;
+      else if (!ws || (music && (ws.model === 'loading' || ws.model === 'idle')) || (filter && ws.words === 'asr' && (ws.asr === 'loading' || ws.asr === 'idle' || !ws.asr)))
+        text = '⏳ Загружаю модель…';
+      else if (filter && ws.words === 'pending') text = '⏳ Получаю субтитры…';
+      else if (state === 'waiting' && ws.waitFor === 'input') text = '⏳ Жду звук от YouTube…';
+      else if (state === 'waiting') text = music ? '⏳ Убираю музыку…' : '⏳ Проверяю речь…';
+      else if (filter && ws.words === 'asr' && ws.asr === 'error') text = `⚠ Фильтр мата не работает: ${ws.asrError ?? 'ошибка распознавания речи'}`;
+      else text = music && filter ? '🎙 Без музыки и мата' : music ? '🎙 Без музыки' : '🎙 Без мата';
       if (blurNote) text = text ? `${text} · ${blurNote}` : blurNote;
 
       if ((!musicOn || state === 'clean' || state === 'paused') && !blurNote) {
@@ -486,6 +555,19 @@ declare global {
   })();
 
   // ───────────────────────── loop & events ─────────────────────────
+  // ───────────────────────── captions for the profanity filter ─────────────────────────
+  const captions = new Captions();
+  let capSent = { version: -1, session: 0 };
+  function syncCaptions(): void {
+    if (!active() || settings.profanity === 'off') return;
+    captions.update();
+    const sid = player.session;
+    if (!sid || (capSent.version === captions.version && capSent.session === sid)) return;
+    capSent = { version: captions.version, session: sid };
+    const r = captions.result;
+    send({ type: 'captions', session: sid, state: r.state, words: r.words, lang: r.lang, kind: r.kind });
+  }
+
   function tick(): void {
     // blur decision first: the badge (drawn by player.tick) reports it
     try {
@@ -495,6 +577,7 @@ declare global {
     }
     try {
       player.tick();
+      syncCaptions();
     } catch (e) {
       console.warn('[music-remover] tick error', e);
     }
@@ -522,6 +605,8 @@ declare global {
           worker: workerStatus,
           time: player.video?.currentTime,
           procConnected: procReady,
+          link: { ...link },
+          captions: { state: captions.result.state, videoId: captions.result.videoId, words: captions.result.words.length, lang: captions.result.lang, kind: captions.result.kind },
           hookLog: hookLog.slice(-8),
           hookStats,
           videoSrc: player.video?.currentSrc?.slice(0, 60),
@@ -537,7 +622,7 @@ declare global {
         const t = player.tiles.get(k);
         if (!t) return null;
         const q = (a: Float32Array) => Array.from(a, (x) => Math.round(Math.max(-1, Math.min(1, x)) * 32767));
-        return { start: t.start, clean: q(t.buf.getChannelData(0)), mix: t.mix ? q(t.mix) : null };
+        return { start: t.start, cfg: t.cfg, profanity: t.profanity ?? null, clean: q(t.buf.getChannelData(0)), mix: t.mix ? q(t.mix) : null };
       },
     };
   }

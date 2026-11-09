@@ -17,19 +17,37 @@
 
   <section class="status" id="status">
     <div class="row"><span>Состояние</span><b id="st-state">—</b></div>
-    <div class="row"><span>Модель</span><b id="st-model">—</b></div>
+    <div class="row"><span>Модель (музыка)</span><b id="st-model">—</b></div>
     <div class="row"><span>Скорость обработки</span><b id="st-speed">—</b></div>
     <div class="row"><span>Готово вперёд</span><b id="st-ahead">—</b></div>
+    <div class="row" id="row-asr" hidden><span>Поиск мата</span><b id="st-asr">—</b></div>
   </section>
 
   <section class="opts">
+    <label class="check toggle">
+      <input id="musicRemoval" type="checkbox" /> <b>Убирать музыку</b>
+    </label>
+  </section>
+
+  <section class="opts">
+    <h2>Мат</h2>
+    <div class="seg" role="radiogroup" aria-label="Фильтр мата">
+      <label><input type="radio" name="profanity" value="off" /><span>Не фильтровать</span></label>
+      <label><input type="radio" name="profanity" value="mute" /><span>Заглушать</span></label>
+      <label><input type="radio" name="profanity" value="beep" /><span>Запикивать</span></label>
+    </div>
+    <small class="hint" id="profanity-hint">Русский и английский. Речь распознаётся на вашем компьютере.</small>
+  </section>
+
+  <section class="opts">
+    <h2>Пока звук не готов</h2>
     <label class="opt">
       <input type="radio" name="mode" value="strict" />
-      <div><b>Строгий режим</b><small>Пока чистый звук не готов — тишина. Музыка не прозвучит никогда.</small></div>
+      <div><b>Строгий режим</b><small>Пока обработанный звук не готов — тишина. Музыка и мат не прозвучат.</small></div>
     </label>
     <label class="opt">
       <input type="radio" name="mode" value="lenient" />
-      <div><b>Мягкий режим</b><small>Пока чистый звук не готов — играет оригинал.</small></div>
+      <div><b>Мягкий режим</b><small>Пока обработанный звук не готов — играет оригинал.</small></div>
     </label>
     <label class="check">
       <input id="showBadge" type="checkbox" /> Показывать значок на видео

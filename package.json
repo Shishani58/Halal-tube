@@ -1,10 +1,11 @@
 {
   "name": "music-remover-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "fetch-model": "node scripts/fetch-model.mjs",
+    "fetch-model": "node scripts/fetch-model.mjs && node scripts/fetch-asr-model.mjs",
+    "fetch-asr-model": "node scripts/fetch-asr-model.mjs",
     "build": "node scripts/build.mjs",
     "build:test": "node scripts/build.mjs --test",
     "watch": "node scripts/build.mjs --watch",
@@ -14,7 +15,8 @@
     "test:e2e": "sh tests/e2e/make-media.sh && node scripts/build.mjs --test && node tests/e2e/local.mjs",
     "test:blur": "sh tests/e2e/make-media.sh && sh tests/e2e/make-blur-media.sh && node scripts/build.mjs --test && node tests/e2e/blur.mjs",
     "bench": "node tests/e2e/bench.mjs webgpu",
-    "package": "node scripts/build.mjs && cd dist && zip -qr ../music-remover.zip . && echo music-remover.zip"
+    "bench:asr": "ASR_BENCH=1 node scripts/build.mjs && node tests/e2e/asr-bench.mjs",
+    "package": "node scripts/build.mjs && rm -f music-remover.zip && cd dist && zip -qr ../music-remover.zip . && echo music-remover.zip"
   },
   "devDependencies": {
     "@types/chrome": "^0.3.7",
@@ -26,6 +28,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.3.2",
     "onnxruntime-web": "^1.31.1"
   }
 }

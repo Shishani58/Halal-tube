@@ -112,7 +112,7 @@ export class VisionController {
   // ───────── per-frame decision ─────────
   tick(activeVideo: HTMLVideoElement | null): void {
     const s = this.getSettings();
-    const on = s.blur;
+    const on = s.enabled && s.blur; // the header switch turns everything off
     if (on !== this.active) {
       this.active = on;
       for (const sb of this.sbs.values()) sb.announced = false;
@@ -184,7 +184,7 @@ export class VisionController {
   /** Short note for the on-video badge ('' = nothing to say). */
   badgeText(): string {
     const s = this.getSettings();
-    if (!s.blur) return '';
+    if (!s.enabled || !s.blur) return '';
     if (this.status?.model === 'error') return '⚠ Размытие: ошибка модели';
     if (this.state === 'checking' && s.blurStrict) return '⏳ Проверяю кадры…';
     if (this.state === 'hidden') return '🙈 Скрыто';

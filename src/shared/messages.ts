@@ -9,12 +9,35 @@ export type ToWorker =
       time: number;
       duration: number;
       enabled: boolean;
+      /** The video is actually playing (not paused, seeking or stalled). Playing videos go first. */
+      playing: boolean;
+      /** Playback rate, to rank how soon each video needs its next tile. */
+      rate: number;
       /** Tile indices the page currently holds around `time`. */
       have: number[];
       /** Debug: also return the original mix with each tile. */
       debug?: boolean;
+      /** What to do to each tile (default: remove music, no profanity filter). */
+      filter?: FilterConfig;
+    }
+  | {
+      /**
+       * Word timings from the video's captions for the profanity filter. 'pending': being fetched
+       * (the worker waits a little before falling back to speech recognition); 'none': the video
+       * has no usable captions.
+       */
+      type: 'captions';
+      session: number;
+      state: CaptionState;
+      /** Media seconds, sorted by start. */
+      words?: { text: string; start: number; end: number }[];
+      lang?: string;
+      /** Auto-generated (word-timed) or uploaded (line-timed) track. */
+      kind?: 'asr' | 'uploaded';
     }
   | { type: 'drop-session'; session: number };
+
+export type CaptionState = 'pending' | 'ready' | 'none';
 
 /** Messages processor → page. */
 export type FromWorker =
@@ -32,8 +55,13 @@ export type FromWorker =
       /** Debug only: original (unseparated) left channel for the same span. */
       mixLeft?: Float32Array;
       computeMs?: number;
+      /** filterKey() of the config this tile was made with. */
+      cfg?: string;
+      /** Profanity filter result for this tile (when it ran). */
+      profanity?: TileProfanityReport;
     }
-  | { type: 'status'; status: WorkerStatus }
+  /** Status of one media session (`session` set) or of the model only (no session yet). */
+  | { type: 'status'; session?: number; status: WorkerStatus }
   | { type: 'tiling'; tileSeconds: number; sampleRate: number };
 
 export interface WorkerStatus {
@@ -47,6 +75,50 @@ export interface WorkerStatus {
   ahead: number;
   /** Seconds of compressed audio buffered ahead of the playhead. */
   inputAhead: number;
+  /**
+   * Why the tile under the playhead isn't there yet: 'input' — the player hasn't loaded that
+   * audio yet; 'compute' — it is queued or being separated; undefined — it's done.
+   */
+  waitFor?: 'input' | 'compute';
+  /** Where the profanity filter gets this video's words: its captions, speech recognition, or still deciding. */
+  words?: 'captions' | 'asr' | 'pending';
+  /** Speech recognizer for the profanity filter. */
+  asr?: 'idle' | 'loading' | 'ready' | 'error';
+  asrError?: string;
+  /** Average recognition time per tile (ms). */
+  asrMs?: number;
+}
+
+export type ProfanityMode = 'off' | 'mute' | 'beep';
+
+/** Per-tile processing the page asks for. */
+export interface FilterConfig {
+  musicRemoval: boolean;
+  profanity: ProfanityMode;
+}
+
+export const DEFAULT_FILTER: FilterConfig = { musicRemoval: true, profanity: 'off' };
+
+/** Short key identifying a FilterConfig (tiles made with another config are stale). */
+export function filterKey(f: FilterConfig): string {
+  return `${f.musicRemoval ? 'v' : 'm'}:${f.profanity}`;
+}
+
+export interface TileProfanityReport {
+  lang: string;
+  langProb: number;
+  passes: number;
+  asrMs: number;
+  /** Recognized words around the tile, media seconds. */
+  words: { text: string; start: number; end: number }[];
+  /** Profane words found. */
+  hits: { text: string; start: number; end: number }[];
+  /** Padded spans muted/beeped inside this tile. */
+  spans: { start: number; end: number }[];
+  /** Share of the left/right recognition context that had audio (debug). */
+  context?: [number, number];
+  /** Debug only: the recognizer's 16 kHz input (int16 values). */
+  input?: number[];
 }
 
 export interface Settings {
@@ -54,6 +126,10 @@ export interface Settings {
   /** strict: silence while clean audio isn't ready; lenient: play original meanwhile. */
   mode: 'strict' | 'lenient';
   showBadge: boolean;
+  /** Remove background music (off: the profanity filter alone works on the original sound). */
+  musicRemoval: boolean;
+  /** Profanity (мат) filter: off, silence the word, or beep over it. */
+  profanity: ProfanityMode;
   /** Blur video frames with nudity (men and women). */
   blur: boolean;
   /** Also blur frames where a woman is visible. */
@@ -62,12 +138,13 @@ export interface Settings {
   blurStrict: boolean;
 }
 
-export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, blur: true, blurWomen: true, blurStrict: true };
+export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, musicRemoval: true, profanity: 'off', blur: true, blurWomen: true, blurStrict: true };
 
 /** What the page reports for the popup. */
 export interface PageStatus {
   worker: WorkerStatus | null;
-  state: 'disabled' | 'no-video' | 'waiting' | 'clean' | 'paused' | 'suspended';
+  /** offline: no link to the processor (e.g. the extension was updated) — the original plays. */
+  state: 'disabled' | 'no-video' | 'waiting' | 'clean' | 'paused' | 'suspended' | 'offline';
   videoTime: number;
   sessions: number;
   /** Blurring (frame classifier) state. */

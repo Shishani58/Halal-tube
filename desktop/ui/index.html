@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Music Remover</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+        <circle cx="16" cy="16" r="15.4" fill="var(--accent)"/>
+        <rect x="12.5" y="6.5" width="7" height="12.6" rx="3.5" fill="#fff"/>
+        <path d="M9.9 14.8a6.1 6.1 0 0 0 12.2 0" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/>
+        <path d="M16 21v3.6M12 25.2h8" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/>
+      </svg>
+      <div>
+        <h1 data-i18n="title"></h1>
+        <p class="sub" data-i18n="subtitle"></p>
+      </div>
+    </div>
+    <div class="lang" role="group" aria-label="Language">
+      <button type="button" data-lang="ru">RU</button>
+      <button type="button" data-lang="en">EN</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="drop" class="drop" tabindex="0">
+      <svg class="drop-icon" viewBox="0 0 48 48" aria-hidden="true">
+        <path d="M6 24h3M12 17v14M18 11v26M24 19v10M30 14v20M36 20v8M42 24h0" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+        <path d="M9 39 39 9" stroke="var(--bg)" stroke-width="7" stroke-linecap="round"/>
+        <path d="M9 39 39 9" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+      </svg>
+      <p class="drop-title" data-i18n="dropTitle"></p>
+      <p class="drop-or"><span data-i18n="or"></span> <button id="pick" type="button" class="link" data-i18n="pick"></button></p>
+      <p class="drop-formats" data-i18n="formats"></p>
+    </section>
+
+    <section id="list-wrap" class="list-wrap" hidden>
+      <div class="list-head">
+        <h2 data-i18n="queue"></h2>
+        <button id="clear" type="button" class="link small" data-i18n="clear"></button>
+      </div>
+      <ul id="list" class="list"></ul>
+    </section>
+  </main>
+
+  <footer class="bottom">
+    <div class="dest">
+      <span class="muted" data-i18n="saveTo"></span>
+      <span id="dest-label" class="dest-label"></span>
+      <button id="dest-change" type="button" class="link small" data-i18n="change"></button>
+      <button id="dest-reset" type="button" class="link small" data-i18n="reset" hidden></button>
+    </div>
+    <div id="engine" class="engine muted"></div>
+  </footer>
+
+  <div id="overlay" class="overlay" hidden>
+    <div class="overlay-box" data-i18n="dropHere"></div>
+  </div>
+
+  <template id="row">
+    <li class="job">
+      <div class="kind" aria-hidden="true"></div>
+      <div class="body">
+        <div class="line1">
+          <span class="name"></span>
+        </div>
+        <div class="line2"><span class="status"></span></div>
+        <div class="bar"><div class="fill"></div></div>
+      </div>
+      <div class="actions">
+        <button type="button" class="btn reveal" hidden></button>
+        <button type="button" class="icon-btn stop" hidden aria-label="">
+          <svg viewBox="0 0 16 16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </li>
+  </template>
+
+  <script src="i18n.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>

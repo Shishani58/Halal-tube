@@ -45,7 +45,7 @@ page.on('pageerror', (e) => console.log('[pageerror]', e.message));
 
 let sw = ctx.serviceWorkers()[0] ?? (await ctx.waitForEvent('serviceworker'));
 const setSettings = (s) => sw.evaluate((x) => chrome.storage.sync.set(x), s);
-await setSettings({ enabled: false, blur: true, blurWomen: true, blurStrict: true }); // isolate blurring
+await setSettings({ enabled: true, musicRemoval: false, profanity: 'off', blur: true, blurWomen: true, blurStrict: true }); // isolate blurring
 
 await page.goto('http://localhost:8791/player.html');
 await page.evaluate(() => localStorage.setItem('__mr_debug', '1'));
@@ -165,10 +165,10 @@ console.log(`blur off → state=${off.vision.state} filter="${off.filter}"`);
 const extId = new URL(sw.url()).host;
 await setSettings({ blur: true });
 const pop = await ctx.newPage();
-await pop.setViewportSize({ width: 320, height: 640 });
+await pop.setViewportSize({ width: 320, height: 900 });
 await pop.goto(`chrome-extension://${extId}/popup/popup.html`);
 await pop.waitForTimeout(800);
 await pop.screenshot({ path: '/tmp/mr/e2e/popup-blur.png' });
-await setSettings({ enabled: true });
+await setSettings({ enabled: true, musicRemoval: true });
 await ctx.close();
 server.close();

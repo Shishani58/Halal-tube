@@ -52,7 +52,7 @@ const sdSeg = (x, y, ax, ay, bx, by, w) => {
   return Math.hypot(pax - bax * h, pay - bay * h) - w;
 };
 
-function draw(size) {
+export function draw(size) {
   const buf = Buffer.alloc(size * size * 4);
   const ss = 4; // supersampling
   for (let py = 0; py < size; py++) {

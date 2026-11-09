@@ -1,0 +1,27 @@
+[package]
+name = "mr-core"
+description = "Music Remover core: MDX-Net vocal separation and FFmpeg file pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mr_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mr-cli"
+path = "src/bin/mr-cli.rs"
+
+[dependencies]
+rustfft = "6"
+ort = "=2.0.0-rc.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.15", features = ["coreml"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "=2.0.0-rc.15", features = ["directml"] }
