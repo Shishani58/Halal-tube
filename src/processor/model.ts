@@ -18,7 +18,7 @@ export interface LoadOptions {
 
 let ortPromise: Promise<typeof Ort> | null = null;
 
-async function loadOrt(base: string): Promise<typeof Ort> {
+export async function loadOrt(base: string): Promise<typeof Ort> {
   if (!ortPromise) {
     ortPromise = (async () => {
       const url = `${base}ort/ort.webgpu.min.mjs`;
