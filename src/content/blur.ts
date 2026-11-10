@@ -11,6 +11,7 @@ import { MSG_NS, type Settings } from '../shared/messages';
 import { isInitSegment, type FromVision, type PageVision, type ToVision, type VisionStatus } from '../shared/vision-messages';
 import { PART, VisionTimeline, type Decision } from '../core/vision-timeline';
 import { cutPlates, samePlate } from '../core/plates';
+import type { HoldPart } from '../core/hold';
 import { StableBoxes } from '../core/stable-boxes';
 import { ThumbBlur } from './thumbs';
 
@@ -397,6 +398,17 @@ export class VisionController {
 
   pageState(): PageVision {
     return { status: this.status, state: this.state, regions: this.regions };
+  }
+
+  /**
+   * What "pause until ready" waits for on the active video: whether its frame is checked, and how
+   * far ahead. Null when blurring doesn't apply (off, no video, broken model: don't hold for it).
+   */
+  holdPart(): HoldPart | null {
+    const s = this.getSettings();
+    if (!s.enabled || !s.blur || !this.activeVideo || this.status?.model === 'error') return null;
+    if (this.state === 'off' || this.state === 'no-video') return null;
+    return { kind: 'blur', now: this.state !== 'checking', ahead: this.status?.ahead ?? 0 };
   }
 
   /** Short note for the on-video badge ('' = nothing to say). */

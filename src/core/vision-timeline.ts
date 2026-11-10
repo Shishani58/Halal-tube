@@ -15,7 +15,7 @@ import type { VisionFrame } from '../shared/vision-messages';
  * only by several looks together (PERSON). `thumbFemale`: a thumbnail is one picture, often a
  * stylised one with several faces, and gets no second look: it needs a surer one.
  */
-export const THRESHOLDS = { nude: 0.3, skin: 0.65, skinWeak: 0.5, female: 0.3, thumbFemale: 0.6 };
+export const THRESHOLDS = { nude: 0.5, nudeWeak: 0.3, skin: 0.65, skinWeak: 0.5, female: 0.3, thumbFemale: 0.6 };
 /**
  * When a person (the looks of her face over a shot, clustered by position) is a woman. A look at
  * `look` or more votes "woman"; she is one when the mean probability over all her looks
@@ -37,6 +37,14 @@ export const MAN_LOOKS = 2;
  */
 export const SKIN_MIN_LOOKS = 3;
 export const SKIN_WINDOW = 0.75;
+/**
+ * Explicit-nudity classes work the same way. A bald head filling the frame (no face found: dark
+ * glasses, head down) scored BUTTOCKS_EXPOSED 0.48 and MALE_GENITALIA_EXPOSED 0.32 in a talk show
+ * and blurred the shot; real nudity scores 0.5–0.75 on every look (bare chests: 0.45–0.75). One
+ * look counts only at THRESHOLDS.nude; between nudeWeak and that it takes NUDE_MIN_LOOKS looks
+ * within ±SKIN_WINDOW seconds.
+ */
+export const NUDE_MIN_LOOKS = 3;
 /**
  * A part of a shot sounds like a woman when at least this share of the windows with a voice in it
  * are a woman's (by pitch), over at least VOICE_MIN_WINDOWS of them. A man's voice changes
@@ -95,7 +103,11 @@ export const PLATE_REACH = 0.8;
 export type BlurLevel = 'soft' | 'normal' | 'strict';
 export type PersonTuning = typeof PERSON;
 export interface Tuning {
+  /** Explicit nudity: one look at this or more counts… */
   nude: number;
+  /** …between nudeWeak and nude it takes nudeLooks looks close together. */
+  nudeWeak: number;
+  nudeLooks: number;
   skin: number;
   skinWeak: number;
   skinLooks: number;
@@ -111,16 +123,16 @@ export interface Tuning {
 
 const TUNINGS: Record<BlurLevel, Tuning> = {
   normal: {
-    nude: THRESHOLDS.nude, skin: THRESHOLDS.skin, skinWeak: THRESHOLDS.skinWeak, skinLooks: SKIN_MIN_LOOKS, person: PERSON,
+    nude: THRESHOLDS.nude, nudeWeak: THRESHOLDS.nudeWeak, nudeLooks: NUDE_MIN_LOOKS, skin: THRESHOLDS.skin, skinWeak: THRESHOLDS.skinWeak, skinLooks: SKIN_MIN_LOOKS, person: PERSON,
     clipWomen: CLIP_WOMEN, clipShare: CLIP_MIN_SHARE, clipShareMen: CLIP_MIN_SHARE_MEN, thumbFemale: THRESHOLDS.thumbFemale, thumbMean: 0.5,
   },
   soft: {
-    nude: 0.4, skin: 0.75, skinWeak: 0.6, skinLooks: 4,
+    nude: 0.6, nudeWeak: 0.4, nudeLooks: 4, skin: 0.75, skinWeak: 0.6, skinLooks: 4,
     person: { look: 0.35, mean: 0.5, single: 0.6, bodyLooks: 3, bodyMean: 0.6, bodySure: 0.92, voiceMean: 0.3, voiceBest: 0.9 },
     clipWomen: CLIP_WOMEN + 0.1, clipShare: 0.65, clipShareMen: 0.9, thumbFemale: 0.7, thumbMean: 0.55,
   },
   strict: {
-    nude: 0.25, skin: 0.55, skinWeak: 0.4, skinLooks: 2,
+    nude: 0.4, nudeWeak: 0.25, nudeLooks: 2, skin: 0.55, skinWeak: 0.4, skinLooks: 2,
     person: { look: 0.25, mean: 0.3, single: 0.4, bodyLooks: 1, bodyMean: 0.4, bodySure: 0.75, voiceMean: 0.12, voiceBest: 0.75 },
     clipWomen: CLIP_WOMEN - 0.1, clipShare: 0.35, clipShareMen: 0.65, thumbFemale: THRESHOLDS.thumbFemale, thumbMean: 0.5,
   },
@@ -405,9 +417,11 @@ export class VisionTimeline {
     const scene: number[] = [];
     const sceneWomen: number[] = [];
     const weakSkin: number[] = [];
+    const weakNude: number[] = [];
     for (let i = this.lowerBound(this.frames, a - 1e-4); i < this.frames.length && this.frames[i].t < b - 1e-4; i++) {
       const f = this.frames[i];
       if (f.skin >= tune.skinWeak && f.skin < tune.skin) weakSkin.push(i);
+      if (f.nude >= tune.nudeWeak && f.nude < tune.nude) weakNude.push(i);
       if (f.nude >= tune.nude || f.skin >= tune.skin) nude.push(i);
       if (f.women.length) women.push(i);
       if (f.scene !== undefined) {
@@ -415,8 +429,9 @@ export class VisionTimeline {
         if (f.scene >= tune.clipWomen) sceneWomen.push(i);
       }
     }
-    // weak skin looks that repeat (this one included) count; keep `nude` ascending
-    const repeated = weakSkin.filter((i) => weakSkin.filter((j) => Math.abs(this.frames[j].t - this.frames[i].t) <= SKIN_WINDOW).length >= tune.skinLooks);
+    // weak looks (bare torso, nudity) that repeat (this one included) count; keep `nude` ascending
+    const repeats = (weak: number[], looks: number) => weak.filter((i) => weak.filter((j) => Math.abs(this.frames[j].t - this.frames[i].t) <= SKIN_WINDOW).length >= looks);
+    const repeated = [...repeats(weakSkin, tune.skinLooks), ...repeats(weakNude, tune.nudeLooks)];
     if (repeated.length) nude.push(...repeated.filter((i) => !nude.includes(i))), nude.sort((p, q) => p - q);
     this.shot = { key, nude, women, scene, sceneWomen };
     return this.shot;

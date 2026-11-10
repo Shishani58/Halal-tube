@@ -158,6 +158,21 @@ test('VisionTimeline: flickering weak "skin" on clothes is not nudity; steady sk
   assert(sure.decide(2.5, { women: false }, 6).verdict === 'full', 'one look at 0.7');
 });
 
+test('VisionTimeline: a bald head filling the frame (explicit-class scores 0.3–0.48) is not nudity', () => {
+  // real scores (vDud, Nagiev 7tKb5u52nSE, first 14 s): BUTTOCKS_EXPOSED 0.438 / 0.324 on the bald head at 0.8–1.0 s,
+  // MALE_GENITALIA_EXPOSED 0.303 on the head and neck at 6.2 s; no face found, nobody undressed
+  const rows: [number, number][] = [[0, 0.005], [0.208, 0.006], [0.417, 0.126], [0.625, 0.099], [0.833, 0.438], [1.042, 0.324], [1.25, 0.166], [1.5, 0.001], [1.75, 0.001], [2, 0.002],
+    [2.292, 0.034], [2.792, 0.03], [2.917, 0.086], [3.417, 0.049], [3.833, 0.002], [4.25, 0.001], [5.083, 0.002], [5.375, 0.132], [5.583, 0.26], [5.791, 0.068], [6, 0.116],
+    [6.208, 0.303], [6.25, 0.005], [6.541, 0.01], [7.166, 0.02], [7.333, 0.106], [7.833, 0.058], [8.041, 0.097], [8.541, 0.191], [8.666, 0.027], [9.083, 0.031]];
+  const tl = new VisionTimeline();
+  tl.add({ from: 0, to: 12, frames: rows.map(([t, nude]) => fr(t, { nude })), cuts: [1.5, 2.292, 2.917, 7.333, 9.875], cutRange: [0, 12], edges: [] });
+  for (const t of [0.1, 0.9, 1.1, 3, 5.5, 6.2, 7, 8.5]) assert(tl.decide(t, { women: true }, 12).verdict === 'clear', `clear at ${t}`);
+  // the same head with steady high scores would be nudity: repeated looks
+  const steady = new VisionTimeline();
+  steady.add({ from: 0, to: 6, frames: [0, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3].map((t) => fr(t, { nude: t >= 1 && t <= 1.5 ? 0.4 : 0 })), cuts: [], cutRange: [0, 6], edges: [] });
+  assert(steady.decide(1.2, { women: false }, 6).verdict === 'full', 'three looks at 0.4 within 0.75 s');
+});
+
 test('VisionTimeline: a woman who stays put gets one still box; one who walks is followed', () => {
   const tl = new VisionTimeline();
   // shot [0,10): she sits on the left (her box jitters a little from look to look)

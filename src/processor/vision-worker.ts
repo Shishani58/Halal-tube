@@ -728,7 +728,7 @@ async function classify(shots: Shot[], scene: ClipBudget | null = null, still = 
       const f = frames[j];
       let located = false;
       for (let i = 4; i < f.women.length; i += 5) located ||= f.women[i] >= THRESHOLDS.female;
-      if (scene.want(f.t, shots[j].th ?? null, !!shots[j].cut, f.nude >= THRESHOLDS.nude || located)) asked.push(j);
+      if (scene.want(f.t, shots[j].th ?? null, !!shots[j].cut, f.nude >= THRESHOLDS.nudeWeak || located)) asked.push(j);
     }
     T.clipLooks = (T.clipLooks ?? 0) + asked.length;
     T.clipSkipped = (T.clipSkipped ?? 0) + n - asked.length;

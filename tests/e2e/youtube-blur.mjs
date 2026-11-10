@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 const dist = resolve('dist');
 const ctx = await chromium.launchPersistentContext('/tmp/mr/yt-profile-blur', {
   channel: 'chromium', headless: false, viewport: { width: 1280, height: 800 }, locale: 'en-US',
-  args: [`--disable-extensions-except=${dist}`, `--load-extension=${dist}`, '--autoplay-policy=no-user-gesture-required'],
+  args: [`--disable-extensions-except=${dist}`, `--load-extension=${dist}`, '--autoplay-policy=no-user-gesture-required', '--mute-audio'],
 });
 const page = ctx.pages()[0] ?? (await ctx.newPage());
 page.on('console', (m) => { const t = m.text(); if (t.includes('music-remover')) console.log('[console]', t); });
@@ -48,5 +48,6 @@ console.log(`classifier: model=${s?.model}/${s?.backend} frames=${s?.frames} spe
 const rows = await page.evaluate(() => window.__musicRemoverDebug?.visionSamples?.() ?? []);
 const flagged = rows.filter((x) => x[1] >= 0.3 || x[2] >= 0.4 || x[3] >= 0.5);
 console.log(`frames flagged: ${flagged.length}/${rows.length}; examples: ${JSON.stringify(flagged.slice(0, 6))}`);
+console.log('EARLY ' + JSON.stringify(rows.filter((x) => x[0] < 14)));
 await page.screenshot({ path: '/tmp/mr/e2e/yt-blur.png' });
 await ctx.close();

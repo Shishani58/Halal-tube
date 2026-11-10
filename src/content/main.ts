@@ -24,6 +24,8 @@ import { VisionController } from './blur';
 import { Captions } from './captions';
 import { ThumbHover } from './thumb-hover';
 import { ThumbCover } from './thumb-cover';
+import { PauseHold } from './hold';
+import type { HoldPart } from '../core/hold';
 
 declare global {
   interface Window {
@@ -53,6 +55,9 @@ declare global {
     () => settings,
     (v) => sessionOf(v),
   );
+
+  /** "Pause until ready": keeps the video paused until the sound / frame check has caught up. */
+  const hold = new PauseHold();
 
   const thumbHover = new ThumbHover();
   const thumbCover = new ThumbCover();
@@ -249,6 +254,8 @@ declare global {
     anchor: { c0: number; t0: number; rate: number } | null = null;
     driftStrikes = 0;
     state: PageStatus['state'] = 'no-video';
+    /** Is the clean sound under the playhead ready (null: the sound isn't being processed, or can't be). Read by the pause-until-ready hold. */
+    audioPart: HoldPart | null = null;
 
     onTile(msg: Extract<FromWorker, { type: 'tile' }>): void {
       if (msg.session !== this.session) return;
@@ -369,6 +376,7 @@ declare global {
     }
 
     tick(v: HTMLVideoElement | null): void {
+      this.audioPart = null;
       if (v !== this.video) {
         this.stopAll();
         this.video = v;
@@ -415,6 +423,7 @@ declare global {
       for (const [kk, tl] of this.tiles) if (tl.validFrom > tl.start && t < tl.validFrom - 0.5) this.tiles.delete(kk);
       const cur = this.tiles.get(k);
       const hasNow = !!cur && t >= cur.validFrom - 0.02;
+      this.audioPart = { kind: 'audio', now: hasNow, ahead: workerStatus?.ahead ?? 0 };
       // Strength below 100 %: the original track is heard too, `share` clean + (1 − share) original
       // (the original already follows the element's volume and mute; the clean tiles don't).
       const share = cleanShare(settings);
@@ -507,7 +516,7 @@ declare global {
 
     update(v: HTMLVideoElement | null, state: PageStatus['state']): void {
       const musicOn = state !== 'disabled' && state !== 'no-video';
-      const blurNote = v ? vision.badgeText() : '';
+      const blurNote = v ? hold.note() || vision.badgeText() : '';
       if (!v || !settings.showBadge || (!musicOn && !blurNote)) {
         this.hide();
         return;
@@ -595,6 +604,12 @@ declare global {
     } catch (e) {
       console.warn('[music-remover] tick error', e);
     }
+    try {
+      const parts = [player.audioPart, vision.holdPart()].filter((p): p is HoldPart => !!p);
+      hold.tick(v, v ? sessionOf(v) : 0, settings.enabled && settings.pauseUntilReady, parts);
+    } catch (e) {
+      console.warn('[music-remover] hold error', e);
+    }
   }
 
   for (const ev of ['play', 'playing', 'pause', 'seeking', 'seeked', 'ratechange', 'waiting', 'emptied', 'loadstart', 'volumechange', 'ended']) {
@@ -658,6 +673,7 @@ declare global {
       videoTime: player.video?.currentTime ?? 0,
       sessions: nextId,
       vision: vision.pageState(),
+      hold: hold.waiting,
     };
     window.postMessage({ ns: MSG_NS, from: 'main', kind: 'status', status }, '*');
   }, 1000);

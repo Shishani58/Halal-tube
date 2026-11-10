@@ -13,6 +13,7 @@ import './passthrough.test';
 import './levels.test';
 import './vision-cache.test';
 import './selftest.test';
+import './hold.test';
 import { runAll } from './harness';
 
 await runAll();

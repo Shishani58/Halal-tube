@@ -202,7 +202,7 @@ export class ThumbBlur {
    * men, and only women are to be blurred; a woman showing skin is found as a woman anyway.
    */
   private isNude(f: Scores): boolean {
-    return f.nude >= this.tune.nude;
+    return f.nude >= this.tune.nudeWeak; // one picture, no repeats to wait for
   }
 
   private hasWoman(f: Scores): boolean {

@@ -12,6 +12,7 @@ const blurWomenEl = $<HTMLInputElement>('blurWomen');
 const blurThumbsEl = $<HTMLInputElement>('blurThumbs');
 const blurHoverEl = $<HTMLInputElement>('blurHover');
 const blurCacheEl = $<HTMLInputElement>('blurCache');
+const holdEl = $<HTMLInputElement>('pauseUntilReady');
 const strengthEl = $<HTMLInputElement>('musicStrength');
 const levelEls = radios('blurLevel');
 const styleEls = radios('blurStyle');
@@ -37,6 +38,7 @@ async function load(): Promise<void> {
   blurThumbsEl.checked = s.blurThumbs;
   blurHoverEl.checked = s.blurHover;
   blurCacheEl.checked = s.blurCache;
+  holdEl.checked = s.pauseUntilReady;
   strengthEl.value = String(s.musicStrength);
   for (const l of levelEls) l.checked = l.value === s.blurLevel;
   for (const x of styleEls) x.checked = x.value === s.blurStyle;
@@ -91,6 +93,7 @@ blurWomenEl.addEventListener('change', () => save({ blurWomen: blurWomenEl.check
 blurThumbsEl.addEventListener('change', () => save({ blurThumbs: blurThumbsEl.checked }));
 blurHoverEl.addEventListener('change', () => save({ blurHover: blurHoverEl.checked }));
 blurCacheEl.addEventListener('change', () => save({ blurCache: blurCacheEl.checked }));
+holdEl.addEventListener('change', () => save({ pauseUntilReady: holdEl.checked }));
 
 /** Videos the classifier remembers (extension storage, shared with the worker). */
 async function showCache(): Promise<void> {
@@ -160,7 +163,8 @@ async function refresh(): Promise<void> {
 
   // ── sound ──
   const soundOff = !s.enabled || (!s.musicRemoval && s.profanity === 'off');
-  const [text, kind] = soundOff ? ['Звук не меняется', '' as Dot] : SOUND[st.state] ?? [st.state, ''];
+  const held = st.hold ?? [];
+  const [text, kind] = held.includes('audio') ? ['Пауза — звук обрабатывается', 'wait' as Dot] : soundOff ? ['Звук не меняется', '' as Dot] : SOUND[st.state] ?? [st.state, ''];
   set('st-state', text);
   dot('sound-dot', kind);
   const w = st.worker;
@@ -184,6 +188,7 @@ async function refresh(): Promise<void> {
   else if (vw?.model === 'error') [vText, vDot] = [`Ошибка: ${vw.error ?? ''}`, 'bad'];
   else if (vw?.model === 'loading') [vText, vDot] = ['Загрузка модели…', 'wait'];
   else if (vis.state === 'no-video') vText = s.blurThumbs ? 'Проверяются превью' : 'Видео не найдено';
+  else if (held.includes('blur')) [vText, vDot] = ['Пауза — кадры проверяются', 'wait'];
   else if (vis.state === 'checking') [vText, vDot] = [s.blurStrict ? 'Кадр проверяется — пока размыт' : 'Кадр проверяется…', 'wait'];
   else if (vis.state === 'hidden') [vText, vDot] = [vis.regions ? `Скрыто областей: ${vis.regions}` : 'Кадр размыт целиком', 'hidden'];
   else [vText, vDot] = ['Кадр чистый', 'ok'];

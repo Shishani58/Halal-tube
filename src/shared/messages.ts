@@ -167,9 +167,15 @@ export interface Settings {
   blurStyle: 'blur' | 'solid';
   /** Keep what the frame classifier found in a video, so the next viewing needs no checking. */
   blurCache: boolean;
+  /**
+   * Keep the video paused while the sound without music (or the profanity filter) or the frame
+   * check hasn't caught up with the playhead, and resume it once it has (instead of playing
+   * silence / the original / a blurred frame meanwhile).
+   */
+  pauseUntilReady: boolean;
 }
 
-export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, musicRemoval: true, musicStrength: 100, profanity: 'off', blur: true, blurWomen: true, blurStrict: true, blurThumbs: true, blurLevel: 'normal', blurHover: false, blurStyle: 'blur', blurCache: true };
+export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, musicRemoval: true, musicStrength: 100, profanity: 'off', blur: true, blurWomen: true, blurStrict: true, blurThumbs: true, blurLevel: 'normal', blurHover: false, blurStyle: 'blur', blurCache: true, pauseUntilReady: false };
 
 /**
  * Share of the clean (voice-only) sound in what is heard, 0–1; the rest is the original track.
@@ -190,6 +196,8 @@ export interface PageStatus {
   sessions: number;
   /** Blurring (frame classifier) state. */
   vision?: import('./vision-messages').PageVision;
+  /** What the video is kept paused for (pauseUntilReady); empty: not held. */
+  hold?: ('audio' | 'blur')[];
 }
 
 export const MSG_NS = '__musicRemover';
