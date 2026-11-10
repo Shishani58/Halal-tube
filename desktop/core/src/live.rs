@@ -29,6 +29,8 @@ pub struct Live {
     new_r: Vec<f32>,
     out_l: Vec<f32>,
     out_r: Vec<f32>,
+    /// Hops that were silent and cost no model run.
+    pub skipped: u64,
 }
 
 impl Live {
@@ -48,6 +50,7 @@ impl Live {
             new_r: Vec::with_capacity(hop),
             out_l: vec![0.0; sep.mdx.gen_size],
             out_r: vec![0.0; sep.mdx.gen_size],
+            skipped: 0,
         }
     }
 
@@ -87,13 +90,20 @@ impl Live {
         self.win_r[self.chunk - hop..].copy_from_slice(&self.new_r);
         self.new_l.clear();
         self.new_r.clear();
-        sep.separate_window(&self.win_l, &self.win_r, &mut self.out_l, &mut self.out_r)?;
         // out[j] is the voice at window sample trim + j: the accurate end of it is out[gen − hop..],
         // the window samples [chunk − trim − hop, chunk − trim)
         let gen = self.out_l.len();
         let (a, b) = (gen - hop, gen);
         let o0 = self.chunk - self.trim - hop;
         let (orig_l, orig_r) = (&self.win_l[o0..o0 + hop], &self.win_r[o0..o0 + hop]);
+        // nothing is playing (the capture is digital silence): no model run, no GPU load
+        if orig_l.iter().chain(orig_r.iter()).all(|x| x.abs() < 1e-6) {
+            out_l.extend(std::iter::repeat(0.0).take(hop));
+            out_r.extend(std::iter::repeat(0.0).take(hop));
+            self.skipped += 1;
+            return Ok(());
+        }
+        sep.separate_window(&self.win_l, &self.win_r, &mut self.out_l, &mut self.out_r)?;
         let (mut vl, mut vr) = (self.out_l[a..b].to_vec(), self.out_r[a..b].to_vec());
         if self.opts.keep_plain_speech {
             keep_original_where_clean(&mut vl, &mut vr, orig_l, orig_r, self.rate, BELOW_DB);

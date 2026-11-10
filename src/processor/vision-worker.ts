@@ -42,9 +42,16 @@ import {
   personFromFace,
   rgbaToChw,
   rgbaToGenderInput,
+  sameFace,
   scoreFrames,
+  shareZooms,
   toFrame,
+  zoomCrops,
+  zoomFaces,
+  ZOOM_KEEP,
+  type Box,
   type Rect,
+  type ZoomArea,
 } from '../core/nudenet';
 import { findPlates } from '../core/plates';
 import { CLIP_INPUT as CS, CLIP_THUMB_LONE, CLIP_THUMB_WOMEN, CLIP_TILE_GATE, CLIP_VIEWS, clipTiles, clipViews, rgbaToClip, tileBox } from '../core/clip';
@@ -550,7 +557,45 @@ const lap = (k: string, since: number): number => {
   return now;
 };
 
-async function classify(shots: Shot[], scene: ClipBudget | null = null, still = false): Promise<VisionFrame[]> {
+/**
+ * A second, zoomed look at faces too small for the detector to be sure of (nudenet.ts zoomCrops):
+ * the crops of every frame (shared with frames close by, and with `kept` areas where an earlier
+ * zoom found someone) are run through the detector, B at a time, and the sure faces found there
+ * that aren't already in `found` are added to it. `kept` gets the areas that found a face.
+ */
+async function zoomIn(shots: Shot[], out: Float32Array, boxes: { dw: number; dh: number }[], iw: number, ih: number, found: Box[][], kept: ZoomArea[]): Promise<void> {
+  const times = shots.map((x) => x.t);
+  const plan = shareZooms(times, shots.map((x, j) => zoomCrops(out, B, j, x.t, boxes[j].dw, boxes[j].dh, iw, ih)), kept);
+  const jobs = plan.flatMap((areas, j) => areas.map((a) => ({ j, a })));
+  T.zoomCrops = (T.zoomCrops ?? 0) + jobs.length;
+  const det = detCtx!;
+  for (let i0 = 0; i0 < jobs.length; i0 += B) {
+    const m = Math.min(B, jobs.length - i0);
+    for (let i = 0; i < m; i++) {
+      const { j, a } = jobs[i0 + i];
+      const { bmp } = shots[j];
+      det.drawImage(bmp, a.x * bmp.width, a.y * bmp.height, a.w * bmp.width, a.h * bmp.height, 0, i * ih, iw, ih);
+    }
+    const px = det.getImageData(0, 0, iw, ih * m).data;
+    const plane = iw * ih;
+    for (let i = 0; i < m; i++) rgbaToChw(px.subarray(i * plane * 4, (i + 1) * plane * 4), iw, detIn, i * 3 * plane, ih);
+    const o = await model!.run(detIn, [B, 3, ih, iw]);
+    for (let i = 0; i < m; i++) {
+      const { j, a } = jobs[i0 + i];
+      for (const f of zoomFaces(o, B, i, a, boxes[j].dw, boxes[j].dh, iw)) {
+        if (sameFace(f, found[j])) continue;
+        found[j].push(f);
+        kept.push({ ...a, score: f.score });
+      }
+    }
+  }
+  // what the next frames may still need: areas from around the newest of these frames
+  const newest = Math.max(...times);
+  const keep = kept.filter((a) => a.t >= newest - ZOOM_KEEP && a.t <= newest + ZOOM_KEEP);
+  kept.splice(0, kept.length, ...keep.slice(-16));
+}
+
+async function classify(shots: Shot[], scene: ClipBudget | null = null, still = false, zoomKept: ZoomArea[] | null = null): Promise<VisionFrame[]> {
   const tc0 = performance.now();
   let tl = tc0;
   T.classifyCalls = (T.classifyCalls ?? 0) + 1;
@@ -575,6 +620,11 @@ async function classify(shots: Shot[], scene: ClipBudget | null = null, still = 
   const out = await model!.run(detIn, [B, 3, ih, iw]);
   tl = lap('detRun', tl);
   const scores = scoreFrames(out, B, n);
+  const found = shots.map((_, j) => detectFaces(out, B, j, still ? STILL_FACE_SCORE : undefined));
+  if (zoomKept) {
+    await zoomIn(shots, out, boxes, iw, ih, found, zoomKept);
+    tl = lap('zoom', tl);
+  }
 
   // face crops from the higher-resolution copies (NC per face, consecutive), stacked, one readback
   const queued: { j: number; face: Rect }[] = [];
@@ -582,7 +632,7 @@ async function classify(shots: Shot[], scene: ClipBudget | null = null, still = 
   for (let j = 0; j < n; j++) {
     const { bmp } = shots[j];
     const k = Math.max(bmp.width, bmp.height) / S;
-    for (const box of detectFaces(out, B, j, still ? STILL_FACE_SCORE : undefined)) {
+    for (const box of found[j]) {
       if (Math.max(box.w, box.h) * k < (still ? STILL_FACE_PX : MIN_FACE)) continue;
       for (const crop of GENDER_CROPS) {
         const c = faceCrop(box, crop);
@@ -845,6 +895,8 @@ function edgeCuts(s: Session, e: Edge, closed: boolean): [number, number][] {
 
 /** How often the scene model may look, per session (clip-budget). */
 const clipBudgets = new WeakMap<Session, ClipBudget>();
+/** Per session: areas where a zoomed look found a face lately (classify → zoomIn). */
+const zoomAreas = new WeakMap<Session, ZoomArea[]>();
 
 /** Seconds checked beyond the playhead of session `sid` (Infinity: it isn't the one being watched). */
 function aheadOf(sid: number, s: Session): number {
@@ -865,6 +917,8 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   const shotsOf = new ShotTracker();
   let budget = clipBudgets.get(s);
   if (!budget) clipBudgets.set(s, (budget = new ClipBudget()));
+  let zoomKept = zoomAreas.get(s);
+  if (!zoomKept) zoomAreas.set(s, (zoomKept = []));
   let lastT = -Infinity;
   let lastShot = -Infinity;
   let lastDur = 0;
@@ -935,7 +989,7 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
     const batch = pending.splice(0, B);
     try {
       budget.mode = clipMode(budget.mode, aheadOf(sid, s), status.speed);
-      frames.push(...(await classify(batch, budget)));
+      frames.push(...(await classify(batch, budget, false, zoomKept)));
       shots += batch.length;
     } finally {
       for (const x of batch) x.bmp.close();

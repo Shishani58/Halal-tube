@@ -13,8 +13,13 @@ path = "src/lib.rs"
 name = "mr-cli"
 path = "src/bin/mr-cli.rs"
 
+[[bin]]
+name = "mr-live"
+path = "src/bin/mr-live.rs"
+
 [dependencies]
 rustfft = "6"
+rubato = "=0.16.2"
 ort = "=2.0.0-rc.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,6 +27,10 @@ thiserror = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ort = { version = "=2.0.0-rc.15", features = ["coreml"] }
+cpal = "=0.15.3"
+
+[build-dependencies]
+cc = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ort = { version = "=2.0.0-rc.15", features = ["directml"] }

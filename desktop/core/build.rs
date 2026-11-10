@@ -2,6 +2,12 @@
 //! (`__isPlatformVersionAtLeast`). rustc links with -nodefaultlibs, so add it explicitly.
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        // system audio capture (Core Audio process tap, macOS 14.2+): a thin Objective-C layer
+        println!("cargo:rerun-if-changed=src/mac/tap.m");
+        println!("cargo:rerun-if-changed=src/mac/tap.h");
+        cc::Build::new().file("src/mac/tap.m").flag("-fobjc-arc").flag("-Wno-unguarded-availability-new").compile("mr_tap");
+        println!("cargo:rustc-link-lib=framework=CoreAudio");
+        println!("cargo:rustc-link-lib=framework=Foundation");
         let out = std::process::Command::new("clang").arg("--print-runtime-dir").output();
         if let Ok(out) = out {
             let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();

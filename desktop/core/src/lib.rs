@@ -7,12 +7,16 @@
 //! - [`live`]: the streaming engine for a live (system audio) mode, without audio capture.
 //! - [`job`]: the streaming file pipeline: decode → separate tile by tile → encode + mux.
 
+#[cfg(target_os = "macos")]
+pub mod capture;
 pub mod job;
 pub mod live;
 pub mod mdx;
 pub mod media;
 pub mod model;
 pub mod passthrough;
+pub mod ring;
+pub mod stream;
 pub mod selftest;
 
 use std::path::PathBuf;
@@ -33,6 +37,8 @@ pub enum Error {
     Model(String),
     #[error("cancelled")]
     Cancelled,
+    #[error("audio capture: {0}")]
+    Capture(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
@@ -54,6 +60,7 @@ impl Error {
             Error::Ffmpeg(_) => "ffmpeg",
             Error::Model(_) => "model",
             Error::Cancelled => "cancelled",
+            Error::Capture(_) => "capture",
             Error::Io(_) => "io",
         }
     }

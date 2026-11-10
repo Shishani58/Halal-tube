@@ -134,6 +134,96 @@ export function detectFaces(out: Float32Array, batch: number, b: number, minScor
   return detectBoxes(out, batch, b, FACE_CLASSES, minScore, maxFaces);
 }
 
+/**
+ * A second, zoomed look at faces the detector half-saw. On a wide shot a face is 15–20 px in the
+ * 320 px input and NudeNet scores it 0.15–0.35, under FACE_MIN, so it never reaches the gender
+ * classifier (a woman in an armchair across the room: 0.19; the same face in a 2× crop: 0.65).
+ * Faces scoring ZOOM_MIN or more are looked at again in a crop of the frame enlarged so that
+ * the face is about ZOOM_FACE px (ZOOM_LO–ZOOM_HI times), at most ZOOM_PER_FRAME crops per frame.
+ */
+export const ZOOM_MIN = 0.12;
+export const ZOOM_FACE = 40;
+export const ZOOM_LO = 1.6;
+export const ZOOM_HI = 3;
+export const ZOOM_PER_FRAME = 3;
+/**
+ * The detector half-sees a small face on some frames and not at all on others (the same woman:
+ * 0.21, 0.20, 0.15, then nothing for two frames). A crop asked for by one frame is also looked at
+ * in the frames up to ZOOM_KEEP seconds around it: people sit still far more often than they jump.
+ */
+export const ZOOM_KEEP = 2;
+
+/** A zoom crop as a frame-relative rect (0–1), of the detector input's aspect; shared between frames. */
+export interface ZoomArea {
+  /** Time of the frame it is for (or that asked for it). */
+  t: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** Detector score of the face that asked for it. */
+  score: number;
+}
+
+const centreInside = (a: { x: number; y: number; w: number; h: number }, c: { x: number; y: number; w: number; h: number }) => {
+  const cx = a.x + a.w / 2, cy = a.y + a.h / 2;
+  return cx > c.x + 0.15 * c.w && cx < c.x + 0.85 * c.w && cy > c.y + 0.15 * c.h && cy < c.y + 0.85 * c.h;
+};
+
+/**
+ * Crops for a second look at image `b`, taken at `t` (frame letterboxed into dw×dh, model input
+ * iw×ih): around each face scoring ZOOM_MIN…FACE_MIN that no sure face overlaps, best first; a
+ * candidate already well inside an earlier crop needs none of its own.
+ */
+export function zoomCrops(out: Float32Array, batch: number, b: number, t: number, dw: number, dh: number, iw: number, ih: number): ZoomArea[] {
+  const all = detectFaces(out, batch, b, ZOOM_MIN, 8);
+  const sure = all.filter((f) => f.score >= FACE_MIN);
+  const crops: Box[] = [];
+  for (const f of all) {
+    if (f.score >= FACE_MIN || crops.length >= ZOOM_PER_FRAME) continue;
+    if (sure.some((s) => iou(s, f) > 0.2) || crops.some((c) => centreInside(f, c))) continue;
+    const z = Math.min(ZOOM_HI, Math.max(ZOOM_LO, ZOOM_FACE / Math.max(f.w, f.h, 1)));
+    const w = Math.min(dw, iw / z), h = Math.min(dh, ih / z);
+    const cx = f.x + f.w / 2, cy = f.y + f.h / 2;
+    const x = Math.min(Math.max(0, cx - w / 2), dw - w);
+    // the face a little above the middle: the body under it helps the detector
+    const y = Math.min(Math.max(0, cy - 0.4 * h), dh - h);
+    crops.push({ x, y, w, h, score: f.score });
+  }
+  return crops.map((c) => ({ t, x: c.x / dw, y: c.y / dh, w: c.w / dw, h: c.h / dh, score: c.score }));
+}
+
+/**
+ * The crops each frame gets: its own first, then those of the other frames (and `kept`: areas
+ * where an earlier zoom found a face) within ZOOM_KEEP seconds, best first, skipping one whose
+ * centre is well inside a crop already chosen; ZOOM_PER_FRAME at most.
+ */
+export function shareZooms(times: number[], own: ZoomArea[][], kept: ZoomArea[] = []): ZoomArea[][] {
+  const pool = [...own.flat(), ...kept].sort((a, b) => b.score - a.score);
+  return times.map((t, j) => {
+    const pick: ZoomArea[] = [];
+    for (const a of [...own[j], ...pool.filter((p) => !own[j].includes(p) && Math.abs(p.t - t) <= ZOOM_KEEP)]) {
+      if (pick.length >= ZOOM_PER_FRAME) break;
+      if (!pick.some((c) => centreInside(a, c))) pick.push({ ...a, t });
+    }
+    return pick;
+  });
+}
+
+/**
+ * Sure faces (FACE_MIN) found in image `i` of a batch, the zoom crop `a` of a frame letterboxed
+ * into dw×dh, drawn to fill the whole input (iw wide): boxes in that frame's letterboxed space.
+ */
+export function zoomFaces(out: Float32Array, batch: number, i: number, a: ZoomArea, dw: number, dh: number, iw: number): Box[] {
+  const s = (a.w * dw) / iw;
+  return detectFaces(out, batch, i).map((f) => ({ x: a.x * dw + f.x * s, y: a.y * dh + f.y * s, w: f.w * s, h: f.h * s, score: f.score }));
+}
+
+/** Whether box `a` is (mostly) the same face as one of `boxes`. */
+export function sameFace(a: Box, boxes: Box[]): boolean {
+  return boxes.some((q) => iou(a, q) > 0.3);
+}
+
 /** Boxes of the given classes in image `b` (320×320 letterboxed input space), after NMS. */
 export function detectBoxes(out: Float32Array, batch: number, b: number, classes: number[], minScore: number, max: number): Box[] {
   const rows = 4 + NUDENET_LABELS.length;

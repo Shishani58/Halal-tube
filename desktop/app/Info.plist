@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Live mode (system audio capture, macOS 14.2+): the text of the "System Audio Recording" permission prompt. -->
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Music Remover listens to the sound your Mac plays in order to remove the music from it. Nothing is recorded or sent anywhere.</string>
+</dict>
+</plist>

@@ -1,5 +1,5 @@
 import { IntervalSet } from '../src/core/intervals';
-import { NUDENET_LABELS, detectFaces, faceCrop, femaleProb, femaleScore, letterbox, personFromBody, personFromFace, rgbaToChw, scoreFrames } from '../src/core/nudenet';
+import { NUDENET_LABELS, ZOOM_PER_FRAME, detectFaces, faceCrop, femaleProb, femaleScore, letterbox, personFromBody, personFromFace, rgbaToChw, scoreFrames, shareZooms, zoomCrops, zoomFaces } from '../src/core/nudenet';
 import { ShotTracker, THUMB_H, THUMB_W, isCut, makeThumb, thumbDiff } from '../src/core/shots';
 import { VisionTimeline, isWoman, pictureWomen } from '../src/core/vision-timeline';
 import { StableBoxes } from '../src/core/stable-boxes';
@@ -66,6 +66,37 @@ test('NudeNet faces: boxes + NMS; gender softmax; woman score', () => {
   assert(Math.abs(femaleProb(new Float32Array([2, 0, 0.3]), 0) - 0.8808) < 1e-3, 'softmax');
   assert(Math.abs(femaleProb(new Float32Array([3, 0, 0.3, 0, 1, 0.3]), 0, 2) - 0.7311) < 1e-3, 'mean logit over crops');
   assert(femaleScore([0.2, 0.9], 0) === 0.9 && femaleScore([], 0.5) === 0 && Math.abs(femaleScore([0.1], 0.7) - 0.56) < 1e-9, 'female score (a body class counts 0.8×)');
+});
+
+test('Zoom: a face the detector half-saw is looked at again, larger; neighbours share the crop', () => {
+  const rows = 4 + NUDENET_LABELS.length;
+  const A = 6;
+  const tensor = (faces: [number, number, number, number][]) => {
+    const out = new Float32Array(rows * A);
+    faces.forEach(([cx, cy, size, s], a) => {
+      out[0 * A + a] = cx; out[1 * A + a] = cy; out[2 * A + a] = size; out[3 * A + a] = size;
+      out[(4 + NUDENET_LABELS.indexOf('FACE_FEMALE')) * A + a] = s;
+    });
+    return out;
+  };
+  // wide shot, 320×180 in a 320×192 input: a sure face (no zoom), a 20 px one at 0.19, noise at 0.08
+  const out = tensor([[250, 40, 40, 0.8], [55, 45, 20, 0.19], [150, 150, 10, 0.08]]);
+  const crops = zoomCrops(out, 1, 0, 10, 320, 180, 320, 192);
+  assert(crops.length === 1, JSON.stringify(crops));
+  const c = crops[0];
+  // 2× (40 px / 20 px): half the frame each way, the input's aspect, inside the frame, the face in it
+  assert(Math.abs(c.w - 0.5) < 1e-6 && Math.abs((c.w * 320) / (c.h * 180) - 320 / 192) < 1e-6, JSON.stringify(c));
+  assert(c.x >= 0 && c.y >= 0 && c.x + c.w <= 1 + 1e-9 && c.y + c.h <= 1 + 1e-9 && 55 / 320 > c.x && 45 / 180 > c.y && 45 / 180 < c.y + c.h, JSON.stringify(c));
+  // a face found in the crop's input maps back into the frame where it is
+  const inCrop = tensor([[(55 / 320 - c.x) * 2 * 320, (45 / 180 - c.y) * 180 * 2, 40, 0.7]]);
+  const back = zoomFaces(inCrop, 1, 0, c, 320, 180, 320);
+  assert(back.length === 1 && Math.abs(back[0].x + back[0].w / 2 - 55) < 0.5 && Math.abs(back[0].y + back[0].h / 2 - 45) < 0.5 && Math.abs(back[0].w - 20) < 1e-6, JSON.stringify(back));
+  // frames 1 s around one that asked for a crop get it too; 2.5 s away and duplicates don't
+  const plan = shareZooms([9, 10, 11, 13.5], [[], [c], [{ ...c, t: 11, x: c.x + 0.01 }], []]);
+  assert(plan[0].length === 1 && plan[1].length === 1 && plan[2].length === 1 && plan[3].length === 0, JSON.stringify(plan.map((p) => p.length)));
+  assert(plan[0][0].t === 9, 'a shared crop is for the frame it is given to');
+  const many = Array.from({ length: 6 }, (_, i) => ({ ...c, x: i * 0.15, w: 0.1, h: 0.1, score: 0.2 }));
+  assert(shareZooms([10], [many])[0].length === ZOOM_PER_FRAME, 'capped per frame');
 });
 
 type F = { t: number; nude: number; skin: number; female: number; women: number[] };
