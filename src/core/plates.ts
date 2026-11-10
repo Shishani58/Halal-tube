@@ -22,6 +22,8 @@ const MIN_AREA = 0.06;
 const MAX_SIDE = 0.92;
 /** The two sides of a plate differ from what lies outside by at least this much, the same way, in luma. */
 const POLARITY = 18;
+/** A plate's side is an unbroken edge: this share of its length (rock, foliage and hair are 0.6–0.9). */
+const MIN_FILL = 0.9;
 /** Plates reported per frame at most. */
 const MAX_PLATES = 3;
 
@@ -30,6 +32,8 @@ interface Line {
   at: number;
   from: number;
   to: number;
+  /** Share of the line's length that is edge (the rest are the gaps GAP allows). */
+  fill: number;
 }
 
 /**
@@ -43,21 +47,21 @@ export function findPlates(rgba: Uint8ClampedArray | Uint8Array, stride: number,
   const vs = lines(y, W, H, true, MIN_RUN);
   if (vs.length < 2) return [];
   const hs = lines(y, W, H, false, MIN_W);
-  // a plate's top and bottom: a horizontal edge across it (or the frame's border)
-  const closed = (x0: number, x1: number, at: number, border: boolean) =>
-    border || hs.some((l) => Math.abs(l.at - at) <= 3 && Math.min(l.to, x1) - Math.max(l.from, x0) >= 0.7 * (x1 - x0));
+  // a plate's top or bottom: a horizontal edge across it
+  const closed = (x0: number, x1: number, at: number) =>
+    hs.some((l) => l.fill >= 0.8 && Math.abs(l.at - at) <= 3 && Math.min(l.to, x1) - Math.max(l.from, x0) >= 0.7 * (x1 - x0));
   const out: { r: number[]; a: number }[] = [];
   for (let i = 0; i < vs.length; i++)
     for (let j = i + 1; j < vs.length; j++) {
       const l = vs[i], r = vs[j];
-      if (r.at - l.at < MIN_W * W) continue;
+      if (l.fill < MIN_FILL || r.fill < MIN_FILL || r.at - l.at < MIN_W * W) continue;
       const y0 = Math.max(l.from, r.from), y1 = Math.min(l.to, r.to);
       if (y1 - y0 < MIN_H * H) continue;
       const rect = [l.at / W, y0 / H, (r.at - l.at) / W, (y1 - y0) / H];
       if (area(rect) < MIN_AREA || (rect[2] > MAX_SIDE && rect[3] > MAX_SIDE)) continue;
-      // another long edge inside means this spans two things (a plate and what is beside it)
-      if (vs.some((m) => m.at > l.at + 3 && m.at < r.at - 3 && Math.min(m.to, y1) - Math.max(m.from, y0) >= 0.7 * (y1 - y0))) continue;
-      if (!closed(l.at, r.at, y0, y0 <= 3) || !closed(l.at, r.at, y1, y1 >= H - 4)) continue;
+      // (a card's edge against a dark room can be too faint to see on one of the two)
+      // (the frame's border alone proves nothing: it takes a real edge on one side at least)
+      if (!closed(l.at, r.at, y0) && !closed(l.at, r.at, y1)) continue;
       if (!sidedAlike(y, W, H, l.at, r.at, y0, y1)) continue;
       out.push({ r: rect, a: area(rect) });
     }
@@ -84,17 +88,23 @@ export function samePlate(a: number[], b: number[]): boolean {
 }
 
 /**
- * The plates a blur box must leave alone at one moment: those seen in the looks just before and
- * after it (both, where both exist: a plate that just left must not uncover a woman, and one that
- * just came is cut away a look later).
+ * The plates a blur box must leave alone at one moment. `before` / `after`: the plates found in
+ * each look (newest / oldest first) shortly before and after it. One that a single look misses
+ * (a slide mid-animation) still counts; one that is in no look after the moment doesn't — a plate
+ * that just left must not uncover a woman — and one that just came is cut away from its first look.
  */
-export function platesBetween(before: number[][] | null, after: number[][] | null): number[][] {
-  if (!before) return after ?? [];
-  if (!after) return before;
+export function platesBetween(before: number[][][], after: number[][][]): number[][] {
+  if (!before.length) return after[0] ?? [];
   const out: number[][] = [];
-  for (const p of before) {
-    const q = after.find((r) => samePlate(p, r));
-    if (q) out.push(inter(p, q));
+  for (const p of before.flat()) {
+    if (out.some((o) => samePlate(o, p))) continue;
+    const prev = before.map((l) => l.find((q) => samePlate(q, p))).find((q) => q);
+    if (!after.length) {
+      if (prev) out.push(prev);
+      continue;
+    }
+    const next = after.map((l) => l.find((q) => samePlate(q, p))).find((q) => q);
+    if (prev && next) out.push(inter(prev, next));
   }
   return out;
 }
@@ -106,11 +116,11 @@ function inter(a: number[], b: number[]): number[] {
 
 /**
  * Boxes with the plates taken out. A box is cut at the plate's edge only where that removes
- * (mostly) plate — the strip taken off is at least CUT_SHARE plate — and keeps every `keep` rect
+ * (mostly) plate — the strip taken off is at least CUT_SHARE plate (a card is shorter than the box) — and keeps every `keep` rect
  * (heads) it held; of the cuts that qualify the one leaving the most is made. A box a plate only
  * touches at the corner, or one that would lose a head, stays as it is.
  */
-export const CUT_SHARE = 0.6;
+export const CUT_SHARE = 0.45;
 export function cutPlates(boxes: number[][], plates: number[][], keep: number[][]): number[][] {
   if (!plates.length) return boxes;
   const e = 0.004;
@@ -167,11 +177,12 @@ export function lines(y: Float32Array, W: number, H: number, vertical: boolean, 
   const need = Math.round(minRun * along);
   const best: Line[] = [];
   for (let a = 2; a < across - 2; a++) {
-    let runFrom = -1, last = -1, bFrom = 0, bTo = 0;
+    let runFrom = -1, last = -1, bFrom = 0, bTo = 0, n = 0, bN = 0;
     const close = () => {
       if (runFrom >= 0 && last - runFrom > bTo - bFrom) {
         bFrom = runFrom;
         bTo = last;
+        bN = n;
       }
     };
     for (let b = 0; b < along; b++) {
@@ -180,14 +191,17 @@ export function lines(y: Float32Array, W: number, H: number, vertical: boolean, 
       // an edge may sit between pixels: look one over as well
       const e = d >= EDGE || Math.abs(at(a + 2) - at(a)) >= EDGE;
       if (!e) continue;
-      if (runFrom >= 0 && b - last <= GAP + 1) last = b;
-      else {
+      if (runFrom >= 0 && b - last <= GAP + 1) {
+        last = b;
+        n++;
+      } else {
         close();
         runFrom = last = b;
+        n = 1;
       }
     }
     close();
-    if (bTo - bFrom >= need) best.push({ at: a, from: bFrom, to: bTo });
+    if (bTo - bFrom >= need) best.push({ at: a, from: bFrom, to: bTo, fill: bN / (bTo - bFrom + 1) });
   }
   // neighbouring columns are one thick edge: keep the longest
   const out: Line[] = [];

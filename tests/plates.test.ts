@@ -49,12 +49,23 @@ test('cutPlates: the plate is taken out of the blur, the head stays covered', ()
   assert(JSON.stringify(cutPlates([box], [[0.1, 0.05, 0.33, 0.2]], [head])[0]) === JSON.stringify(box), 'corner graze: no cut');
 });
 
-test('platesBetween: a plate that just left must not uncover her; one that just came is cut a look later', () => {
+test('cutPlates: a QR card shorter than the box still comes out of the blur', () => {
+  // YouTube 3zf_L95als8 at 110.8 s: a card beside her, found as [0.056, 0.156, 0.325, 0.556]
+  const [cut] = cutPlates([[0.31, 0, 0.69, 1]], [[0.056, 0.156, 0.325, 0.556]], [[0.42, 0.05, 0.35, 0.5, 1]]);
+  assert(cut[0] >= 0.381 - 1e-9 && cut[0] + cut[2] === 1, `cut at the card: ${cut}`);
+  // a small card low in the box, beside her arm: not enough of the strip is card
+  const arm = cutPlates([[0.3, 0, 0.7, 1]], [[0.05, 0.7, 0.3, 0.2]], [[0.45, 0.05, 0.3, 0.4, 1]])[0];
+  assert(arm[0] === 0.3, `box kept: ${arm}`);
+});
+
+test('platesBetween: a plate that just left must not uncover her; one that just came is cut at its first look; a missed look is bridged', () => {
   const a = [[0.02, 0.1, 0.52, 0.8]];
-  assert(platesBetween(a, []).length === 0, 'gone in the next look');
-  assert(platesBetween([], a).length === 0, 'not there before');
-  assert(platesBetween(a, [[0.021, 0.1, 0.52, 0.8]]).length === 1, 'in both');
-  assert(platesBetween(a, null).length === 1 && platesBetween(null, a).length === 1, 'one side only');
+  assert(platesBetween([a], [[]]).length === 0, 'gone in the next look');
+  assert(platesBetween([[], []], [a, a]).length === 0, 'not there before: nothing to carry over');
+  assert(platesBetween([a], [[[0.021, 0.1, 0.52, 0.8]]]).length === 1, 'in both');
+  assert(platesBetween([a], []).length === 1 && platesBetween([], [a]).length === 1, 'one side only');
+  assert(platesBetween([[], a], [[], a]).length === 1, 'one look missed on each side: bridged');
+  assert(platesBetween([[], []], [[], []]).length === 0, 'seen nowhere');
 });
 
 test('VisionTimeline: found women stay blurred when the checking is close behind the playhead (not strict)', () => {

@@ -83,7 +83,7 @@ export const MOTION_MARGIN = 0.25;
  */
 export const PERSON_MARGIN = { x: 0.06, top: 0.03, bottom: 0.06 };
 export const MIN_MARGIN = 0.025;
-/** Plates are taken from the looks this close (seconds) before and after the moment. */
+/** Plates are taken from the looks within this many seconds before and after the moment. */
 export const PLATE_REACH = 0.8;
 
 export interface BlurPolicy {
@@ -185,6 +185,11 @@ export class VisionTimeline {
     return this.frames.map((f) => [f.t, f.nude, f.skin, f.female, f.scene ?? -1]);
   }
 
+  /** Debug: [t, x, y, w, h] of every overlay plate found. */
+  platesDump(): number[][] {
+    return this.frames.flatMap((f) => platesOf(f.plates).map((r) => [f.t, ...r]));
+  }
+
   /** Debug: [t, Hz] voice pitch windows. */
   voiceDump(): number[][] {
     return this.voice.map((v) => [Math.round(v.t * 100) / 100, v.f0]);
@@ -261,13 +266,21 @@ export class VisionTimeline {
   }
 
   /**
-   * The overlay plates at t: those of the looks just before and just after it, in this shot (see
-   * platesBetween).
+   * The overlay plates at t: those of the looks in this shot within PLATE_REACH before and after it
+   * (see platesBetween).
    */
   private platesAt(t: number, a: number, b: number): number[][] {
     const k = this.lowerBound(this.frames, t + 1e-4);
-    const look = (f: VisionFrame | undefined) => (f && f.t >= a - 1e-4 && f.t < b - 1e-4 && Math.abs(f.t - t) <= PLATE_REACH ? platesOf(f.plates) : null);
-    return platesBetween(look(this.frames[k - 1]), look(this.frames[k]));
+    const take = (from: number, step: number, ok: (ft: number) => boolean): number[][][] => {
+      const out: number[][][] = [];
+      for (let i = from; i >= 0 && i < this.frames.length && ok(this.frames[i].t); i += step) out.push(platesOf(this.frames[i].plates));
+      return out;
+    };
+    const inShot = (ft: number) => ft >= a - 1e-4 && ft < b - 1e-4;
+    return platesBetween(
+      take(k - 1, -1, (ft) => inShot(ft) && t - ft <= PLATE_REACH),
+      take(k, 1, (ft) => inShot(ft) && ft - t <= PLATE_REACH),
+    );
   }
 
   /** Where to blur one person (her looks in this part of the shot) at t. */

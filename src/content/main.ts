@@ -621,6 +621,9 @@ declare global {
       visionSamples() {
         return vision.timeline(player.session)?.dump() ?? [];
       },
+      visionPlates() {
+        return vision.timeline(player.session)?.platesDump() ?? [];
+      },
       visionCuts() {
         return vision.timeline(player.session)?.cutTimes ?? [];
       },
