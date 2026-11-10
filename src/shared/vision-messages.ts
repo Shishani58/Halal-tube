@@ -9,7 +9,9 @@ export type ToVision =
   | { type: 'sb-init'; session: number; sb: number; mime: string }
   | { type: 'append'; session: number; sb: number; data: ArrayBuffer; tsOffset: number }
   | { type: 'abort'; session: number; sb: number }
-  | { type: 'position'; session: number; time: number; duration: number; enabled: boolean };
+  | { type: 'position'; session: number; time: number; duration: number; enabled: boolean }
+  /** Classify a still image (a video thumbnail), fetched by the worker. */
+  | { type: 'image'; url: string };
 
 /** Vision worker → page. */
 export type FromVision =
@@ -19,7 +21,9 @@ export type FromVision =
    * replaces what was known there); `edges`: cut or not at GOP boundaries ([time, 1 | 0]).
    */
   | { type: 'result'; session: number; from: number; to: number; frames: VisionFrame[]; cuts: number[]; cutRange: [number, number]; edges: [number, number][] }
-  | { type: 'status'; status: VisionStatus };
+  | { type: 'status'; status: VisionStatus }
+  /** A classified image (`frame`), or why it couldn't be (`error`). */
+  | { type: 'image'; url: string; frame?: VisionFrame; error?: string };
 
 /** One classified frame. */
 export interface VisionFrame {

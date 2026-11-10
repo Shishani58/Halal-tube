@@ -144,9 +144,11 @@ export interface Settings {
   blurWomen: boolean;
   /** Keep the video blurred until its frames have been checked. */
   blurStrict: boolean;
+  /** Also check and blur video thumbnails (feed, recommendations, end screen). */
+  blurThumbs: boolean;
 }
 
-export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, musicRemoval: true, profanity: 'off', blur: true, blurWomen: true, blurStrict: true };
+export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, musicRemoval: true, profanity: 'off', blur: true, blurWomen: true, blurStrict: true, blurThumbs: true };
 
 /** What the page reports for the popup. */
 export interface PageStatus {

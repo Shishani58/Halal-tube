@@ -73,6 +73,9 @@ const STALE_SESSION_MS = 60_000;
 const MAX_FAILURES = 3;
 /** After a model error, try loading again after this long. */
 const RETRY_MS = 30_000;
+/** Thumbnails waiting to be classified (more are asked for again by the page later). */
+const MAX_IMAGES = 200;
+const IMAGE_TIMEOUT_MS = 10_000;
 
 interface Gop {
   start: number;
@@ -130,6 +133,8 @@ let errorAt = 0;
 let workSec = 0;
 let mediaSec = 0;
 const status: VisionStatus = { model: 'idle', backend: '-', frames: 0, speed: 0, ahead: 0 };
+/** Thumbnail URLs to classify, oldest first. */
+const images = new Set<string>();
 
 const post = (m: FromVision) => self.postMessage(m);
 
@@ -248,6 +253,15 @@ self.onmessage = (e: MessageEvent<ToVision>) => {
       updateStatus();
       break;
     }
+    case 'image': {
+      images.delete(m.url);
+      images.add(m.url);
+      if (images.size > MAX_IMAGES) images.delete(images.values().next().value!);
+      if (status.model === 'error' && Date.now() - errorAt > RETRY_MS) status.model = 'idle';
+      if (status.model === 'idle') void initModel();
+      schedule();
+      break;
+    }
   }
 };
 
@@ -337,12 +351,25 @@ const detIn = new Float32Array(B * 3 * S * S);
 const genIn = new Float32Array(G * 3 * GS * GS);
 
 async function pump(): Promise<void> {
-  if (busy || !model || !gender || !pos?.enabled) return;
-  const sid = pos.session;
-  const s = sessions.get(sid);
-  if (!s) return;
-  const g = pickGop(s, pos.time);
-  if (!g) return;
+  if (busy || !model || !gender) return;
+  const sid = pos?.enabled ? pos.session : 0;
+  const s = sid ? sessions.get(sid) : undefined;
+  const g = s && pos ? pickGop(s, pos.time) : null;
+  // thumbnails are quick and on screen: first, unless the playing video needs its next frames checked
+  if (images.size && !(g && s && pos && !s.checked.covers(pos.time, pos.time + 3))) {
+    busy = true;
+    try {
+      await analyseImages();
+      lastWorkAt = Date.now();
+    } catch (e) {
+      console.warn('[music-remover] thumbnail analysis failed', e);
+    } finally {
+      busy = false;
+    }
+    schedule();
+    return;
+  }
+  if (!s || !g) return;
   busy = true;
   try {
     await analyse(sid, s, g);
@@ -441,6 +468,70 @@ async function classify(shots: Shot[]): Promise<VisionFrame[]> {
     });
   }
   return frames;
+}
+
+/**
+ * Parts of a thumbnail looked at besides the whole picture: on a wide one, its left and right
+ * halves (with some overlap), so small faces in a collage are seen at almost twice the size.
+ */
+function imageCrops(w: number, h: number): [number, number, number, number][] {
+  if (w < h * 1.2) return [];
+  const half = Math.round(w * 0.55);
+  return [
+    [0, 0, half, h],
+    [w - half, 0, half, h],
+  ];
+}
+
+/** Fetch and classify the next thumbnails: nudity and female scores, the most of the whole and its parts. */
+async function analyseImages(): Promise<void> {
+  const urls = [...images].slice(-B).reverse(); // newest first: what the page shows now
+  for (const u of urls) images.delete(u);
+  const loaded = await Promise.all(
+    urls.map(async (url) => {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), IMAGE_TIMEOUT_MS);
+      try {
+        const res = await fetch(url, { credentials: 'omit', signal: ctl.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const whole = await createImageBitmap(await res.blob());
+        const parts = await Promise.all(imageCrops(whole.width, whole.height).map(([x, y, w, h]) => createImageBitmap(whole, x, y, w, h)));
+        return { url, bmps: [whole, ...parts] };
+      } catch (e) {
+        post({ type: 'image', url, error: e instanceof Error ? e.message : String(e) });
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+    }),
+  );
+  const ok = loaded.filter((x): x is { url: string; bmps: ImageBitmap[] } => !!x);
+  try {
+    // as many whole images per detector call as fit
+    for (let i = 0; i < ok.length; ) {
+      const group: typeof ok = [];
+      let n = 0;
+      while (i < ok.length && (n === 0 || n + ok[i].bmps.length <= B)) {
+        n += ok[i].bmps.length;
+        group.push(ok[i++]);
+      }
+      try {
+        const frames = await classify(group.flatMap((x) => x.bmps.map((bmp) => ({ t: 0, bmp }))));
+        let k = 0;
+        for (const x of group) {
+          const fs = frames.slice(k, (k += x.bmps.length));
+          const max = (f: (v: VisionFrame) => number) => Math.max(...fs.map(f));
+          post({ type: 'image', url: x.url, frame: { t: 0, nude: max((v) => v.nude), skin: max((v) => v.skin), female: max((v) => v.female), women: fs[0].women } });
+        }
+        status.frames += n;
+      } catch (e) {
+        for (const x of group) post({ type: 'image', url: x.url, error: e instanceof Error ? e.message : String(e) });
+        throw e;
+      }
+    }
+  } finally {
+    for (const x of ok) for (const b of x.bmps) b.close();
+  }
 }
 
 let thumbCtx: OffscreenCanvasRenderingContext2D | null = null;

@@ -1,68 +1,78 @@
 import { DEFAULT_SETTINGS, type PageStatus, type Settings } from '../shared/messages';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+const radios = (name: string) => Array.from(document.querySelectorAll<HTMLInputElement>(`input[name=${name}]`));
+
 const enabledEl = $<HTMLInputElement>('enabled');
 const badgeEl = $<HTMLInputElement>('showBadge');
-const modeEls = Array.from(document.querySelectorAll<HTMLInputElement>('input[name=mode]'));
-const blurEls = (['blur', 'blurWomen', 'blurStrict'] as const).map((k) => [k, $<HTMLInputElement>(k)] as const);
 const musicEl = $<HTMLInputElement>('musicRemoval');
-const profEls = Array.from(document.querySelectorAll<HTMLInputElement>('input[name=profanity]'));
+const blurEl = $<HTMLInputElement>('blur');
+const blurWomenEl = $<HTMLInputElement>('blurWomen');
+const blurThumbsEl = $<HTMLInputElement>('blurThumbs');
+const modeEls = radios('mode');
+const profEls = radios('profanity');
+const strictEls = radios('blurStrict');
+
+let s: Settings = { ...DEFAULT_SETTINGS };
+
+function save(patch: Partial<Settings>): void {
+  s = { ...s, ...patch };
+  render();
+  void chrome.storage.sync.set(patch);
+}
 
 async function load(): Promise<void> {
-  const s = (await chrome.storage.sync.get(DEFAULT_SETTINGS)) as Settings;
+  s = (await chrome.storage.sync.get(DEFAULT_SETTINGS)) as Settings;
   enabledEl.checked = s.enabled;
   badgeEl.checked = s.showBadge;
-  for (const m of modeEls) m.checked = m.value === s.mode;
-  for (const [k, el] of blurEls) el.checked = s[k];
   musicEl.checked = s.musicRemoval;
+  blurEl.checked = s.blur;
+  blurWomenEl.checked = s.blurWomen;
+  blurThumbsEl.checked = s.blurThumbs;
+  for (const m of modeEls) m.checked = m.value === s.mode;
   for (const p of profEls) p.checked = p.value === s.profanity;
-  hint(s);
+  for (const x of strictEls) x.checked = (x.value === '1') === s.blurStrict;
+  render();
 }
 
-/** Warn when both features are off: the extension then leaves the sound alone. */
-function hint(s: Pick<Settings, 'musicRemoval' | 'profanity'>): void {
-  const el = $('profanity-hint');
+/** Everything that follows from the settings alone (hints, dimmed parts). */
+function render(): void {
+  document.body.classList.toggle('off', !s.enabled);
+  $('off-banner').hidden = s.enabled;
+  $('card-blur').classList.toggle('disabled', !s.blur);
+
+  const hint = $('profanity-hint');
   const idle = !s.musicRemoval && s.profanity === 'off';
-  el.textContent = idle ? 'Музыка и мат не фильтруются — звук не меняется.' : 'Русский и английский. Речь распознаётся на вашем компьютере.';
-  el.classList.toggle('warn', idle);
+  hint.textContent = idle ? 'Музыка и мат не фильтруются — звук не меняется.' : 'Русский и английский. Речь распознаётся на вашем компьютере.';
+  hint.classList.toggle('warn', idle);
+  $('mode-hint').textContent =
+    s.mode === 'strict' ? 'Первые секунды тихо, зато музыка и мат не проскочат.' : 'Сразу играет оригинал, обработанный звук подхватывается позже.';
 }
 
-function current(): Pick<Settings, 'musicRemoval' | 'profanity'> {
-  return { musicRemoval: musicEl.checked, profanity: (profEls.find((p) => p.checked)?.value ?? 'off') as Settings['profanity'] };
+enabledEl.addEventListener('change', () => save({ enabled: enabledEl.checked }));
+badgeEl.addEventListener('change', () => save({ showBadge: badgeEl.checked }));
+musicEl.addEventListener('change', () => save({ musicRemoval: musicEl.checked }));
+blurEl.addEventListener('change', () => save({ blur: blurEl.checked }));
+blurWomenEl.addEventListener('change', () => save({ blurWomen: blurWomenEl.checked }));
+blurThumbsEl.addEventListener('change', () => save({ blurThumbs: blurThumbsEl.checked }));
+for (const m of modeEls) m.addEventListener('change', () => m.checked && save({ mode: m.value as Settings['mode'] }));
+for (const p of profEls) p.addEventListener('change', () => p.checked && save({ profanity: p.value as Settings['profanity'] }));
+for (const x of strictEls) x.addEventListener('change', () => x.checked && save({ blurStrict: x.value === '1' }));
+
+type Dot = '' | 'ok' | 'wait' | 'bad' | 'hidden';
+function dot(id: string, kind: Dot): void {
+  $(id).className = `dot ${kind}`;
 }
+const set = (id: string, text: string) => ($(id).textContent = text);
 
-enabledEl.addEventListener('change', () => void chrome.storage.sync.set({ enabled: enabledEl.checked }));
-badgeEl.addEventListener('change', () => void chrome.storage.sync.set({ showBadge: badgeEl.checked }));
-for (const m of modeEls) m.addEventListener('change', () => m.checked && void chrome.storage.sync.set({ mode: m.value }));
-for (const [k, el] of blurEls) el.addEventListener('change', () => void chrome.storage.sync.set({ [k]: el.checked }));
-
-musicEl.addEventListener('change', () => {
-  hint(current());
-  void chrome.storage.sync.set({ musicRemoval: musicEl.checked });
-});
-for (const p of profEls)
-  p.addEventListener('change', () => {
-    if (!p.checked) return;
-    hint(current());
-    void chrome.storage.sync.set({ profanity: p.value });
-  });
-
-const VISION_TEXT = {
-  off: 'Выключено',
-  'no-video': 'Видео не найдено',
-  checking: 'Проверяется…',
-  hidden: 'Размыт',
-  clear: 'Чистый',
-} as const;
-
-const STATE_TEXT: Record<PageStatus['state'], string> = {
-  disabled: 'Выключено',
-  'no-video': 'Видео не найдено',
-  waiting: 'Обработка…',
-  clean: 'Играет обработанный звук',
-  paused: 'Пауза (готово)',
-  suspended: 'Нажмите на страницу',
-  offline: 'Нет связи с обработчиком — обновите страницу',
+const SOUND: Record<PageStatus['state'], [string, Dot]> = {
+  disabled: ['Выключено', ''],
+  'no-video': ['Видео не найдено', ''],
+  waiting: ['Обрабатывается…', 'wait'],
+  clean: ['Играет обработанный звук', 'ok'],
+  paused: ['Пауза — звук готов', 'ok'],
+  suspended: ['Нажмите на страницу, чтобы включить звук', 'wait'],
+  offline: ['Нет связи — обновите страницу', 'bad'],
 };
 
 async function refresh(): Promise<void> {
@@ -75,42 +85,51 @@ async function refresh(): Promise<void> {
       st = null;
     }
   }
-  const set = (id: string, text: string) => ($(id).textContent = text);
+  const onYoutube = !!tab?.url && /youtube(-nocookie)?\.com/.test(tab.url);
+  set('hdr-sub', !s.enabled ? 'Выключено' : st ? 'Работает на этой вкладке' : onYoutube ? 'Обновите страницу YouTube' : 'Откройте видео на YouTube');
+
   if (!st) {
-    set('st-state', tab?.url?.includes('youtube') ? 'Обновите страницу' : 'Откройте YouTube');
-    set('st-model', '—');
-    set('st-speed', '—');
-    set('st-ahead', '—');
-    set('vs-state', '—');
-    set('vs-ahead', '—');
+    set('st-state', onYoutube ? 'Обновите страницу' : 'Откройте YouTube');
+    dot('sound-dot', '');
+    for (const id of ['st-model', 'st-speed', 'st-ahead', 'vs-ahead']) set(id, '—');
+    set('vs-state', s.blur ? '—' : 'Выключено');
+    dot('blur-dot', '');
     $('row-asr').hidden = true;
     return;
   }
-  const vis = st.vision;
-  const vw = vis?.status;
-  set(
-    'vs-state',
-    !vis ? '—' : vw?.model === 'error' ? `Ошибка: ${vw.error ?? ''}` : vw?.model === 'loading' && vis.state !== 'off' ? 'Загрузка модели…' : VISION_TEXT[vis.state],
-  );
-  set('vs-ahead', vw && vis?.state !== 'off' ? `${Math.round(vw.ahead)} с${vw.speed > 0 ? ` (${vw.speed.toFixed(0)}× реального времени)` : ''}` : '—');
-  set('st-state', STATE_TEXT[st.state] ?? st.state);
+
+  // ── sound ──
+  const soundOff = !s.enabled || (!s.musicRemoval && s.profanity === 'off');
+  const [text, kind] = soundOff ? ['Звук не меняется', '' as Dot] : SOUND[st.state] ?? [st.state, ''];
+  set('st-state', text);
+  dot('sound-dot', kind);
   const w = st.worker;
-  if (!w) {
-    set('st-model', '—');
-  } else if (!current().musicRemoval) {
-    set('st-model', 'Не нужна (музыка не убирается)');
-  } else if (w.model === 'ready') {
-    set('st-model', w.backend === 'webgpu' ? 'Готова (GPU)' : 'Готова (CPU, медленно)');
-  } else if (w.model === 'error') {
-    set('st-model', `Ошибка: ${w.error ?? ''}`);
-  } else {
-    set('st-model', w.model === 'loading' ? 'Загрузка…' : 'Не загружена');
-  }
+  if (!w) set('st-model', '—');
+  else if (!s.musicRemoval) set('st-model', 'Не нужна (музыка не убирается)');
+  else if (w.model === 'ready') set('st-model', w.backend === 'webgpu' ? 'Готова (GPU)' : 'Готова (CPU, медленно)');
+  else if (w.model === 'error') set('st-model', `Ошибка: ${w.error ?? ''}`);
+  else set('st-model', w.model === 'loading' ? 'Загрузка…' : 'Не загружена');
   set('st-speed', w && w.rtf > 0 ? `${(1 / w.rtf).toFixed(1)}× быстрее реального времени` : '—');
   set('st-ahead', w ? `${Math.round(w.ahead)} с (аудио загружено на ${Math.round(w.inputAhead)} с)` : '—');
-  const filterOn = current().profanity !== 'off';
+  const filterOn = s.profanity !== 'off';
   $('row-asr').hidden = !filterOn;
   if (filterOn) set('st-asr', asrText(w));
+
+  // ── blur ──
+  const vis = st.vision;
+  const vw = vis?.status;
+  let vText = '—';
+  let vDot: Dot = '';
+  if (!s.enabled || !s.blur || !vis || vis.state === 'off') vText = 'Выключено';
+  else if (vw?.model === 'error') [vText, vDot] = [`Ошибка: ${vw.error ?? ''}`, 'bad'];
+  else if (vw?.model === 'loading') [vText, vDot] = ['Загрузка модели…', 'wait'];
+  else if (vis.state === 'no-video') vText = s.blurThumbs ? 'Проверяются превью' : 'Видео не найдено';
+  else if (vis.state === 'checking') [vText, vDot] = [s.blurStrict ? 'Кадр проверяется — пока размыт' : 'Кадр проверяется…', 'wait'];
+  else if (vis.state === 'hidden') [vText, vDot] = [vis.regions ? `Скрыто областей: ${vis.regions}` : 'Кадр размыт целиком', 'hidden'];
+  else [vText, vDot] = ['Кадр чистый', 'ok'];
+  set('vs-state', vText);
+  dot('blur-dot', vDot);
+  set('vs-ahead', vw && vis && vis.state !== 'off' && vis.state !== 'no-video' ? `${Math.round(vw.ahead)} с${vw.speed > 0 ? ` · ${vw.speed.toFixed(0)}× быстрее` : ''}` : '—');
 }
 
 /** Where the profanity filter's words come from, and the recognizer's state. */
@@ -129,6 +148,5 @@ function asrText(w: PageStatus['worker']): string {
   }
 }
 
-void load();
-void refresh();
+void load().then(refresh);
 setInterval(() => void refresh(), 1000);

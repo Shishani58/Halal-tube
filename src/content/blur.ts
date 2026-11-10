@@ -4,11 +4,14 @@
  *  - women: only where they are — boxes laid over the video with `backdrop-filter: blur()`;
  *  - nudity, and (strict mode) frames not checked yet: the whole frame, a CSS filter on <video>.
  * Both are composited on the GPU, no pixel work in the page. While a video plays, the decision is
- * remade every animation frame, so boxes follow the people and switch exactly at shot cuts.
+ * remade every animation frame and switches exactly at shot cuts; the boxes are kept still within a
+ * shot (StableBoxes). Video thumbnails are handled by ThumbBlur.
  */
 import { MSG_NS, type Settings } from '../shared/messages';
 import { isInitSegment, type FromVision, type PageVision, type ToVision, type VisionStatus } from '../shared/vision-messages';
 import { VisionTimeline, type Decision } from '../core/vision-timeline';
+import { StableBoxes } from '../core/stable-boxes';
+import { ThumbBlur } from './thumbs';
 
 interface VideoSb {
   id: number;
@@ -69,6 +72,10 @@ export class VisionController {
   private overlays = new Map<HTMLVideoElement, Overlay>();
   private ambientHidden = false;
   private activeVideo: HTMLVideoElement | null = null;
+  /** Still boxes per video; `t`/`seeks` tell a seek from playback. */
+  private steady = new WeakMap<HTMLVideoElement, { boxes: StableBoxes; t: number; seeks: number }>();
+  /** Video thumbnails (feed, sidebar, end screen). */
+  private readonly thumbs = new ThumbBlur((m) => this.send(m));
   private raf = 0;
   /** Women boxes on the active video right now. */
   private regions = 0;
@@ -130,6 +137,7 @@ export class VisionController {
   // ───────── results ─────────
   onMessage(msg: FromVision): void {
     if (msg.type === 'status') this.status = msg.status;
+    else if (msg.type === 'image') this.thumbs.onResult(msg);
     else if (msg.type === 'result') {
       let tl = this.timelines.get(msg.session);
       if (tl) this.timelines.delete(msg.session); // re-inserted below: least-recently-updated order
@@ -137,7 +145,10 @@ export class VisionController {
       this.timelines.set(msg.session, tl);
       if (this.timelines.size > MAX_TIMELINES) this.timelines.delete(this.timelines.keys().next().value!);
       tl.add(msg);
-    } else if (msg.type === 'ready') this.lastPos = 0;
+    } else if (msg.type === 'ready') {
+      this.lastPos = 0;
+      this.thumbs.onRestart();
+    }
   }
 
   timeline(session: number): VisionTimeline | undefined {
@@ -155,6 +166,7 @@ export class VisionController {
     }
     this.activeVideo = activeVideo;
     this.frame();
+    this.thumbs.tick(s);
 
     const now = performance.now();
     if (activeVideo && now - this.lastPos > 250) {
@@ -184,10 +196,12 @@ export class VisionController {
         // boxes are page elements: a <video> shown fullscreen by itself (or in PiP) would leave them behind
         if (d.verdict === 'region' && (document.fullscreenElement === v || document.pictureInPictureElement === v)) full = true;
         this.apply(v, full);
-        this.place(v, !full && d.verdict === 'region' ? d.rects : []);
+        const rects = !full && d.verdict === 'region' ? this.still(v, d) : [];
+        if (!rects.length) this.steady.get(v)?.boxes.reset();
+        this.place(v, rects);
         if (v === this.activeVideo) {
           activeBlurred = full || d.verdict === 'region';
-          this.regions = full ? 0 : d.rects.length;
+          this.regions = rects.length;
           this.state = d.verdict === 'full' || d.verdict === 'region' ? 'hidden' : d.verdict === 'unknown' ? 'checking' : 'clear';
         }
       }
@@ -225,10 +239,24 @@ export class VisionController {
     const rank = { clear: 0, region: 1, unknown: 2, full: 3 } as const;
     for (const x of [t, Math.max(0, t - LAG), Math.min(t + lead, d - 0.01)]) {
       const r = tl.decide(x, p, d);
+      if (x === t) out.shot = r.shot;
       if (rank[r.verdict] > rank[out.verdict]) out.verdict = r.verdict;
       out.rects.push(...r.rects);
     }
     return out;
+  }
+
+  /** The boxes to show on v: what d asks to hide, kept still within a shot. */
+  private still(v: HTMLVideoElement, d: Decision): number[][] {
+    let st = this.steady.get(v);
+    if (!st) {
+      st = { boxes: new StableBoxes(), t: v.currentTime, seeks: 0 };
+      this.steady.set(v, st);
+    }
+    const t = v.currentTime;
+    if (Math.abs(t - st.t) > 1.5) st.seeks++;
+    st.t = t;
+    return st.boxes.update(d.rects, `${this.sessionOf(v)}|${d.shot ?? ''}|${st.seeks}`, performance.now());
   }
 
   private apply(v: HTMLVideoElement, blur: boolean): void {

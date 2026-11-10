@@ -168,16 +168,17 @@ export function unionRect(a: Rect, b: Rect): Rect {
 }
 
 /**
- * The whole person around a face: hair and head above it, shoulders and arms to the sides, the body
- * below (about 7 head heights — a standing person to the knees; cut off by the frame edge), grown
- * further to take in detected body regions that lie under the face.
+ * The whole person around a face: hair and head above it, shoulders and arms to the sides (wide
+ * enough for a seated person's crossed legs), the body below (about 7 head heights — a standing
+ * person to the knees; cut off by the frame edge), grown further to take in detected body regions
+ * that lie under the face.
  */
 export function personFromFace(face: Rect, parts: Rect[]): Rect {
   const cx = face.x + face.w / 2;
-  let r: Rect = { x: cx - 1.8 * face.w, y: face.y - 0.6 * face.h, w: 3.6 * face.w, h: 8.6 * face.h };
+  let r: Rect = { x: cx - 2.2 * face.w, y: face.y - 0.6 * face.h, w: 4.4 * face.w, h: 8.6 * face.h };
   for (const p of parts) {
     const px = p.x + p.w / 2, py = p.y + p.h / 2;
-    if (Math.abs(px - cx) < 3 * face.w && py > face.y + face.h / 2 && py < face.y + 10 * face.h) r = unionRect(r, p);
+    if (Math.abs(px - cx) < 3.6 * face.w && py > face.y + face.h / 2 && py < face.y + 10 * face.h) r = unionRect(r, p);
   }
   return clampRect(r);
 }

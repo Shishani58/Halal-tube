@@ -2,6 +2,8 @@ import { IntervalSet } from '../src/core/intervals';
 import { NUDENET_LABELS, detectFaces, faceCrop, femaleProb, femaleScore, letterbox, personFromBody, personFromFace, rgbaToChw, scoreFrames } from '../src/core/nudenet';
 import { ShotTracker, THUMB_H, THUMB_W, isCut, makeThumb, thumbDiff } from '../src/core/shots';
 import { VisionTimeline } from '../src/core/vision-timeline';
+import { StableBoxes } from '../src/core/stable-boxes';
+import { thumbKey } from '../src/content/thumbs';
 import { assert, test } from './harness';
 
 test('IntervalSet merges, answers coverage, trims', () => {
@@ -104,16 +106,53 @@ test('VisionTimeline: needs the shot checked ahead; nudity blurs the whole frame
   assert(tl.cutTimes.length === 0 && tl.decide(3.4, { women: false }, 6).verdict === 'clear', 'cut taken back, nudity gone');
 });
 
-test('VisionTimeline: between looks; turned away; reach limit', () => {
+test('VisionTimeline: a woman who stays put gets one still box; one who walks is followed', () => {
   const tl = new VisionTimeline();
-  const frames: F[] = [woman(0, 0.1), woman(0.5, 0.3), fr(1), fr(1.5), fr(2), fr(2.5), fr(3)];
-  for (let t = 3.5; t < 30; t += 0.5) frames.push(fr(t));
-  tl.add({ from: 0, to: 30, frames, cuts: [], cutRange: [0, 30], edges: [] });
-  const mid = tl.decide(0.25, { women: true });
-  assert(mid.verdict === 'region' && inside(mid.rects, 0.2, 0.5) && inside(mid.rects, 0.4, 0.5), 'covers both looks around t');
-  const away = tl.decide(2.0, { women: true });
-  assert(away.verdict === 'region' && away.rects.length === 1 && inside(away.rects, 0.15, 0.5) && inside(away.rects, 0.45, 0.5), 'not seen now: everywhere she was');
-  assert(tl.decide(12, { women: true }).verdict === 'clear', 'a long take: no further than SHOT_REACH');
+  // shot [0,10): she sits on the left (her box jitters a little from look to look)
+  // shot [10,20): she walks left → right · shot [20,40): seen at the start, then gone
+  const frames: F[] = [];
+  for (let t = 0; t < 10; t += 0.5) frames.push(woman(t, 0.1 + (Math.round(t * 2) % 3) * 0.01));
+  for (let t = 10; t < 20; t += 0.5) frames.push(woman(t, 0.04 * (t - 10)));
+  for (let t = 20; t < 40; t += 0.5) frames.push(t < 21 ? woman(t, 0.3) : fr(t));
+  tl.add({ from: 0, to: 40, frames, cuts: [10, 20], cutRange: [0, 40], edges: [] });
+  const all = { women: true };
+  const seat = [0.3, 2.1, 5.7, 9.9].map((t) => JSON.stringify(tl.decide(t, all).rects));
+  assert(seat.every((x) => x === seat[0]), `still box: ${seat.join(' ')}`);
+  const box = tl.decide(5, all).rects[0];
+  assert(box.length === 4 && box[0] < 0.1 - 0.02 && box[0] + box[2] > 0.32 + 0.02, `margin for arms and legs: ${box}`);
+  const walk = tl.decide(15, all);
+  assert(walk.verdict === 'region' && inside(walk.rects, 0.3, 0.5) && !inside(walk.rects, 0.05, 0.5) && !inside(walk.rects, 0.75, 0.5), `followed: ${JSON.stringify(walk.rects)}`);
+  assert(walk.shot === 10, 'reports its shot');
+  assert(tl.decide(25, all).verdict === 'region', 'not seen now: still blurred where she was');
+  assert(tl.decide(35, all).verdict === 'clear', 'a long take: no further than SHOT_REACH');
+});
+
+test('StableBoxes: grow at once, shrink late, start over at a cut', () => {
+  const sb = new StableBoxes();
+  const her = [0.4, 0.2, 0.2, 0.6];
+  const [b0] = sb.update([her], 'shot1', 0);
+  assert(b0[0] < 0.4 && b0[0] + b0[2] > 0.6, 'padded');
+  // small moves and duplicate looks: the box doesn't move
+  const same = sb.update([[0.405, 0.21, 0.2, 0.59], [0.398, 0.2, 0.2, 0.6]], 'shot1', 100);
+  assert(same.length === 1 && JSON.stringify(same[0]) === JSON.stringify(b0), `still: ${JSON.stringify(same)}`);
+  // she leans out: covered right away
+  const [b1] = sb.update([[0.45, 0.2, 0.2, 0.6]], 'shot1', 200);
+  assert(b1[0] + b1[2] >= 0.65 && b1[0] <= b0[0] + 1e-9, `grows: ${b1}`);
+  // much smaller need: shrinks only after a while
+  const small = [0.45, 0.3, 0.06, 0.1];
+  assert(JSON.stringify(sb.update([small], 'shot1', 1000)[0]) === JSON.stringify(b1), 'not yet');
+  sb.update([small], 'shot1', 2000);
+  const [b2] = sb.update([small], 'shot1', 3100);
+  assert(b2[2] < 0.2 && b2[0] <= 0.45 && b2[0] + b2[2] >= 0.51, `shrinks to fit: ${b2}`);
+  // a new shot: boxes start over
+  const [b3] = sb.update([[0.0, 0.0, 0.1, 0.1]], 'shot2', 3200);
+  assert(b3[0] === 0 && b3[2] < 0.2, `new shot: ${b3}`);
+  assert(sb.update([], 'shot2', 3300).length === 1 && sb.update([], 'shot2', 3600).length === 0, 'held briefly, then gone');
+});
+
+test('Thumbnails: one verdict per video, whatever the size', () => {
+  const k = thumbKey('https://i.ytimg.com/vi/abc_-1/hqdefault.jpg?sqp=x&rs=y');
+  assert(k === 'abc_-1' && thumbKey('https://i9.ytimg.com/vi_webp/abc_-1/mqdefault.webp') === k && thumbKey('https://i.ytimg.com/an_webp/abc_-1/mqdefault_6s.webp?du=3000') === k, k);
 });
 
 test('Person regions from a face and body parts', () => {
