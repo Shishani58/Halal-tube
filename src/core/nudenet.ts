@@ -181,21 +181,26 @@ export function unionRect(a: Rect, b: Rect): Rect {
  * The person around a face, as two rects: [head, body]. One rect for both would also cover the
  * background on either side of the head — on a close-up that is most of the frame. NudeNet's face
  * box runs from the brows to below the chin, so the head (with the hair) reaches 0.65 box heights
- * above it and 0.7 box widths to each side of its centre; the body starts at the shoulders, is
- * wide enough for arms on a desk or crossed legs, and goes down about 8 head heights (a standing
- * person to the knees; cut off by the frame edge), grown to take in detected body regions under
- * the face.
+ * above it and 0.7 box widths to each side of its centre; the body starts at the shoulders, is as
+ * wide as the shoulders (about 2.6 face widths: on a close-up a wider guess covers half the frame —
+ * a slide beside her), and goes down about 8 head heights (a standing person to the knees; cut off
+ * by the frame edge), grown to take in detected body regions under the face (arms on a desk,
+ * crossed legs), though never further than BODY_REACH face widths from its centre.
  */
 export function personFromFace(face: Rect, parts: Rect[]): [Rect, Rect] {
   const cx = face.x + face.w / 2;
   const head: Rect = { x: cx - 0.7 * face.w, y: face.y - 0.65 * face.h, w: 1.4 * face.w, h: 1.55 * face.h };
-  let body: Rect = { x: cx - 2.2 * face.w, y: face.y + 0.85 * face.h, w: 4.4 * face.w, h: 8.15 * face.h };
+  let body: Rect = { x: cx - 1.3 * face.w, y: face.y + 0.85 * face.h, w: 2.6 * face.w, h: 8.15 * face.h };
   for (const p of parts) {
     const px = p.x + p.w / 2, py = p.y + p.h / 2;
-    if (Math.abs(px - cx) < 3.6 * face.w && py > face.y + face.h / 2 && py < face.y + 10 * face.h) body = unionRect(body, p);
+    if (Math.abs(px - cx) < 2.2 * face.w && py > face.y + face.h / 2 && py < face.y + 10 * face.h) body = unionRect(body, p);
   }
-  return [clampRect(head), clampRect(body)];
+  const x0 = Math.max(body.x, cx - BODY_REACH * face.w), x1 = Math.min(body.x + body.w, cx + BODY_REACH * face.w);
+  return [clampRect(head), clampRect({ ...body, x: x0, w: x1 - x0 })];
 }
+
+/** How far (in face widths) from the face's centre a detected body part may widen the body box. */
+export const BODY_REACH = 2.5;
 
 /** A woman seen by her body alone (no face found): the region, grown to where the head and legs would be. */
 export function personFromBody(part: Rect): Rect {

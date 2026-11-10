@@ -184,6 +184,12 @@ test('Person regions from a face and body parts', () => {
   assert(r.x + r.w < 0.9, 'parts far to the side are someone else');
   const b = personFromBody({ x: 0.4, y: 0.5, w: 0.1, h: 0.1 });
   assert(b.y <= 0.25 && b.x <= 0.32 && b.x + b.w >= 0.58, `head above the chest: ${JSON.stringify(b)}`);
+  // a close-up (face a fifth of the frame wide, right of centre): the body box must not reach
+  // over to a slide on the left half of the frame
+  const [, close] = personFromFace({ x: 0.663, y: 0.238, w: 0.209, h: 0.374 }, []);
+  assert(close.x >= 0.45 && close.x + close.w <= 1, `close-up body stays on her: ${JSON.stringify(close)}`);
+  const [, wide] = personFromFace(face, [{ x: 0.1, y: 0.5, w: 0.8, h: 0.2 }]);
+  assert(wide.x >= 0.5 - 2.5 * face.w - 1e-9 && wide.x + wide.w <= 0.5 + 2.5 * face.w + 1e-9, `a wide stray part can't stretch the body over the frame: ${JSON.stringify(wide)}`);
 });
 
 /** Synthetic THUMB_W×THUMB_H RGBA "scene": a gradient with an offset and a colour. */

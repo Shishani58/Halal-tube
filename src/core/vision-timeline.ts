@@ -50,7 +50,7 @@ export const SHOT_REACH = 8;
  * A woman who stays in place (her boxes over the shot add up to at most this × her largest box)
  * gets one still box for the whole shot; one who moves is followed, from her looks this close to t…
  */
-export const STILL_GROWTH = 1.8;
+export const STILL_GROWTH = 1.4;
 export const MOVE_WINDOW = 1.0;
 /** …grown by MOTION_MARGIN per second to the nearest look when she was only seen on one side of t. */
 export const MOTION_MARGIN = 0.25;
@@ -60,7 +60,7 @@ export const MOTION_MARGIN = 0.25;
  * estimate. The top goes by the width: a body rect is tall, and a margin by its height would
  * reach up over the head beside it (the two would merge into one box covering the background).
  */
-export const PERSON_MARGIN = { x: 0.12, top: 0.03, bottom: 0.1 };
+export const PERSON_MARGIN = { x: 0.06, top: 0.03, bottom: 0.06 };
 export const MIN_MARGIN = 0.025;
 
 export interface BlurPolicy {
