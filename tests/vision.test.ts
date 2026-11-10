@@ -139,7 +139,7 @@ test('VisionTimeline: a woman who stays put gets one still box; one who walks is
   const seat = [0.3, 2.1, 5.7, 9.9].map((t) => JSON.stringify(tl.decide(t, all).rects));
   assert(seat.every((x) => x === seat[0]), `still box: ${seat.join(' ')}`);
   const box = tl.decide(5, all).rects[0];
-  assert(box.length === 4 && box[0] < 0.1 - 0.02 && box[0] + box[2] > 0.32 + 0.02, `margin for arms and legs: ${box}`);
+  assert(box.length === 5 && box[4] === 0 && box[0] < 0.1 - 0.02 && box[0] + box[2] > 0.32 + 0.02, `margin for arms and legs: ${box}`);
   const walk = tl.decide(15, all);
   assert(walk.verdict === 'region' && inside(walk.rects, 0.3, 0.5) && !inside(walk.rects, 0.05, 0.5) && !inside(walk.rects, 0.75, 0.5), `followed: ${JSON.stringify(walk.rects)}`);
   assert(walk.shot === 10, 'reports its shot');
@@ -221,4 +221,24 @@ test('Shot cuts: hard cut yes; noise, pan, flash no', () => {
   const sampled = res.filter((x) => x.includes('s')).length;
   assert(res[0] === '.s' && res[35] === 'Cs', `first frame and the cut frame are classified: ${res.join(' ')}`);
   assert(sampled <= 12, `few looks at a still shot: ${sampled}`);
+});
+
+test('Heads and bodies are tracked apart but shown as one blur', () => {
+  const tl = new VisionTimeline();
+  // a close-up: she leans down and back up; the head of one look overlaps the body of another
+  const frames = [];
+  for (let t = 0; t < 6; t += 0.5) {
+    const dy = (Math.round(t * 2) % 4) * 0.06;
+    frames.push({ t, nude: 0, skin: 0, female: 0.9, women: [0.35, 0.02 + dy, 0.3, 0.55, 0.9, 0.05, 0.5 + dy, 0.9, 0.5, 0.9], parts: [1, 2] });
+  }
+  tl.add({ from: 0, to: 6, frames, cuts: [], cutRange: [0, 6], edges: [] });
+  const d = tl.decide(3, { women: true }, 6);
+  assert(d.verdict === 'region' && d.rects.length === 2, `two boxes: ${JSON.stringify(d.rects)}`);
+  const head = d.rects.find((r) => r[4] === 1)!;
+  assert(head[0] > 0.2 && head[0] + head[2] < 0.8, `head box leaves the sides open: ${head}`);
+  const sb = new StableBoxes();
+  const shown = sb.update(d.rects, 's', 0);
+  assert(shown.length === 1, `head and body are shown as one blur: ${JSON.stringify(shown)}`);
+  const far = sb.update([[0.02, 0.02, 0.1, 0.1, 1], [0.7, 0.6, 0.25, 0.35, 2]], 'far', 0);
+  assert(far.length === 2, `boxes far apart stay separate: ${JSON.stringify(far)}`);
 });

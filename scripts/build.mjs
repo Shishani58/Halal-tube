@@ -80,7 +80,7 @@ const builds = [
     format: 'esm',
     alias: { 'onnxruntime-web/webgpu': './src/processor/ort-shim.ts', 'onnxruntime-common': './src/processor/ort-shim.ts' },
   },
-  { entryPoints: { background: 'src/background.ts', 'processor/offscreen': 'src/processor/offscreen.ts', 'processor/worker': 'src/processor/worker.ts', 'processor/vision-worker': 'src/processor/vision-worker.ts', 'popup/popup': 'src/popup/popup.ts', 'bench/bench': 'src/bench/bench.ts', 'bench/asr-bench': 'src/bench/asr-bench.ts' }, format: 'esm' },
+  { entryPoints: { background: 'src/background.ts', 'processor/offscreen': 'src/processor/offscreen.ts', 'processor/worker': 'src/processor/worker.ts', 'processor/vision-worker': 'src/processor/vision-worker.ts', 'processor/clip-worker': 'src/processor/clip-worker.ts', 'popup/popup': 'src/popup/popup.ts', 'bench/bench': 'src/bench/bench.ts', 'bench/asr-bench': 'src/bench/asr-bench.ts' }, format: 'esm' },
 ];
 
 if (!watch) rmSync(dist, { recursive: true, force: true });

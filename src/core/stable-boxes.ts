@@ -11,6 +11,8 @@ export const HOLD = 300;
 
 interface Box {
   r: number[];
+  /** Part of a person it covers (rect[4], vision-timeline PART): boxes of different parts never merge. */
+  kind: number;
   /** What it must cover now (null: nothing). */
   need: number[] | null;
   tooBigSince: number;
@@ -27,7 +29,7 @@ export class StableBoxes {
   private boxes: Box[] = [];
   private key: string | null = null;
 
-  /** Frame-relative boxes to show for the rects `want` to hide; `key` names the shot. */
+  /** Frame-relative boxes to show for the rects `want` ([x, y, w, h, part?]) to hide; `key` names the shot. */
   update(want: number[][], key: string, now: number): number[][] {
     if (key !== this.key) {
       this.boxes = [];
@@ -35,9 +37,11 @@ export class StableBoxes {
     }
     for (const b of this.boxes) b.need = null;
     for (const w of mergeAll(want.map((r) => r.slice()))) {
+      const kind = w[4] ?? 0;
       let best: Box | null = null;
       let bestOv = 0;
       for (const b of this.boxes) {
+        if (b.kind !== kind) continue;
         const ov = overlap(b.r, w);
         if (ov > bestOv) {
           bestOv = ov;
@@ -47,13 +51,13 @@ export class StableBoxes {
       if (best && bestOv > 0.2) {
         best.need = best.need ? union(best.need, w) : w;
         if (!contains(best.r, w)) best.r = grow(union(best.r, w), GROW_PAD);
-      } else this.boxes.push({ r: grow(w, GROW_PAD), need: w, tooBigSince: 0, lastNeeded: now });
+      } else this.boxes.push({ r: grow(w, GROW_PAD), kind, need: w, tooBigSince: 0, lastNeeded: now });
     }
     // boxes that grew into each other become one
     for (let i = 0; i < this.boxes.length; i++)
       for (let j = this.boxes.length - 1; j > i; j--) {
         const a = this.boxes[i], b = this.boxes[j];
-        if (overlap(a.r, b.r) < 0.3) continue;
+        if (a.kind !== b.kind || overlap(a.r, b.r) < 0.3) continue;
         a.r = union(a.r, b.r);
         a.need = a.need && b.need ? union(a.need, b.need) : a.need ?? b.need;
         a.lastNeeded = Math.max(a.lastNeeded, b.lastNeeded);
@@ -73,7 +77,8 @@ export class StableBoxes {
         b.tooBigSince = 0;
       }
     }
-    return this.boxes.map((b) => b.r);
+    // heads and bodies are tracked apart, but shown as one blur where they touch
+    return joinTouching(this.boxes.map((b) => b.r));
   }
 
   reset(): void {
@@ -82,17 +87,37 @@ export class StableBoxes {
   }
 }
 
+/** Boxes closer than this (share of the frame) to each other are shown as one blur. */
+export const JOIN_GAP = 0.02;
+
+/** Boxes that overlap or nearly touch (directly or through others) as one box around them. */
+export function joinTouching(boxes: number[][]): number[][] {
+  const rs = boxes.map((r) => r.slice(0, 4));
+  for (let i = 0; i < rs.length; i++)
+    for (let j = rs.length - 1; j > i; j--)
+      if (touches(rs[i], rs[j])) {
+        rs[i] = union(rs[i], rs[j]);
+        rs.splice(j, 1);
+        j = rs.length; // the grown box may now touch ones already passed
+      }
+  return rs;
+}
+
+function touches(a: number[], b: number[]): boolean {
+  return Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0]) > -JOIN_GAP && Math.min(a[1] + a[3], b[1] + b[3]) - Math.max(a[1], b[1]) > -JOIN_GAP;
+}
+
 function contains(outer: number[], r: number[]): boolean {
   const e = 1e-6;
   return r[0] >= outer[0] - e && r[1] >= outer[1] - e && r[0] + r[2] <= outer[0] + outer[2] + e && r[1] + r[3] <= outer[1] + outer[3] + e;
 }
 
-/** Rects that largely overlap (the same person seen at nearby times) as one. */
+/** Rects of the same part that largely overlap (the same person seen at nearby times) as one. */
 function mergeAll(rs: number[][]): number[][] {
   for (let i = 0; i < rs.length; i++)
     for (let j = rs.length - 1; j > i; j--)
-      if (overlap(rs[i], rs[j]) > 0.25) {
-        rs[i] = union(rs[i], rs[j]);
+      if ((rs[i][4] ?? 0) === (rs[j][4] ?? 0) && overlap(rs[i], rs[j]) > 0.25) {
+        rs[i] = [...union(rs[i], rs[j]), rs[i][4] ?? 0];
         rs.splice(j, 1);
         j = rs.length; // the grown rect may now overlap ones already passed
       }

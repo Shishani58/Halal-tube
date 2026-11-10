@@ -44,16 +44,21 @@ import {
   toFrame,
   type Rect,
 } from '../core/nudenet';
-import { CLIP_INPUT as CS, CLIP_VIEWS, clipFrameWomen, clipViews, rgbaToClip } from '../core/clip';
+import { CLIP_INPUT as CS, CLIP_VIEWS, clipViews, rgbaToClip } from '../core/clip';
+import type { FromClip, ToClip } from './clip-worker';
 import { ShotTracker, THUMB_H, THUMB_W, isEdgeCut, makeThumb, type Thumb } from '../core/shots';
 import type { FromVision, ToVision, VisionFrame, VisionStatus } from '../shared/vision-messages';
+import { PART, THRESHOLDS } from '../core/vision-timeline';
+import { ClipBudget, clipMode } from '../core/clip-budget';
 import { loadModel, type LoadedModel } from './model';
 
 declare const self: DedicatedWorkerGlobalScope;
 
 const DETECTOR_FILE = 'nudenet-320n.onnx';
 const GENDER_FILE = 'genderage.onnx';
-const CLIP_FILE = 'mobileclip-s0-vision.onnx';
+/** Longest wait for the scene model to load / to score a batch; past it, frames go without. */
+const CLIP_LOAD_MS = 60_000;
+const CLIP_RUN_MS = 10_000;
 /** Faces per gender-classifier call at most (GENDER_CROPS.length crops each). */
 const NC = GENDER_CROPS.length;
 const G = 8 * NC;
@@ -137,8 +142,41 @@ const sessions = new Map<number, Session>();
 let pos: Extract<ToVision, { type: 'position' }> | null = null;
 let model: LoadedModel | null = null;
 let gender: LoadedModel | null = null;
-/** Optional: without it (file missing, failed to load) frames get no `women` scene score. */
-let clip: LoadedModel | null = null;
+/**
+ * The scene model, in a worker of its own (clip-worker.ts). Optional: without it (no WebGPU, file
+ * missing, too slow to answer) frames get no `scene` score.
+ */
+let clip: Worker | null = null;
+let clipCalls = 0;
+
+function clipAsk(m: ToClip, ms: number, transfer: Transferable[] = []): Promise<FromClip | null> {
+  const w = clip;
+  if (!w) return Promise.resolve(null);
+  const id = m.type === 'run' ? m.id : -1;
+  return new Promise((resolve) => {
+    const done = (r: FromClip | null) => {
+      clearTimeout(timer);
+      w.removeEventListener('message', on);
+      resolve(r);
+    };
+    const on = (e: MessageEvent<FromClip>) => {
+      const r = e.data;
+      if ((m.type === 'load' && r.type === 'loaded') || (r.type === 'result' && r.id === id)) done(r);
+    };
+    const timer = setTimeout(() => done(null), ms);
+    w.addEventListener('message', on);
+    w.postMessage(m, transfer);
+  });
+}
+
+async function loadClip(): Promise<void> {
+  clip = new Worker(new URL('./clip-worker.js', self.location.href), { type: 'module' });
+  const r = await clipAsk({ type: 'load' }, CLIP_LOAD_MS);
+  if (r?.type === 'loaded' && r.ok) return;
+  console.warn('[music-remover] scene model unavailable', r?.type === 'loaded' ? r.error : 'timeout');
+  clip.terminate();
+  clip = null;
+}
 let busy = false;
 /** Last time a GOP was analysed or the models became ready (idle release). */
 let lastWorkAt = Date.now();
@@ -306,10 +344,7 @@ async function initModel(): Promise<void> {
     await model.run(new Float32Array(B * 3 * wide.w * wide.h), [B, 3, wide.h, wide.w]);
     // tiny model, tiny inputs: CPU avoids GPU round trips and leaves the GPU to the detector
     gender = await loadModel({ base, modelFile: GENDER_FILE, shape: [1, 3, GS, GS], backend: 'wasm' });
-    clip = await loadModel({ base, modelFile: CLIP_FILE, shape: [CLIP_VIEWS, 3, CS, CS] }).catch((e) => {
-      console.warn('[music-remover] scene model unavailable', e);
-      return null;
-    });
+    await loadClip();
     status.model = 'ready';
     status.backend = model.backend;
     status.error = undefined;
@@ -361,6 +396,9 @@ function pickGop(s: Session, t: number): Gop | null {
 interface Shot {
   t: number;
   bmp: ImageBitmap;
+  /** Thumbnail, and whether the frame starts a new shot (clip-budget); absent for stills. */
+  th?: Thumb;
+  cut?: boolean;
 }
 
 function ctx(w: number, h: number): OffscreenCanvasRenderingContext2D {
@@ -372,7 +410,6 @@ let faceCtx: OffscreenCanvasRenderingContext2D | null = null;
 const detIn = new Float32Array(B * 3 * S * S);
 const genIn = new Float32Array(G * 3 * GS * GS);
 let clipCtx: OffscreenCanvasRenderingContext2D | null = null;
-const clipIn = new Float32Array(B * CLIP_VIEWS * 3 * CS * CS);
 
 /** MobileCLIP women score of each frame (null without the model): views stacked, one readback. */
 async function sceneWomen(bmps: ImageBitmap[]): Promise<number[] | null> {
@@ -385,9 +422,10 @@ async function sceneWomen(bmps: ImageBitmap[]): Promise<number[] | null> {
     for (const [x, y, side] of clipViews(bmp.width, bmp.height)) c.drawImage(bmp, x, y, side, side, 0, CS * i++, CS, CS);
   const px = c.getImageData(0, 0, CS, CS * m).data;
   const plane = CS * CS;
-  for (let k = 0; k < m; k++) rgbaToClip(px.subarray(k * plane * 4, (k + 1) * plane * 4), CS, clipIn, k * 3 * plane);
-  const out = await clip.run(clipIn, [m, 3, CS, CS]);
-  return bmps.map((_, j) => clipFrameWomen(out, j * CLIP_VIEWS));
+  const input = new Float32Array(m * 3 * plane);
+  for (let k = 0; k < m; k++) rgbaToClip(px.subarray(k * plane * 4, (k + 1) * plane * 4), CS, input, k * 3 * plane);
+  const r = await clipAsk({ type: 'run', id: ++clipCalls, input, frames: bmps.length }, CLIP_RUN_MS, [input.buffer]);
+  return r?.type === 'result' && r.scores ? r.scores : null;
 }
 
 async function pump(): Promise<void> {
@@ -417,7 +455,6 @@ async function pump(): Promise<void> {
     lastWorkAt = Date.now();
   } catch (e) {
     console.warn('[music-remover] GOP analysis failed', g.start, e);
-    status.error = 'DBG ' + (e instanceof Error ? e.stack ?? e.message : String(e)); // DBG
     if (g.closed) free(g);
     else g.analyzedCount = g.packets.length; // retry once more data arrives
     // a persistent failure (lost GPU device…) must show, not silently stop checking frames
@@ -440,7 +477,19 @@ async function pump(): Promise<void> {
  * frame and per face: all detector inputs are drawn stacked into one canvas, all face crops into
  * another, and each is read back once.
  */
-async function classify(shots: Shot[], scene = false): Promise<VisionFrame[]> {
+/** Cumulative milliseconds per stage (profiling; reported in the status). */
+const T: Record<string, number> = {};
+const lap = (k: string, since: number): number => {
+  const now = performance.now();
+  T[k] = (T[k] ?? 0) + now - since;
+  return now;
+};
+
+async function classify(shots: Shot[], scene: ClipBudget | null = null): Promise<VisionFrame[]> {
+  const tc0 = performance.now();
+  let tl = tc0;
+  T.classifyCalls = (T.classifyCalls ?? 0) + 1;
+  T.classifyFrames = (T.classifyFrames ?? 0) + shots.length;
   const n = shots.length;
   const boxes = shots.map((x) => letterbox(x.bmp.width, x.bmp.height));
   const { w: iw, h: ih } = detectorInput(boxes);
@@ -456,10 +505,11 @@ async function classify(shots: Shot[], scene = false): Promise<VisionFrame[]> {
   const px = det.getImageData(0, 0, iw, ih * n).data;
   const plane = iw * ih;
   for (let j = 0; j < n; j++) rgbaToChw(px.subarray(j * plane * 4, (j + 1) * plane * 4), iw, detIn, j * 3 * plane, ih);
+  tl = lap('detPrep', tl);
   // unused batch slots: whatever they held (the model's output for them is never read)
   const out = await model!.run(detIn, [B, 3, ih, iw]);
+  tl = lap('detRun', tl);
   const scores = scoreFrames(out, B, n);
-  const sceneScores = scene ? await sceneWomen(shots.map((x) => x.bmp)) : null;
 
   // face crops from the higher-resolution copies (NC per face, consecutive), stacked, one readback
   const queued: { j: number; face: Rect }[] = [];
@@ -489,8 +539,11 @@ async function classify(shots: Shot[], scene = false): Promise<VisionFrame[]> {
     }
     const fpx = fc.getImageData(0, 0, GS, GS * m).data;
     for (let i = 0; i < m; i++) rgbaToGenderInput(fpx.subarray(i * GS * GS * 4, (i + 1) * GS * GS * 4), GS, genIn, i * 3 * GS * GS);
+    tl = lap('facePrep', tl);
     // exactly as many crops as there are (CPU: the cost is per crop, unlike the GPU detector)
     const g = await gender!.run(genIn, [m, 3, GS, GS]);
+    tl = lap('gender', tl);
+    T.genderCrops = (T.genderCrops ?? 0) + m;
     for (let i = 0; i < m; i += NC) {
       const q = queued[(i0 + i) / NC];
       faces[q.j].push({ face: q.face, p: femaleProb(g, i, NC) });
@@ -504,17 +557,19 @@ async function classify(shots: Shot[], scene = false): Promise<VisionFrame[]> {
     const { dw, dh } = boxes[j];
     const parts = detectBoxes(out, B, j, BODY_CLASSES, 0.3, 12).map((x) => toFrame(x, dw, dh));
     const women: number[] = [];
+    const kinds: number[] = [];
     /** Each person's rects (head and body, or body alone) and their entries in `women`. */
     const people: { rects: Rect[]; at: number[] }[] = [];
-    const add = (rects: Rect[], p: number) => {
+    const add = (rects: Rect[], p: number, part: number[]) => {
       const at: number[] = [];
-      for (const q of rects) {
+      rects.forEach((q, i) => {
         at.push(women.length / 5);
         women.push(r(q.x), r(q.y), r(q.w), r(q.h), r(p));
-      }
+        kinds.push(part[i]);
+      });
       people.push({ rects, at });
     };
-    for (const f of faces[j]) if (f.p >= WOMAN_REPORT) add(personFromFace(f.face, parts), f.p);
+    for (const f of faces[j]) if (f.p >= WOMAN_REPORT) add(personFromFace(f.face, parts), f.p, [PART.head, PART.body]);
     // a woman's body: makes the person it belongs to a woman; or one without a face found
     // (turned away, face cut off)
     for (const x of detectBoxes(out, B, j, GROUPS.femaleBody, FEMALE_BODY_MIN, 4)) {
@@ -522,7 +577,7 @@ async function classify(shots: Shot[], scene = false): Promise<VisionFrame[]> {
       const cx = part.x + part.w / 2, cy = part.y + part.h / 2;
       const who = people.find((o) => o.rects.some((q) => cx >= q.x && cx <= q.x + q.w && cy >= q.y && cy <= q.y + q.h));
       if (who) for (const i of who.at) women[i * 5 + 4] = Math.max(women[i * 5 + 4], r(x.score));
-      else add([personFromBody(part)], x.score);
+      else add([personFromBody(part)], x.score, [PART.whole]);
     }
     frames.push({
       t: shots[j].t,
@@ -530,9 +585,33 @@ async function classify(shots: Shot[], scene = false): Promise<VisionFrame[]> {
       skin: r(sc.skin),
       female: r(femaleScore(faces[j].map((f) => f.p), sc.femaleBody)),
       women,
-      ...(sceneScores ? { scene: r(sceneScores[j]) } : {}),
+      ...(kinds.some((k) => k !== PART.whole) ? { parts: kinds } : {}),
     });
   }
+  tl = lap('post', tl);
+  // The scene model looks only where the budget says (clip-budget): not at frames already decided
+  // by nudity or a located woman, and a few times per shot.
+  if (scene && clip) {
+    const asked: number[] = [];
+    for (let j = 0; j < n; j++) {
+      const f = frames[j];
+      let located = false;
+      for (let i = 4; i < f.women.length; i += 5) located ||= f.women[i] >= THRESHOLDS.female;
+      if (scene.want(f.t, shots[j].th ?? null, !!shots[j].cut, f.nude >= THRESHOLDS.nude || located)) asked.push(j);
+    }
+    T.clipLooks = (T.clipLooks ?? 0) + asked.length;
+    T.clipSkipped = (T.clipSkipped ?? 0) + n - asked.length;
+    if (asked.length) {
+      const sc = await sceneWomen(asked.map((j) => shots[j].bmp));
+      if (sc)
+        asked.forEach((j, i) => {
+          frames[j].scene = r(sc[i]);
+          scene.result(sc[i]);
+        });
+    }
+    tl = lap('clip', tl);
+  }
+  lap('classify', tc0);
   return frames;
 }
 
@@ -623,6 +702,15 @@ function edgeCuts(s: Session, e: Edge, closed: boolean): [number, number][] {
   return out;
 }
 
+/** How often the scene model may look, per session (clip-budget). */
+const clipBudgets = new WeakMap<Session, ClipBudget>();
+
+/** Seconds checked beyond the playhead of session `sid` (Infinity: it isn't the one being watched). */
+function aheadOf(sid: number, s: Session): number {
+  if (!pos || pos.session !== sid) return Infinity;
+  return Math.max(0, s.checked.endFrom(pos.time) - pos.time);
+}
+
 async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   const t0 = performance.now();
   const packets = g.packets.slice();
@@ -634,6 +722,8 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   const pending: Shot[] = [];
   const frames: VisionFrame[] = [];
   const shotsOf = new ShotTracker();
+  let budget = clipBudgets.get(s);
+  if (!budget) clipBudgets.set(s, (budget = new ClipBudget()));
   let lastT = -Infinity;
   let lastShot = -Infinity;
   let lastDur = 0;
@@ -651,19 +741,27 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   const TB = THUMB_W * THUMB_H * 4;
   const drain = () => {
     if (!slots.length) return;
+    const td = performance.now();
     const px = tc.getImageData(0, 0, THUMB_W, THUMB_H * slots.length).data;
+    T.drainFrames = (T.drainFrames ?? 0) + slots.length;
+    lap('thumbReadback', td);
+    const tt = performance.now();
     slots.forEach((x, i) => {
-      const { sample } = shotsOf.push(x.t, makeThumb(px.subarray(i * TB, (i + 1) * TB)));
+      const th = makeThumb(px.subarray(i * TB, (i + 1) * TB));
+      const { cut, sample } = shotsOf.push(x.t, th);
       if (sample && x.bmp) {
-        pending.push({ t: x.t, bmp: x.bmp });
+        pending.push({ t: x.t, bmp: x.bmp, th, cut });
         lastShot = Math.max(lastShot, x.t);
       } else x.bmp?.close();
     });
     slots.length = 0;
+    lap('shotTrack', tt);
   };
 
   const decoder = new VideoDecoder({
     output: (f) => {
+      const to = performance.now();
+      T.decodedFrames = (T.decodedFrames ?? 0) + 1;
       try {
         const t = ms(f.timestamp / 1e6);
         lastT = Math.max(lastT, t);
@@ -684,6 +782,7 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
         slots.push({ t, bmp });
       } finally {
         f.close();
+        lap('frameCb', to);
       }
       if (slots.length === THUMB_BATCH) drain();
     },
@@ -694,7 +793,8 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   const runBatch = async () => {
     const batch = pending.splice(0, B);
     try {
-      frames.push(...(await classify(batch, true)));
+      budget.mode = clipMode(budget.mode, aheadOf(sid, s), status.speed);
+      frames.push(...(await classify(batch, budget)));
       shots += batch.length;
     } finally {
       for (const x of batch) x.bmp.close();
@@ -742,21 +842,34 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
     post({ type: 'result', session: sid, from: spanFrom, to: spanTo, frames, cuts: shotsOf.cuts, cutRange: [g.start, spanTo], edges });
 
   status.frames += shots;
+  lap('analyse', t0);
   workSec += (performance.now() - t0) / 1000;
   mediaSec += Math.max(0, spanTo - spanFrom);
   status.speed = workSec > 0 ? mediaSec / workSec : 0;
 }
 
 let lastStatus = 0;
+let trailing: ReturnType<typeof setTimeout> | null = null;
 function updateStatus(force = false): void {
   const now = Date.now();
-  if (!force && now - lastStatus < 500) return;
+  if (!force && now - lastStatus < 500) {
+    // the last update of a burst must not be dropped (the status would stay stale until the next work)
+    trailing ??= setTimeout(() => {
+      trailing = null;
+      updateStatus(true);
+    }, 500);
+    return;
+  }
+  if (trailing) {
+    clearTimeout(trailing);
+    trailing = null;
+  }
   lastStatus = now;
   if (pos) {
     const s = sessions.get(pos.session);
     status.ahead = s ? Math.max(0, s.checked.endFrom(pos.time) - pos.time) : 0;
   }
-  post({ type: 'status', status: { ...status } });
+  post({ type: 'status', status: { ...status, timings: { ...T } } });
 }
 
 function setError(e: unknown): void {
@@ -768,13 +881,17 @@ function setError(e: unknown): void {
 async function releaseModels(): Promise<void> {
   const m = model;
   const gm = gender;
-  const cm = clip;
+  if (clip) {
+    clip.postMessage({ type: 'release' } satisfies ToClip);
+    const w = clip;
+    setTimeout(() => w.terminate(), 2000);
+  }
+  clip = null;
   model = null;
   gender = null;
-  clip = null;
   status.model = 'idle';
   status.backend = '-';
-  await Promise.all([m?.release(), gm?.release(), cm?.release()]).catch(() => undefined);
+  await Promise.all([m?.release(), gm?.release()]).catch(() => undefined);
 }
 
 setInterval(() => {

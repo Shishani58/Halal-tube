@@ -34,6 +34,8 @@ export interface VisionFrame {
   female: number;
   /** Women in the frame: flat [x, y, w, h, score, …], frame-relative (0–1), one rect each (a person: head and body). */
   women: number[];
+  /** Part of the person each `women` rect covers (vision-timeline PART: 1 head, 2 body); absent: 0 (whole). */
+  parts?: number[];
   /** MobileCLIP: how surely the frame shows women at all, wherever they are (video frames only). */
   scene?: number;
 }
@@ -48,6 +50,8 @@ export interface VisionStatus {
   speed: number;
   /** Seconds of video checked ahead of the playhead (contiguous). */
   ahead: number;
+  /** Cumulative milliseconds per pipeline stage since the worker started (profiling). */
+  timings?: Record<string, number>;
 }
 
 /** What the page reports about blurring (popup, badge). */

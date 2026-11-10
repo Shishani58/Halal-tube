@@ -32,6 +32,8 @@ export const VOICE_MIN_WINDOWS = 2;
  * them, score CLIP_WOMEN — one stray frame of a group of men doesn't blur their scene.
  */
 export const CLIP_MIN_FRAMES = 2;
+/** What a woman's rect covers (VisionFrame.parts): heads and bodies are kept as separate boxes. */
+export const PART = { whole: 0, head: 1, body: 2 } as const;
 export const CLIP_MIN_SHARE = 0.3;
 /**
  * Decisions are made per shot (the frames between two cuts): what is found anywhere in a shot holds
@@ -203,7 +205,7 @@ export class VisionTimeline {
       for (const r of womenOf(f, th)) looks.push({ t: f.t, r });
     }
     const rects: number[][] = [];
-    for (const person of people(looks)) rects.push(this.whereIs(person, t));
+    for (const person of people(looks)) rects.push([...this.whereIs(person, t), person[0].r[4]]);
     if (rects.length) return { verdict: 'region', rects, shot: a };
     // women seen in the picture, but not where they are: all of it
     const inRange = (idx: number[]) => idx.filter((i) => this.frames[i].t >= lo && this.frames[i].t < hi).length;
@@ -291,12 +293,17 @@ interface Look {
   r: number[];
 }
 
-/** Looks whose boxes overlap (directly or through others) are the same person. */
+/**
+ * Looks whose boxes overlap (directly or through others) are the same person — or the same part
+ * of her: heads go with heads and bodies with bodies. Mixed, a head seen a little lower in one
+ * frame overlaps the body of another, and the chain joins them into one box over the whole frame.
+ */
 function people(looks: Look[]): Look[][] {
   const parent = looks.map((_, i) => i);
   const root = (i: number): number => (parent[i] === i ? i : (parent[i] = root(parent[i])));
   for (let i = 0; i < looks.length; i++)
-    for (let j = i + 1; j < looks.length; j++) if (overlap(looks[i].r, looks[j].r) > 0.3) parent[root(i)] = root(j);
+    for (let j = i + 1; j < looks.length; j++)
+      if (looks[i].r[4] === looks[j].r[4] && overlap(looks[i].r, looks[j].r) > 0.3) parent[root(i)] = root(j);
   const groups = new Map<number, Look[]>();
   looks.forEach((l, i) => {
     const k = root(i);
@@ -328,11 +335,11 @@ function pad(r: number[]): number[] {
   return [x0, y0, x1 - x0, y1 - y0];
 }
 
-/** The women in a frame (score at least th), [x, y, w, h] each. */
+/** The women in a frame (score at least th), [x, y, w, h, part] each (PART). */
 function womenOf(f: VisionFrame, th: number): number[][] {
   const out: number[][] = [];
-  for (let j = 0; j + 4 < f.women.length; j += 5) {
-    if (f.women[j + 4] >= th) out.push([f.women[j], f.women[j + 1], f.women[j + 2], f.women[j + 3]]);
+  for (let j = 0, i = 0; j + 4 < f.women.length; j += 5, i++) {
+    if (f.women[j + 4] >= th) out.push([f.women[j], f.women[j + 1], f.women[j + 2], f.women[j + 3], f.parts?.[i] ?? PART.whole]);
   }
   return out;
 }
