@@ -32,8 +32,10 @@ export interface VisionFrame {
   skin: number;
   /** Most confident woman in the frame (0 when none). */
   female: number;
-  /** Women in the frame: flat [x, y, w, h, score, …], frame-relative (0–1), one whole person each. */
+  /** Women in the frame: flat [x, y, w, h, score, …], frame-relative (0–1), one rect each (a person: head and body). */
   women: number[];
+  /** MobileCLIP: how surely the frame shows women at all, wherever they are (video frames only). */
+  scene?: number;
 }
 
 export interface VisionStatus {

@@ -151,6 +151,17 @@ export class VisionController {
     }
   }
 
+  /** Voice pitch of an audio tile of this session (from the audio processor). */
+  onVoice(session: number, start: number, f0s: number[]): void {
+    let tl = this.timelines.get(session);
+    if (!tl) {
+      tl = new VisionTimeline();
+      this.timelines.set(session, tl);
+      if (this.timelines.size > MAX_TIMELINES) this.timelines.delete(this.timelines.keys().next().value!);
+    }
+    tl.addVoice(start, f0s);
+  }
+
   timeline(session: number): VisionTimeline | undefined {
     return this.timelines.get(session);
   }

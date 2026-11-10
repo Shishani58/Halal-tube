@@ -11,7 +11,9 @@ const test = process.argv.includes('--test');
 const dist = join(root, test ? 'dist-test' : 'dist');
 const watch = process.argv.includes('--watch');
 
-const MODELS = ['Kim_Vocal_2.onnx', 'nudenet-320n.onnx', 'genderage.onnx'];
+const MODELS = ['Kim_Vocal_2.onnx', 'nudenet-320n.onnx', 'genderage.onnx', 'mobileclip-s0-vision.onnx'];
+/** Faster fp16 variants, used when the GPU supports them (made by npm run fetch-model; optional). */
+const OPTIONAL_MODELS = ['Kim_Vocal_2.fp16.onnx'];
 const ORT_FILES = ['ort.webgpu.min.mjs', 'ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.asyncify.wasm'];
 
 function copyStatic() {
@@ -27,6 +29,12 @@ function copyStatic() {
     }
     const target = join(dist, 'models', name);
     if (!existsSync(target) || statSync(target).size !== statSync(model).size) copyFileSync(model, target);
+  }
+  for (const name of OPTIONAL_MODELS) {
+    const model = join(root, 'models', name);
+    const target = join(dist, 'models', name);
+    if (!existsSync(model)) console.warn(`\n⚠ ${name} not found: the slower fp32 model will be used. Run: npm run fetch-model\n`);
+    else if (!existsSync(target) || statSync(target).size !== statSync(model).size) copyFileSync(model, target);
   }
   // speech recognition for the profanity filter (optional: without it the filter reports an error)
   // ASR_BENCH=1 also ships the other downloaded sizes, for the benchmark page.

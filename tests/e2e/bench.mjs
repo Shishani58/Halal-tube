@@ -13,7 +13,7 @@ if (!sw) sw = await ctx.waitForEvent('serviceworker');
 const id = new URL(sw.url()).host;
 const page = await ctx.newPage();
 page.on('console', (m) => m.type() === 'error' && console.log('console:', m.text()));
-await page.goto(`chrome-extension://${id}/bench/bench.html?backends=${process.argv[2] ?? 'webgpu'}&iters=4`);
+await page.goto(`chrome-extension://${id}/bench/bench.html?backends=${process.argv[2] ?? 'webgpu'}&iters=4${process.argv[3] ? `&model=${process.argv[3]}` : ''}`);
 await page.waitForFunction(() => window.__bench, null, { timeout: 600000 });
 console.log(await page.textContent('#out'));
 await ctx.close();

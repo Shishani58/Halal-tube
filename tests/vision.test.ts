@@ -59,9 +59,11 @@ test('NudeNet faces: boxes + NMS; gender softmax; woman score', () => {
   put(3, 30, 30, 10, 10, 'FACE_MALE', 0.2); // below threshold
   const faces = detectFaces(out, 1, 0);
   assert(faces.length === 2 && Math.abs(faces[0].score - 0.9) < 1e-6 && Math.abs(faces[0].x - 80) < 1e-6 && Math.abs(faces[0].y - 75) < 1e-6, JSON.stringify(faces));
-  const c = faceCrop(faces[0]);
-  assert(Math.abs(c.side - 60) < 1e-6 && Math.abs(c.x - 70) < 1e-6 && Math.abs(c.y - 70) < 1e-6, JSON.stringify(c));
+  // the crop is wider than the box and higher (NudeNet's face box sits low)
+  const c = faceCrop(faces[0], { scale: 1.4, dy: -0.1 });
+  assert(Math.abs(c.side - 70) < 1e-6 && Math.abs(c.x - 65) < 1e-6 && Math.abs(c.y - 60) < 1e-6, JSON.stringify(c));
   assert(Math.abs(femaleProb(new Float32Array([2, 0, 0.3]), 0) - 0.8808) < 1e-3, 'softmax');
+  assert(Math.abs(femaleProb(new Float32Array([3, 0, 0.3, 0, 1, 0.3]), 0, 2) - 0.7311) < 1e-3, 'mean logit over crops');
   assert(femaleScore([0.2, 0.9], 0) === 0.9 && femaleScore([], 0.5) === 0 && femaleScore([0.1], 0.7) === 0.7, 'female score');
 });
 
@@ -104,6 +106,24 @@ test('VisionTimeline: needs the shot checked ahead; nudity blurs the whole frame
   // re-analysis replaces the cut list inside its range
   tl.add({ from: 3, to: 6, frames: [fr(4)], cuts: [], cutRange: [3, 6], edges: [] });
   assert(tl.cutTimes.length === 0 && tl.decide(3.4, { women: false }, 6).verdict === 'clear', 'cut taken back, nudity gone');
+});
+
+test('VisionTimeline: flickering weak "skin" on clothes is not nudity; steady skin is', () => {
+  // real scores of two men in dark jackets (youtube yKUPd7BW4P4, 157.8–164.8 s) that blurred 7 s of frame
+  const clothed = [0.464, 0.141, 0.179, 0.087, 0.203, 0.27, 0.451, 0.574, 0.197, 0.024, 0.197, 0.235, 0.299, 0.266, 0.341, 0.072, 0.058, 0.14, 0.427, 0.323, 0.299, 0.296, 0.374, 0.411, 0.514, 0.332, 0.289, 0.544, 0.389, 0.446, 0.467, 0.255, 0.349];
+  const tl = new VisionTimeline();
+  tl.add({ from: 0, to: 12, frames: clothed.map((s, i) => fr(i * 0.2, { skin: s })), cuts: [], cutRange: [0, 12], edges: [] });
+  for (const t of [0.1, 3, 6.4]) assert(tl.decide(t, { women: false }, 12).verdict === 'clear', `clothes at ${t}`);
+  // a bare torso: high on every look, or one very sure look
+  const bare = new VisionTimeline();
+  bare.add({ from: 0, to: 6, frames: [0, 1, 2, 3, 4, 5].map((t) => fr(t, { skin: t >= 2 && t < 5 ? 0.55 : 0 })).concat([fr(0.5), fr(1.5)]), cuts: [], cutRange: [0, 6], edges: [] });
+  assert(bare.decide(2.5, { women: false }, 6).verdict === 'clear', 'one look at 0.55 per second: not repeated enough');
+  const steady = new VisionTimeline();
+  steady.add({ from: 0, to: 6, frames: [0, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3].map((t) => fr(t, { skin: t >= 1 && t <= 1.5 ? 0.55 : 0 })), cuts: [], cutRange: [0, 6], edges: [] });
+  assert(steady.decide(1.2, { women: false }, 6).verdict === 'full', 'three looks at 0.55 within 0.75 s');
+  const sure = new VisionTimeline();
+  sure.add({ from: 0, to: 6, frames: [fr(0), fr(1, { skin: 0.7 }), fr(2), fr(3)], cuts: [], cutRange: [0, 6], edges: [] });
+  assert(sure.decide(2.5, { women: false }, 6).verdict === 'full', 'one look at 0.7');
 });
 
 test('VisionTimeline: a woman who stays put gets one still box; one who walks is followed', () => {
@@ -157,8 +177,10 @@ test('Thumbnails: one verdict per video, whatever the size', () => {
 
 test('Person regions from a face and body parts', () => {
   const face = { x: 0.45, y: 0.1, w: 0.1, h: 0.15 };
-  const r = personFromFace(face, [{ x: 0.3, y: 0.5, w: 0.15, h: 0.1 }, { x: 0.9, y: 0.5, w: 0.05, h: 0.05 }]);
-  assert(r.x <= 0.3 && r.x + r.w >= 0.62 && r.y <= 0.05 && r.y + r.h === 1, `hair, shoulders, body to the frame edge: ${JSON.stringify(r)}`);
+  const [head, r] = personFromFace(face, [{ x: 0.3, y: 0.5, w: 0.15, h: 0.1 }, { x: 0.9, y: 0.5, w: 0.05, h: 0.05 }]);
+  assert(head.y <= 0.01 && head.x <= 0.43 && head.x + head.w >= 0.57 && head.x > 0.35 && head.x + head.w < 0.65, `head with the hair, no wider: ${JSON.stringify(head)}`);
+  assert(r.y <= head.y + head.h && r.y >= 0.15, `body from the shoulders, touching the head: ${JSON.stringify(r)}`);
+  assert(r.x <= 0.3 && r.x + r.w >= 0.62 && r.y + r.h === 1, `shoulders, arms, body to the frame edge: ${JSON.stringify(r)}`);
   assert(r.x + r.w < 0.9, 'parts far to the side are someone else');
   const b = personFromBody({ x: 0.4, y: 0.5, w: 0.1, h: 0.1 });
   assert(b.y <= 0.25 && b.x <= 0.32 && b.x + b.w >= 0.58, `head above the chest: ${JSON.stringify(b)}`);

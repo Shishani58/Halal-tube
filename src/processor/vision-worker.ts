@@ -4,20 +4,26 @@
  * playback) and decodes it GOP by GOP with WebCodecs. Every decoded frame is shrunk to a 32×18
  * thumbnail to find shot cuts; frames are classified at each cut (the first frame of a new shot),
  * when the picture has changed enough since the last look, and at least every 0.5 s:
- *   1. NudeNet (YOLOv8n, WebGPU) on a 320×320 copy → nudity scores, face and body boxes;
- *   2. InsightFace genderage (1.3 MB, WASM) on each face crop → is it a woman, and where she is.
+ *   1. NudeNet (YOLOv8n, WebGPU) on a copy letterboxed to 320 px (320×192 for 16:9 video) →
+ *      nudity scores, face and body boxes;
+ *   2. InsightFace genderage (1.3 MB, WASM) on each face crop → is it a woman, and where she is;
+ *   3. MobileCLIP-S0 (45 MB, WebGPU) on three squares of the frame → are there women in it at all
+ *      (small or stylised figures the face pipeline can't see; the page blurs the whole frame).
  * Reports which time ranges were checked, where the cuts are and what was found where.
  *
- * Every frame has to be decoded (inter-frame coding), but only sampled frames are copied (on the
- * GPU, into an ImageBitmap) and only 320×320 + 96×96 face crops are read back; everything else is
- * closed right away. Decoding, detection and classification are pipelined in batches of 8, so at
- * most a couple of batches of frame copies exist at a time. Packets are dropped as soon as their
- * GOP is analysed.
+ * Every frame has to be decoded (inter-frame coding). Each one gets a GPU-side copy (an
+ * ImageBitmap, ≤ 960 px) and a thumbnail drawn into a strip; the strip of 16 thumbnails is read
+ * back at once, and copies of the frames not picked for classification are closed. GPU readbacks
+ * stall the worker, so they are batched everywhere: one per 16 thumbnails, one per 8 detector
+ * inputs, one per batch of face crops. Decoding, detection and classification are pipelined, so
+ * at most a few batches of frame copies exist at a time. Packets are dropped as soon as their GOP
+ * is analysed.
  */
 import { createDemuxer, type Demuxer, type Packet } from '../core/demux';
 import { IntervalSet } from '../core/intervals';
 import {
   BODY_CLASSES,
+  GENDER_CROPS,
   GENDER_INPUT as GS,
   GROUPS,
   FEMALE_BODY_MIN,
@@ -25,6 +31,7 @@ import {
   NUDENET_INPUT as S,
   detectBoxes,
   detectFaces,
+  detectorInput,
   faceCrop,
   femaleProb,
   femaleScore,
@@ -37,6 +44,7 @@ import {
   toFrame,
   type Rect,
 } from '../core/nudenet';
+import { CLIP_INPUT as CS, CLIP_VIEWS, clipFrameWomen, clipViews, rgbaToClip } from '../core/clip';
 import { ShotTracker, THUMB_H, THUMB_W, isEdgeCut, makeThumb, type Thumb } from '../core/shots';
 import type { FromVision, ToVision, VisionFrame, VisionStatus } from '../shared/vision-messages';
 import { loadModel, type LoadedModel } from './model';
@@ -45,16 +53,21 @@ declare const self: DedicatedWorkerGlobalScope;
 
 const DETECTOR_FILE = 'nudenet-320n.onnx';
 const GENDER_FILE = 'genderage.onnx';
-/** Faces per gender-classifier call. */
-const G = 8;
+const CLIP_FILE = 'mobileclip-s0-vision.onnx';
+/** Faces per gender-classifier call at most (GENDER_CROPS.length crops each). */
+const NC = GENDER_CROPS.length;
+const G = 8 * NC;
 /** Longest side of the frame copy kept for face crops. */
 const HI = 960;
-/** Faces the gender classifier calls a woman at least this surely are reported (the page applies the threshold). */
-const WOMAN_REPORT = 0.3;
+/**
+ * Faces the gender classifier calls a woman at least this surely are reported; the page applies
+ * the threshold, a lower one where a woman's voice is heard (vision-timeline FACE_FEMALE_*).
+ */
+const WOMAN_REPORT = 0.05;
 /** Analysed GOP edges remembered per session (cuts across GOP boundaries). */
 const MAX_EDGES = 256;
-/** Faces smaller than this (px in the HI copy) are too small to classify. */
-const MIN_FACE = 20;
+/** Faces smaller than this (longer box edge, px in the HI copy) are too small to classify. */
+const MIN_FACE = 17;
 /** A still-growing GOP under the playhead is re-analysed once this many new seconds arrived. */
 const PARTIAL_MIN = 1;
 /** …or, on its first pass, once it holds this much. */
@@ -124,6 +137,8 @@ const sessions = new Map<number, Session>();
 let pos: Extract<ToVision, { type: 'position' }> | null = null;
 let model: LoadedModel | null = null;
 let gender: LoadedModel | null = null;
+/** Optional: without it (file missing, failed to load) frames get no `women` scene score. */
+let clip: LoadedModel | null = null;
 let busy = false;
 /** Last time a GOP was analysed or the models became ready (idle release). */
 let lastWorkAt = Date.now();
@@ -286,8 +301,15 @@ async function initModel(): Promise<void> {
   updateStatus(true);
   try {
     model = await loadModel({ base, modelFile: DETECTOR_FILE, shape: [B, 3, S, S] });
+    // also compile the shaders for wide (16:9) video frames, the usual input
+    const wide = detectorInput([letterbox(16, 9)]);
+    await model.run(new Float32Array(B * 3 * wide.w * wide.h), [B, 3, wide.h, wide.w]);
     // tiny model, tiny inputs: CPU avoids GPU round trips and leaves the GPU to the detector
-    gender = await loadModel({ base, modelFile: GENDER_FILE, shape: [G, 3, GS, GS], backend: 'wasm' });
+    gender = await loadModel({ base, modelFile: GENDER_FILE, shape: [1, 3, GS, GS], backend: 'wasm' });
+    clip = await loadModel({ base, modelFile: CLIP_FILE, shape: [CLIP_VIEWS, 3, CS, CS] }).catch((e) => {
+      console.warn('[music-remover] scene model unavailable', e);
+      return null;
+    });
     status.model = 'ready';
     status.backend = model.backend;
     status.error = undefined;
@@ -345,10 +367,28 @@ function ctx(w: number, h: number): OffscreenCanvasRenderingContext2D {
   return new OffscreenCanvas(w, h).getContext('2d', { alpha: false })!;
 }
 let hiCtx: OffscreenCanvasRenderingContext2D | null = null;
-let loCtx: OffscreenCanvasRenderingContext2D | null = null;
+let detCtx: OffscreenCanvasRenderingContext2D | null = null;
 let faceCtx: OffscreenCanvasRenderingContext2D | null = null;
 const detIn = new Float32Array(B * 3 * S * S);
 const genIn = new Float32Array(G * 3 * GS * GS);
+let clipCtx: OffscreenCanvasRenderingContext2D | null = null;
+const clipIn = new Float32Array(B * CLIP_VIEWS * 3 * CS * CS);
+
+/** MobileCLIP women score of each frame (null without the model): views stacked, one readback. */
+async function sceneWomen(bmps: ImageBitmap[]): Promise<number[] | null> {
+  if (!clip || !bmps.length) return null;
+  const m = bmps.length * CLIP_VIEWS;
+  clipCtx ??= ctx(CS, CS * B * CLIP_VIEWS);
+  const c = clipCtx;
+  let i = 0;
+  for (const bmp of bmps)
+    for (const [x, y, side] of clipViews(bmp.width, bmp.height)) c.drawImage(bmp, x, y, side, side, 0, CS * i++, CS, CS);
+  const px = c.getImageData(0, 0, CS, CS * m).data;
+  const plane = CS * CS;
+  for (let k = 0; k < m; k++) rgbaToClip(px.subarray(k * plane * 4, (k + 1) * plane * 4), CS, clipIn, k * 3 * plane);
+  const out = await clip.run(clipIn, [m, 3, CS, CS]);
+  return bmps.map((_, j) => clipFrameWomen(out, j * CLIP_VIEWS));
+}
 
 async function pump(): Promise<void> {
   if (busy || !model || !gender) return;
@@ -377,6 +417,7 @@ async function pump(): Promise<void> {
     lastWorkAt = Date.now();
   } catch (e) {
     console.warn('[music-remover] GOP analysis failed', g.start, e);
+    status.error = 'DBG ' + (e instanceof Error ? e.stack ?? e.message : String(e)); // DBG
     if (g.closed) free(g);
     else g.analyzedCount = g.packets.length; // retry once more data arrives
     // a persistent failure (lost GPU device…) must show, not silently stop checking frames
@@ -393,48 +434,68 @@ async function pump(): Promise<void> {
   schedule();
 }
 
-/** Classify frames: nudity scores, face and body boxes, then the gender of each face. */
-async function classify(shots: Shot[]): Promise<VisionFrame[]> {
-  loCtx ??= ctx(S, S);
-  faceCtx ??= ctx(GS, GS);
-  const lo = loCtx, fc = faceCtx;
+/**
+ * Classify frames: nudity scores, face and body boxes, then the gender of each face.
+ * GPU readbacks stall the worker until the GPU catches up, so there are two per call, not one per
+ * frame and per face: all detector inputs are drawn stacked into one canvas, all face crops into
+ * another, and each is read back once.
+ */
+async function classify(shots: Shot[], scene = false): Promise<VisionFrame[]> {
   const n = shots.length;
   const boxes = shots.map((x) => letterbox(x.bmp.width, x.bmp.height));
-  for (let j = 0; j < n; j++) {
-    const { bmp } = shots[j];
-    const { dw, dh } = boxes[j];
-    lo.fillStyle = '#000';
-    lo.fillRect(0, 0, S, S);
-    lo.drawImage(bmp, 0, 0, dw, dh);
-    rgbaToChw(lo.getImageData(0, 0, S, S).data, S, detIn, j * 3 * S * S);
+  const { w: iw, h: ih } = detectorInput(boxes);
+  detCtx ??= ctx(S, S * B);
+  const det = detCtx;
+  if (det.canvas.width !== iw || det.canvas.height !== ih * B) {
+    det.canvas.width = iw;
+    det.canvas.height = ih * B;
   }
-  const out = await model!.run(detIn);
+  det.fillStyle = '#000';
+  det.fillRect(0, 0, iw, ih * n);
+  for (let j = 0; j < n; j++) det.drawImage(shots[j].bmp, 0, j * ih, boxes[j].dw, boxes[j].dh);
+  const px = det.getImageData(0, 0, iw, ih * n).data;
+  const plane = iw * ih;
+  for (let j = 0; j < n; j++) rgbaToChw(px.subarray(j * plane * 4, (j + 1) * plane * 4), iw, detIn, j * 3 * plane, ih);
+  // unused batch slots: whatever they held (the model's output for them is never read)
+  const out = await model!.run(detIn, [B, 3, ih, iw]);
   const scores = scoreFrames(out, B, n);
+  const sceneScores = scene ? await sceneWomen(shots.map((x) => x.bmp)) : null;
 
-  // face crops from the higher-resolution copies
-  const faces: { face: Rect; p: number }[][] = shots.map(() => []);
-  let queued: { j: number; face: Rect }[] = [];
-  const flush = async () => {
-    if (!queued.length) return;
-    const g = await gender!.run(genIn);
-    queued.forEach((o, i) => faces[o.j].push({ face: o.face, p: femaleProb(g, i) }));
-    queued = [];
-  };
+  // face crops from the higher-resolution copies (NC per face, consecutive), stacked, one readback
+  const queued: { j: number; face: Rect }[] = [];
+  const crops: { bmp: ImageBitmap; sx: number; sy: number; side: number }[] = [];
   for (let j = 0; j < n; j++) {
     const { bmp } = shots[j];
     const k = Math.max(bmp.width, bmp.height) / S;
     for (const box of detectFaces(out, B, j)) {
-      const c = faceCrop(box);
-      if (c.side * k < MIN_FACE) continue;
-      fc.fillStyle = '#000';
-      fc.fillRect(0, 0, GS, GS);
-      fc.drawImage(bmp, c.x * k, c.y * k, c.side * k, c.side * k, 0, 0, GS, GS);
-      rgbaToGenderInput(fc.getImageData(0, 0, GS, GS).data, GS, genIn, queued.length * 3 * GS * GS);
+      if (Math.max(box.w, box.h) * k < MIN_FACE) continue;
+      for (const crop of GENDER_CROPS) {
+        const c = faceCrop(box, crop);
+        crops.push({ bmp, sx: c.x * k, sy: c.y * k, side: c.side * k });
+      }
       queued.push({ j, face: toFrame(box, boxes[j].dw, boxes[j].dh) });
-      if (queued.length === G) await flush();
     }
   }
-  await flush();
+  const faces: { face: Rect; p: number }[][] = shots.map(() => []);
+  for (let i0 = 0; i0 < crops.length; i0 += G) {
+    const m = Math.min(G, crops.length - i0);
+    faceCtx ??= ctx(GS, GS * G);
+    const fc = faceCtx;
+    fc.fillStyle = '#000';
+    fc.fillRect(0, 0, GS, GS * m);
+    for (let i = 0; i < m; i++) {
+      const c = crops[i0 + i];
+      fc.drawImage(c.bmp, c.sx, c.sy, c.side, c.side, 0, i * GS, GS, GS);
+    }
+    const fpx = fc.getImageData(0, 0, GS, GS * m).data;
+    for (let i = 0; i < m; i++) rgbaToGenderInput(fpx.subarray(i * GS * GS * 4, (i + 1) * GS * GS * 4), GS, genIn, i * 3 * GS * GS);
+    // exactly as many crops as there are (CPU: the cost is per crop, unlike the GPU detector)
+    const g = await gender!.run(genIn, [m, 3, GS, GS]);
+    for (let i = 0; i < m; i += NC) {
+      const q = queued[(i0 + i) / NC];
+      faces[q.j].push({ face: q.face, p: femaleProb(g, i, NC) });
+    }
+  }
 
   const r = (x: number) => Math.round(x * 1000) / 1000;
   const frames: VisionFrame[] = [];
@@ -443,21 +504,25 @@ async function classify(shots: Shot[]): Promise<VisionFrame[]> {
     const { dw, dh } = boxes[j];
     const parts = detectBoxes(out, B, j, BODY_CLASSES, 0.3, 12).map((x) => toFrame(x, dw, dh));
     const women: number[] = [];
-    const regions: Rect[] = [];
-    for (const f of faces[j]) {
-      if (f.p < WOMAN_REPORT) continue;
-      const reg = personFromFace(f.face, parts);
-      regions.push(reg);
-      women.push(r(reg.x), r(reg.y), r(reg.w), r(reg.h), r(f.p));
-    }
-    // a woman's body without a face found (turned away, face cut off)
+    /** Each person's rects (head and body, or body alone) and their entries in `women`. */
+    const people: { rects: Rect[]; at: number[] }[] = [];
+    const add = (rects: Rect[], p: number) => {
+      const at: number[] = [];
+      for (const q of rects) {
+        at.push(women.length / 5);
+        women.push(r(q.x), r(q.y), r(q.w), r(q.h), r(p));
+      }
+      people.push({ rects, at });
+    };
+    for (const f of faces[j]) if (f.p >= WOMAN_REPORT) add(personFromFace(f.face, parts), f.p);
+    // a woman's body: makes the person it belongs to a woman; or one without a face found
+    // (turned away, face cut off)
     for (const x of detectBoxes(out, B, j, GROUPS.femaleBody, FEMALE_BODY_MIN, 4)) {
       const part = toFrame(x, dw, dh);
       const cx = part.x + part.w / 2, cy = part.y + part.h / 2;
-      if (regions.some((q) => cx >= q.x && cx <= q.x + q.w && cy >= q.y && cy <= q.y + q.h)) continue;
-      const reg = personFromBody(part);
-      regions.push(reg);
-      women.push(r(reg.x), r(reg.y), r(reg.w), r(reg.h), r(x.score));
+      const who = people.find((o) => o.rects.some((q) => cx >= q.x && cx <= q.x + q.w && cy >= q.y && cy <= q.y + q.h));
+      if (who) for (const i of who.at) women[i * 5 + 4] = Math.max(women[i * 5 + 4], r(x.score));
+      else add([personFromBody(part)], x.score);
     }
     frames.push({
       t: shots[j].t,
@@ -465,6 +530,7 @@ async function classify(shots: Shot[]): Promise<VisionFrame[]> {
       skin: r(sc.skin),
       female: r(femaleScore(faces[j].map((f) => f.p), sc.femaleBody)),
       women,
+      ...(sceneScores ? { scene: r(sceneScores[j]) } : {}),
     });
   }
   return frames;
@@ -534,17 +600,12 @@ async function analyseImages(): Promise<void> {
   }
 }
 
+/**
+ * Thumbnails of this many decoded frames are drawn into one strip and read back at once: a
+ * readback waits for the GPU, and one per frame took 60–80% of the analysis time.
+ */
+const THUMB_BATCH = 16;
 let thumbCtx: OffscreenCanvasRenderingContext2D | null = null;
-
-/** 32×18 thumbnail of a decoded frame (one tiny GPU readback). */
-function thumbOf(f: VideoFrame): Thumb {
-  if (!thumbCtx) {
-    thumbCtx = new OffscreenCanvas(THUMB_W, THUMB_H).getContext('2d', { alpha: false })!;
-    thumbCtx.imageSmoothingQuality = 'high';
-  }
-  thumbCtx.drawImage(f, 0, 0, THUMB_W, THUMB_H);
-  return makeThumb(thumbCtx.getImageData(0, 0, THUMB_W, THUMB_H).data);
-}
 
 const ms = (t: number) => Math.round(t * 1000) / 1000;
 
@@ -579,15 +640,38 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   let shots = 0;
   let failure: unknown = null;
 
+  if (!thumbCtx) {
+    thumbCtx = new OffscreenCanvas(THUMB_W, THUMB_H * THUMB_BATCH).getContext('2d', { alpha: false })!;
+    thumbCtx.imageSmoothingQuality = 'high';
+  }
+  const tc = thumbCtx;
+  // Frames whose thumbnail is drawn but not read yet. Whether a frame is classified is only known
+  // from its thumbnail, so each one (that could be) keeps a GPU-side copy until then.
+  const slots: { t: number; bmp: ImageBitmap | null }[] = [];
+  const TB = THUMB_W * THUMB_H * 4;
+  const drain = () => {
+    if (!slots.length) return;
+    const px = tc.getImageData(0, 0, THUMB_W, THUMB_H * slots.length).data;
+    slots.forEach((x, i) => {
+      const { sample } = shotsOf.push(x.t, makeThumb(px.subarray(i * TB, (i + 1) * TB)));
+      if (sample && x.bmp) {
+        pending.push({ t: x.t, bmp: x.bmp });
+        lastShot = Math.max(lastShot, x.t);
+      } else x.bmp?.close();
+    });
+    slots.length = 0;
+  };
+
   const decoder = new VideoDecoder({
     output: (f) => {
       try {
         const t = ms(f.timestamp / 1e6);
         lastT = Math.max(lastT, t);
         lastDur = (f.duration ?? 0) / 1e6 || lastDur;
-        const { sample } = shotsOf.push(t, thumbOf(f));
-        if (sample && t > from + 1e-3) {
-          // GPU-side copy at ≤ HI px; the VideoFrame can be released immediately
+        tc.drawImage(f, 0, slots.length * THUMB_H, THUMB_W, THUMB_H);
+        let bmp: ImageBitmap | null = null;
+        if (t > from + 1e-3) {
+          // GPU-side copy at ≤ HI px (no readback); the VideoFrame can be released immediately
           const k = Math.min(1, HI / Math.max(f.displayWidth, f.displayHeight));
           const w = Math.max(1, Math.round(f.displayWidth * k)), h = Math.max(1, Math.round(f.displayHeight * k));
           if (hc.canvas.width !== w || hc.canvas.height !== h) {
@@ -595,12 +679,13 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
             hc.canvas.height = h;
           }
           hc.drawImage(f, 0, 0, w, h);
-          pending.push({ t, bmp: (hc.canvas as OffscreenCanvas).transferToImageBitmap() });
-          lastShot = Math.max(lastShot, t);
+          bmp = (hc.canvas as OffscreenCanvas).transferToImageBitmap();
         }
+        slots.push({ t, bmp });
       } finally {
         f.close();
       }
+      if (slots.length === THUMB_BATCH) drain();
     },
     error: (e) => {
       failure = e;
@@ -609,7 +694,7 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
   const runBatch = async () => {
     const batch = pending.splice(0, B);
     try {
-      frames.push(...(await classify(batch)));
+      frames.push(...(await classify(batch, true)));
       shots += batch.length;
     } finally {
       for (const x of batch) x.bmp.close();
@@ -636,9 +721,11 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
     }
     if (!failure && decoder.state === 'configured') await decoder.flush();
     if (failure) throw failure;
+    drain();
     while (pending.length) await runBatch();
   } finally {
     for (const x of pending) x.bmp.close();
+    for (const x of slots) x.bmp?.close();
     if (decoder.state !== 'closed') decoder.close();
   }
 
@@ -681,11 +768,13 @@ function setError(e: unknown): void {
 async function releaseModels(): Promise<void> {
   const m = model;
   const gm = gender;
+  const cm = clip;
   model = null;
   gender = null;
+  clip = null;
   status.model = 'idle';
   status.backend = '-';
-  await Promise.all([m?.release(), gm?.release()]).catch(() => undefined);
+  await Promise.all([m?.release(), gm?.release(), cm?.release()]).catch(() => undefined);
 }
 
 setInterval(() => {

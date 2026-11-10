@@ -37,7 +37,8 @@ export class Tiling {
   }
 }
 
-export type RunModel = (input: Float32Array) => Promise<Float32Array>;
+/** Run a model on `input` (of `shape`, or the shape it was loaded with). */
+export type RunModel = (input: Float32Array, shape?: [number, number, number, number]) => Promise<Float32Array>;
 
 /** Run one model window: stereo input (chunkSize) → separated stereo output (genSize). */
 export async function separateWindow(

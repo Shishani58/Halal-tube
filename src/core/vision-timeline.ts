@@ -1,11 +1,38 @@
+import { CLIP_WOMEN } from './clip';
 import { IntervalSet } from './intervals';
+import { VOICE_STEP, voiceSex } from './voice';
 import type { VisionFrame } from '../shared/vision-messages';
 
 /**
  * Thresholds: nudity groups are NudeNet confidences (it reports detections from 0.2–0.25);
- * `female` is the gender classifier's probability that a visible face is a woman.
+ * `female` is the gender classifier's probability that a visible face is a woman; `femaleVoice`
+ * replaces it where mostly a woman's voice is heard (see VOICE_FEMALE_SHARE). On 231 labelled
+ * portraits: 0.3 finds 97.4% of women and takes 2.6% of men for women; 0.05 finds 98.3% / 7%.
  */
-export const THRESHOLDS = { nude: 0.3, skin: 0.4, female: 0.5 };
+export const THRESHOLDS = { nude: 0.3, skin: 0.65, skinWeak: 0.5, female: 0.3, femaleVoice: 0.05 };
+/**
+ * `skin` (bare torso / belly) is a weak signal: NudeNet takes a dark jacket over a printed T-shirt,
+ * or a sun-lit forearm, for it at 0.3–0.57 for seconds at a time (a clothed man in a car review
+ * blurred the whole frame for 7 s). One frame counts only at THRESHOLDS.skin; between skinWeak and
+ * that it takes SKIN_MIN_LOOKS looks within ±SKIN_WINDOW seconds — a bare torso scores high on
+ * every look, clothes flicker.
+ */
+export const SKIN_MIN_LOOKS = 3;
+export const SKIN_WINDOW = 0.75;
+/**
+ * A part of a shot sounds like a woman when at least this share of the windows with a voice in it
+ * are a woman's (by pitch), over at least VOICE_MIN_WINDOWS of them. A man's voice changes
+ * nothing: he may be asking a woman on screen.
+ */
+export const VOICE_FEMALE_SHARE = 0.7;
+export const VOICE_MIN_WINDOWS = 2;
+/**
+ * Women nobody located (MobileCLIP sees them, no face or body was found): the whole frame is
+ * blurred when at least CLIP_MIN_FRAMES looks in this part of the shot, and CLIP_MIN_SHARE of
+ * them, score CLIP_WOMEN — one stray frame of a group of men doesn't blur their scene.
+ */
+export const CLIP_MIN_FRAMES = 2;
+export const CLIP_MIN_SHARE = 0.3;
 /**
  * Decisions are made per shot (the frames between two cuts): what is found anywhere in a shot holds
  * for all of it, so a woman is hidden from the shot's first frame even if her face only shows later.
@@ -26,10 +53,12 @@ export const MOVE_WINDOW = 1.0;
 /** …grown by MOTION_MARGIN per second to the nearest look when she was only seen on one side of t. */
 export const MOTION_MARGIN = 0.25;
 /**
- * Margin around a person, as a share of her box (sides, top, bottom), at least MIN_MARGIN of the
- * frame: a seated woman's crossed legs or an arm reach out of the face-based estimate.
+ * Margin around a person's rect, as a share of its width (sides, top) and height (bottom), at least
+ * MIN_MARGIN of the frame: a seated woman's crossed legs or an arm reach out of the face-based
+ * estimate. The top goes by the width: a body rect is tall, and a margin by its height would
+ * reach up over the head beside it (the two would merge into one box covering the background).
  */
-export const PERSON_MARGIN = { x: 0.12, top: 0.04, bottom: 0.1 };
+export const PERSON_MARGIN = { x: 0.12, top: 0.03, bottom: 0.1 };
 export const MIN_MARGIN = 0.025;
 
 export interface BlurPolicy {
@@ -55,8 +84,11 @@ interface ShotInfo {
   key: string;
   /** Indices (into frames, ascending) of frames with nudity… */
   nude: number[];
-  /** …and with a woman. */
+  /** …with someone who may be a woman (at the lowest threshold)… */
   women: number[];
+  /** …and with a scene score: all of them, and those showing women. */
+  scene: number[];
+  sceneWomen: number[];
 }
 
 /**
@@ -67,6 +99,8 @@ export class VisionTimeline {
   readonly checked = new IntervalSet();
   private frames: VisionFrame[] = [];
   private cuts: number[] = [];
+  /** Voice pitch windows (start time, Hz; 0: no voice), ascending. */
+  private voice: { t: number; f0: number }[] = [];
   private version = 0;
   private shot: ShotInfo | null = null;
 
@@ -87,15 +121,41 @@ export class VisionTimeline {
     this.version++;
   }
 
+  /** Voice pitch of an audio tile: `f0s` every VOICE_STEP seconds from `start` (replaces what was known there). */
+  addVoice(start: number, f0s: number[]): void {
+    const end = start + f0s.length * VOICE_STEP;
+    const k = this.lowerBound(this.voice, start - 1e-3);
+    let e = k;
+    while (e < this.voice.length && this.voice[e].t < end - 1e-3) e++;
+    this.voice.splice(k, e - k, ...f0s.map((f0, i) => ({ t: start + i * VOICE_STEP, f0 })));
+    this.version++;
+  }
+
+  /** Mostly a woman's voice heard in [lo, hi). */
+  womanHeard(lo: number, hi: number): boolean {
+    let f = 0, m = 0;
+    for (let i = this.lowerBound(this.voice, lo - VOICE_STEP / 2); i < this.voice.length && this.voice[i].t < hi; i++) {
+      const s = voiceSex(this.voice[i].f0);
+      if (s === 'f') f++;
+      else if (s === 'm') m++;
+    }
+    return f >= VOICE_MIN_WINDOWS && f >= VOICE_FEMALE_SHARE * (f + m);
+  }
+
   private addCut(t: number): void {
     const k = this.lowerBound(this.cuts, t - 0.02);
     if (k < this.cuts.length && Math.abs(this.cuts[k] - t) <= 0.02) return;
     this.cuts.splice(k, 0, t);
   }
 
-  /** Debug: [t, nude, skin, female] rows. */
+  /** Debug: [t, nude, skin, female, scene (-1: none)] rows. */
   dump(): number[][] {
-    return this.frames.map((f) => [f.t, f.nude, f.skin, f.female]);
+    return this.frames.map((f) => [f.t, f.nude, f.skin, f.female, f.scene ?? -1]);
+  }
+
+  /** Debug: [t, Hz] voice pitch windows. */
+  voiceDump(): number[][] {
+    return this.voice.map((v) => [Math.round(v.t * 100) / 100, v.f0]);
   }
 
   get sampleCount(): number {
@@ -131,18 +191,25 @@ export class VisionTimeline {
     };
     const n = near(s.nude);
     if ((n.prev !== undefined && this.frames[n.prev].t >= lo) || (n.next !== undefined && this.frames[n.next].t < hi)) return { verdict: 'full', rects: [] };
-    if (!p.women || !s.women.length) return { verdict: 'clear', rects: [] };
+    if (!p.women) return { verdict: 'clear', rects: [] };
 
-    // every look at a woman in this part of the shot, grouped into people
+    // every look at a woman in this part of the shot, grouped into people; faces the classifier
+    // isn't sure about count when a woman's voice is heard
+    const th = this.womanHeard(lo, hi) ? THRESHOLDS.femaleVoice : THRESHOLDS.female;
     const looks: Look[] = [];
     for (const i of s.women) {
       const f = this.frames[i];
       if (f.t < lo || f.t >= hi) continue;
-      for (const r of womenOf(f)) looks.push({ t: f.t, r });
+      for (const r of womenOf(f, th)) looks.push({ t: f.t, r });
     }
     const rects: number[][] = [];
     for (const person of people(looks)) rects.push(this.whereIs(person, t));
-    return rects.length ? { verdict: 'region', rects, shot: a } : { verdict: 'clear', rects: [], shot: a };
+    if (rects.length) return { verdict: 'region', rects, shot: a };
+    // women seen in the picture, but not where they are: all of it
+    const inRange = (idx: number[]) => idx.filter((i) => this.frames[i].t >= lo && this.frames[i].t < hi).length;
+    const k = inRange(s.sceneWomen);
+    if (k >= CLIP_MIN_FRAMES && k >= CLIP_MIN_SHARE * inRange(s.scene)) return { verdict: 'full', rects: [], shot: a };
+    return { verdict: 'clear', rects: [], shot: a };
   }
 
   /** Where to blur one person (her looks in this part of the shot) at t. */
@@ -187,12 +254,23 @@ export class VisionTimeline {
     if (this.shot?.key === key) return this.shot;
     const nude: number[] = [];
     const women: number[] = [];
+    const scene: number[] = [];
+    const sceneWomen: number[] = [];
+    const weakSkin: number[] = [];
     for (let i = this.lowerBound(this.frames, a - 1e-4); i < this.frames.length && this.frames[i].t < b - 1e-4; i++) {
       const f = this.frames[i];
+      if (f.skin >= THRESHOLDS.skinWeak && f.skin < THRESHOLDS.skin) weakSkin.push(i);
       if (f.nude >= THRESHOLDS.nude || f.skin >= THRESHOLDS.skin) nude.push(i);
-      if (f.female >= THRESHOLDS.female && womenOf(f).length) women.push(i);
+      if (womenOf(f, Math.min(THRESHOLDS.female, THRESHOLDS.femaleVoice)).length) women.push(i);
+      if (f.scene !== undefined) {
+        scene.push(i);
+        if (f.scene >= CLIP_WOMEN) sceneWomen.push(i);
+      }
     }
-    this.shot = { key, nude, women };
+    // weak skin looks that repeat (this one included) count; keep `nude` ascending
+    const repeated = weakSkin.filter((i) => weakSkin.filter((j) => Math.abs(this.frames[j].t - this.frames[i].t) <= SKIN_WINDOW).length >= SKIN_MIN_LOOKS);
+    if (repeated.length) nude.push(...repeated.filter((i) => !nude.includes(i))), nude.sort((p, q) => p - q);
+    this.shot = { key, nude, women, scene, sceneWomen };
     return this.shot;
   }
 
@@ -245,16 +323,16 @@ export function area(r: number[]): number {
 function pad(r: number[]): number[] {
   const mx = Math.max(MIN_MARGIN, PERSON_MARGIN.x * r[2]);
   const x0 = Math.max(0, r[0] - mx), x1 = Math.min(1, r[0] + r[2] + mx);
-  const y0 = Math.max(0, r[1] - Math.max(MIN_MARGIN, PERSON_MARGIN.top * r[3]));
+  const y0 = Math.max(0, r[1] - Math.max(MIN_MARGIN, PERSON_MARGIN.top * r[2]));
   const y1 = Math.min(1, r[1] + r[3] + Math.max(MIN_MARGIN, PERSON_MARGIN.bottom * r[3]));
   return [x0, y0, x1 - x0, y1 - y0];
 }
 
-/** The women in a frame, [x, y, w, h] each. */
-function womenOf(f: VisionFrame): number[][] {
+/** The women in a frame (score at least th), [x, y, w, h] each. */
+function womenOf(f: VisionFrame, th: number): number[][] {
   const out: number[][] = [];
   for (let j = 0; j + 4 < f.women.length; j += 5) {
-    if (f.women[j + 4] >= THRESHOLDS.female) out.push([f.women[j], f.women[j + 1], f.women[j + 2], f.women[j + 3]]);
+    if (f.women[j + 4] >= th) out.push([f.women[j], f.women[j + 1], f.women[j + 2], f.women[j + 3]]);
   }
   return out;
 }

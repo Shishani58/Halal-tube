@@ -59,12 +59,22 @@ export function letterbox(w: number, h: number, size = NUDENET_INPUT): { dw: num
 }
 
 /**
- * RGBA bytes (size×size) → planar **BGR** floats in [0,1] at `out[offset…]`.
+ * Detector input size for a batch of letterboxed frames: just enough to hold the largest of them
+ * (multiples of 32, as YOLOv8 needs), not the full square — a 16:9 frame needs 320×192, 40% less
+ * work than 320×320 of which a third is black padding. Boxes come out in the same coordinates.
+ */
+export function detectorInput(sizes: { dw: number; dh: number }[], size = NUDENET_INPUT): { w: number; h: number } {
+  const up = (x: number) => Math.min(size, Math.max(32, Math.ceil(x / 32) * 32));
+  return { w: up(Math.max(0, ...sizes.map((s) => s.dw))), h: up(Math.max(0, ...sizes.map((s) => s.dh))) };
+}
+
+/**
+ * RGBA bytes (width×height, default square) → planar **BGR** floats in [0,1] at `out[offset…]`.
  * The model expects BGR: NudeNet's reference preprocessing swaps R/B twice
  * (cvtColor RGBA2BGR on a BGR image, then blobFromImage swapRB), so channels end up in BGR order.
  */
-export function rgbaToChw(rgba: Uint8ClampedArray | Uint8Array, size: number, out: Float32Array, offset = 0): void {
-  const n = size * size;
+export function rgbaToChw(rgba: Uint8ClampedArray | Uint8Array, width: number, out: Float32Array, offset = 0, height = width): void {
+  const n = width * height;
   const k = 1 / 255;
   for (let i = 0, j = 0; i < n; i++, j += 4) {
     out[offset + i] = rgba[j + 2] * k;
@@ -168,19 +178,23 @@ export function unionRect(a: Rect, b: Rect): Rect {
 }
 
 /**
- * The whole person around a face: hair and head above it, shoulders and arms to the sides (wide
- * enough for a seated person's crossed legs), the body below (about 7 head heights — a standing
- * person to the knees; cut off by the frame edge), grown further to take in detected body regions
- * that lie under the face.
+ * The person around a face, as two rects: [head, body]. One rect for both would also cover the
+ * background on either side of the head — on a close-up that is most of the frame. NudeNet's face
+ * box runs from the brows to below the chin, so the head (with the hair) reaches 0.65 box heights
+ * above it and 0.7 box widths to each side of its centre; the body starts at the shoulders, is
+ * wide enough for arms on a desk or crossed legs, and goes down about 8 head heights (a standing
+ * person to the knees; cut off by the frame edge), grown to take in detected body regions under
+ * the face.
  */
-export function personFromFace(face: Rect, parts: Rect[]): Rect {
+export function personFromFace(face: Rect, parts: Rect[]): [Rect, Rect] {
   const cx = face.x + face.w / 2;
-  let r: Rect = { x: cx - 2.2 * face.w, y: face.y - 0.6 * face.h, w: 4.4 * face.w, h: 8.6 * face.h };
+  const head: Rect = { x: cx - 0.7 * face.w, y: face.y - 0.65 * face.h, w: 1.4 * face.w, h: 1.55 * face.h };
+  let body: Rect = { x: cx - 2.2 * face.w, y: face.y + 0.85 * face.h, w: 4.4 * face.w, h: 8.15 * face.h };
   for (const p of parts) {
     const px = p.x + p.w / 2, py = p.y + p.h / 2;
-    if (Math.abs(px - cx) < 3.6 * face.w && py > face.y + face.h / 2 && py < face.y + 10 * face.h) r = unionRect(r, p);
+    if (Math.abs(px - cx) < 3.6 * face.w && py > face.y + face.h / 2 && py < face.y + 10 * face.h) body = unionRect(body, p);
   }
-  return clampRect(r);
+  return [clampRect(head), clampRect(body)];
 }
 
 /** A woman seen by her body alone (no face found): the region, grown to where the head and legs would be. */
@@ -196,15 +210,22 @@ function iou(a: Box, b: Box): number {
 }
 
 /**
- * NudeNet face boxes are looser than InsightFace's own detector, so the crop is 1.2× the longer
- * edge (not InsightFace's 1.5×). Tuned on portraits: 1.2 separates men / women best.
+ * Crops the gender classifier sees for each face; their logits are averaged. NudeNet's face box
+ * sits low (brows to below the chin), and the classifier wants the whole head (hair, forehead) the
+ * way InsightFace's own detector crops it — centred on the box it decides badly: a woman with her
+ * hair tied back came out a man at 0.04. Shifted up and wider, two crops: on 231 labelled
+ * portraits women found 90% → 97%, men taken for women 3.5% → 2.6% (at FACE_FEMALE_MIN).
+ * `scale`: side over the box's longer edge; `dy`: centre shift, in box heights (up < 0).
  */
-export const FACE_CROP_SCALE = 1.2;
+export const GENDER_CROPS = [
+  { scale: 1.4, dy: -0.1 },
+  { scale: 1.8, dy: -0.2 },
+] as const;
 
-/** Square crop around a face for the gender classifier (centred on the box). */
-export function faceCrop(box: Box): { x: number; y: number; side: number } {
-  const side = Math.max(box.w, box.h) * FACE_CROP_SCALE;
-  return { x: box.x + box.w / 2 - side / 2, y: box.y + box.h / 2 - side / 2, side };
+/** Square crop around a face for the gender classifier (one of GENDER_CROPS; default: the first). */
+export function faceCrop(box: Box, crop: { scale: number; dy: number } = GENDER_CROPS[0]): { x: number; y: number; side: number } {
+  const side = Math.max(box.w, box.h) * crop.scale;
+  return { x: box.x + box.w / 2 - side / 2, y: box.y + box.h / 2 + crop.dy * box.h - side / 2, side };
 }
 
 export const GENDER_INPUT = 96;
@@ -213,11 +234,11 @@ export const GENDER_INPUT = 96;
  * InsightFace genderage (input: RGB 0–255, planar, 96×96; it normalises internally).
  * Output [female, male, age/100] → probability the face is a woman.
  */
-export function femaleProb(out: Float32Array, i: number): number {
-  const f = out[i * 3], m = out[i * 3 + 1];
-  const mx = Math.max(f, m);
-  const ef = Math.exp(f - mx), em = Math.exp(m - mx);
-  return ef / (ef + em);
+export function femaleProb(out: Float32Array, i: number, n = 1): number {
+  // mean female − male logit over n consecutive crops of one face, then the sigmoid (= softmax of 2)
+  let d = 0;
+  for (let j = i; j < i + n; j++) d += out[j * 3] - out[j * 3 + 1];
+  return 1 / (1 + Math.exp(-d / n));
 }
 
 /** RGBA bytes (n×n) → planar RGB 0–255 floats, the gender classifier's input. */

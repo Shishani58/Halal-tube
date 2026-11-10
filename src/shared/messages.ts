@@ -67,6 +67,11 @@ export type FromWorker =
       cfg?: string;
       /** Profanity filter result for this tile (when it ran). */
       profanity?: TileProfanityReport;
+      /**
+       * Pitch of the voice (Hz, 0: nobody speaks) every VOICE_STEP seconds from `start`, measured
+       * on the separated vocals (only with music removal): a hint for blurring women.
+       */
+      voice?: number[];
     }
   /** Status of one media session (`session` set) or of the model only (no session yet). */
   | { type: 'status'; session?: number; status: WorkerStatus }

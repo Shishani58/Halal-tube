@@ -12,8 +12,8 @@ async function bench(backend: 'webgpu' | 'wasm', iters: number) {
   const base = new URL('../', location.href).href;
   log(`\n[${backend}] loading model…`);
   const t0 = performance.now();
-  const model = await loadModel({ base, modelFile: 'Kim_Vocal_2.onnx', shape: mdx.tensorShape, backend });
-  log(`[${backend}] loaded + warm-up in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  const model = await loadModel({ base, modelFile: 'Kim_Vocal_2.onnx', fp16File: params.get('fp16') === '0' ? undefined : 'Kim_Vocal_2.fp16.onnx', shape: mdx.tensorShape, backend });
+  log(`[${backend}${model.fp16 ? ', fp16' : ''}] loaded + warm-up in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
   const L = new Float32Array(mdx.chunkSize).map(() => (Math.random() - 0.5) * 0.2);
   const R = new Float32Array(mdx.chunkSize).map(() => (Math.random() - 0.5) * 0.2);
   const times: number[] = [];
@@ -32,7 +32,27 @@ async function bench(backend: 'webgpu' | 'wasm', iters: number) {
   const audio = (mdx.genSize / 44100) * 1000;
   const speed = audio / avg;
   log(`[${backend}] average ${avg.toFixed(0)} ms per ${(audio / 1000).toFixed(2)} s of audio → ${speed.toFixed(1)}× real time`);
-  return { backend: model.backend, avgMs: avg, speed };
+  return { backend: model.backend, fp16: model.fp16, avgMs: avg, speed };
+}
+
+/** Scene model (MobileCLIP-S0 image encoder): a batch of 8 frames × 3 views. */
+async function benchClip(backend: 'webgpu' | 'wasm', iters: number) {
+  const base = new URL('../', location.href).href;
+  log(`\n[clip ${backend}] loading model…`);
+  const t0 = performance.now();
+  const model = await loadModel({ base, modelFile: 'mobileclip-s0-vision.onnx', shape: [3, 3, 256, 256], backend });
+  log(`[clip ${backend}] loaded + warm-up in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  const n = 24;
+  const input = new Float32Array(n * 3 * 256 * 256).map(() => Math.random());
+  const times: number[] = [];
+  for (let i = 0; i < iters; i++) {
+    const a = performance.now();
+    await model.run(input, [n, 3, 256, 256]);
+    times.push(performance.now() - a);
+    log(`[clip ${backend}] ${n} views: ${times[i].toFixed(0)} ms`);
+  }
+  const avg = times.slice(1).reduce((x, y) => x + y, 0) / Math.max(1, times.length - 1);
+  return { model: 'clip', backend: model.backend, avgMs: avg, msPerView: avg / n };
 }
 
 const params = new URLSearchParams(location.search);
@@ -43,7 +63,7 @@ const results: unknown[] = [];
   log(`WebGPU available: ${'gpu' in navigator}`);
   for (const b of backends) {
     try {
-      results.push(await bench(b, iters));
+      results.push(params.get('model') === 'clip' ? await benchClip(b, iters) : await bench(b, iters));
     } catch (e) {
       log(`[${b}] failed: ${e instanceof Error ? e.message : String(e)}`);
       results.push({ backend: b, error: String(e) });

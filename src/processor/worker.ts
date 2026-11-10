@@ -10,9 +10,10 @@ import { KIM_VOCAL_2, MdxProcessor } from '../core/mdx';
 import { wordsIn } from '../core/captions';
 import type { Word } from '../core/profanity';
 import { resampleCubic } from '../core/resample';
-import { Tiling, separateWindow } from '../core/tiles';
+import { voicePitch } from '../core/voice';
+import { Tiling } from '../core/tiles';
 import { DEFAULT_FILTER, filterKey, type CaptionState, type FilterConfig, type FromWorker, type ToWorker, type WorkerStatus } from '../shared/messages';
-import { decodePackets } from './decode';
+import { decodePackets, type DecodedAudio } from './decode';
 import { loadModel, type LoadedModel } from './model';
 import { PacketStore } from './packet-store';
 import { CONTEXT_S, ProfanityStage } from './profanity-stage';
@@ -20,6 +21,7 @@ import { CONTEXT_S, ProfanityStage } from './profanity-stage';
 declare const self: DedicatedWorkerGlobalScope;
 
 const MODEL_FILE = 'Kim_Vocal_2.onnx';
+const MODEL_FP16_FILE = 'Kim_Vocal_2.fp16.onnx';
 const LOOKAHEAD_TILES = 16; // ≈ 92 s of clean audio prepared ahead
 const KEEP_BEHIND_S = 45;
 const MAX_SESSIONS = 8;
@@ -33,7 +35,7 @@ const CAPTIONS_WAIT_MS = 10_000;
 const base = new URL('../', self.location.href).href;
 const mdx = new MdxProcessor(KIM_VOCAL_2);
 const tiling = new Tiling(mdx);
-const scratch = new Float32Array(4 * KIM_VOCAL_2.dimF * KIM_VOCAL_2.dimT);
+const SPEC_SIZE = 4 * KIM_VOCAL_2.dimF * KIM_VOCAL_2.dimT;
 /** Model loads run one at a time (concurrent first session creation hangs ONNX Runtime). */
 let loadChain: Promise<unknown> = Promise.resolve();
 function serial<T>(load: () => Promise<T>): Promise<T> {
@@ -177,7 +179,7 @@ async function initModel(): Promise<void> {
   model$.error = undefined;
   updateStatus(true);
   try {
-    model = await serial(() => loadModel({ base, modelFile: MODEL_FILE, shape: mdx.tensorShape }));
+    model = await serial(() => loadModel({ base, modelFile: MODEL_FILE, fp16File: MODEL_FP16_FILE, shape: mdx.tensorShape }));
     modelEverLoaded = true;
     model$.model = 'ready';
     model$.backend = model.backend;
@@ -269,6 +271,7 @@ function pickFor(id: number, s: Session): TilePick | null {
     if (Number.isFinite(pos.duration) && pos.duration > 0 && tiling.tileStart(k) >= pos.duration) break;
     if (s.have.has(k)) continue;
     const key = `${id}:${k}`;
+    if (inflight.has(key)) continue;
     const sent = sentAt.get(key);
     if (sent && now - sent < 3000) continue; // page hasn't acknowledged yet
     const failed = failedAt.get(key);
@@ -300,52 +303,183 @@ function pickTile(): TilePick | null {
   return best;
 }
 
+/** A tile on its way through the pipeline: decoded and transformed, waiting for the model. */
+interface Job {
+  pick: TilePick;
+  key: string;
+  f: FilterConfig;
+  debug: boolean;
+  decoded: DecodedAudio;
+  /** Resampled model input window. */
+  L: Float32Array;
+  R: Float32Array;
+  /** Model input (spectrogram); only with music removal. */
+  spec?: Float32Array;
+  t0: number;
+}
+
+/** Tiles being computed right now (not picked again). */
+const inflight = new Set<string>();
+/** Spectrogram buffers (one per tile in the pipeline: at most two). */
+const specPool: Float32Array[] = [];
+/** When the last tile left the pipeline (throughput, `rtf`). */
+let lastDoneAt = 0;
+
+/** The tile is still worth computing (the viewer may have seeked meanwhile). */
+function stillWanted(pick: TilePick): boolean {
+  const s = sessions.get(pick.sessionId);
+  if (!s?.pos) return false;
+  const t = playhead(s);
+  return pick.k >= tiling.tileAt(t) && tiling.tileStart(pick.k) <= t + (LOOKAHEAD_TILES + 1) * tiling.tileSeconds;
+}
+
+/** Seconds of wall time until tile k of session `id` is heard. */
+function dueOf(pick: TilePick): number {
+  const s = sessions.get(pick.sessionId);
+  if (!s?.pos) return Infinity;
+  const rate = s.pos.rate > 0 ? s.pos.rate : 1;
+  return Math.max(0, tiling.tileStart(pick.k) - playhead(s)) / rate + (s.pos.playing ? 0 : 1000);
+}
+
+/** The tile's words come from speech recognition (which runs on the GPU too). */
+function usesAsr(job: Job): boolean {
+  const s = sessions.get(job.pick.sessionId);
+  return job.f.profanity !== 'off' && !!s && wordsFrom(s) === 'asr';
+}
+
+/** CPU part before the model: decode, resample, STFT. Null when the tile is no longer wanted. */
+async function prepare(pick: TilePick): Promise<Job | null> {
+  const s = sessions.get(pick.sessionId)!;
+  const key = `${pick.sessionId}:${pick.k}`;
+  const f = s.pos?.filter ?? DEFAULT_FILTER;
+  const t0 = performance.now();
+  const [a, b] = tiling.inputRange(pick.k);
+  const ctxS = f.profanity !== 'off' ? CONTEXT_S : 0; // speech recognition also hears around the tile
+  const decoded = await decodePackets(s.store.range(a - 0.12 - ctxS, b + 0.05 + ctxS));
+  if (!decoded) throw new Error('nothing decoded');
+  // The viewer may have seeked while this was being decoded: don't spend the model on a tile
+  // that is no longer ahead of the playhead.
+  if (!stillWanted(pick)) return null;
+  const L = resampleCubic(decoded.left, decoded.sampleRate, decoded.start, tiling.rate, a, tiling.chunkSize);
+  const R = resampleCubic(decoded.right, decoded.sampleRate, decoded.start, tiling.rate, a, tiling.chunkSize);
+  const spec = f.musicRemoval ? mdx.stft(L, R, specPool.pop() ?? new Float32Array(SPEC_SIZE)) : undefined;
+  return { pick, key, f, debug: !!s.pos?.debug, decoded, L, R, spec, t0 };
+}
+
+/** Pick and prepare the next tile (skipping ones that fail or are no longer wanted). */
+async function prepareNext(): Promise<Job | null> {
+  for (let tries = 0; tries < 4; tries++) {
+    const pick = pickTile();
+    if (!pick) return null;
+    const key = `${pick.sessionId}:${pick.k}`;
+    inflight.add(key);
+    try {
+      const job = await prepare(pick);
+      if (job) return job;
+      inflight.delete(key);
+    } catch (e) {
+      console.warn('[music-remover] tile failed', pick.k, e);
+      failedAt.set(key, Date.now());
+      inflight.delete(key);
+    }
+  }
+  return null;
+}
+
+function drop(job: Job): void {
+  inflight.delete(job.key);
+  if (job.spec) specPool.push(job.spec);
+  job.spec = undefined;
+}
+
+/** The model on a prepared tile (GPU). The spectrogram buffer goes back to the pool. */
+function infer(job: Job): Promise<Float32Array> {
+  const spec = job.spec!;
+  job.spec = undefined;
+  return model!.run(spec).finally(() => specPool.push(spec));
+}
+
+/** CPU part after the model: iSTFT, profanity filter, send. */
+async function finish(job: Job, pred: Float32Array | undefined): Promise<void> {
+  const { pick, key, f, debug, decoded, L, R } = job;
+  const { sessionId, k, validFrom } = pick;
+  const G = tiling.genSize, trim = tiling.trim;
+  const mixLeft = debug ? L.slice(trim, trim + G) : undefined;
+  const [left, right] = pred ? mdx.istftTrimmed(pred) : [L.slice(trim, trim + G), R.slice(trim, trim + G)];
+  // the voice's pitch on the vocals (before the profanity filter beeps over them)
+  const voice = f.musicRemoval ? voicePitch(left, right, tiling.rate) : undefined;
+  const { report, patch } =
+    f.profanity !== 'off'
+      ? await profanity.filterTile({ session: sessionId, k, start: tiling.tileStart(k), validFrom, rate: tiling.rate, left, right, decoded, separated: f.musicRemoval, mode: f.profanity, debug })
+      : {};
+  // throughput: tiles overlap in the pipeline, so count wall time since the previous one left
+  const now = performance.now();
+  const dt = (now - Math.max(job.t0, lastDoneAt)) / 1000;
+  lastDoneAt = now;
+  computeSec += dt;
+  audioSec += tiling.tileSeconds;
+  model$.tilesDone++;
+  model$.rtf = computeSec / audioSec;
+  sentAt.set(key, Date.now());
+  inflight.delete(key);
+  const transfer: Transferable[] = [left.buffer, right.buffer];
+  if (mixLeft) transfer.push(mixLeft.buffer);
+  post(
+    { type: 'tile', session: sessionId, k, start: tiling.tileStart(k), validFrom, sampleRate: tiling.rate, left, right, mixLeft, computeMs: (now - job.t0), cfg: filterKey(f), profanity: report, voice },
+    transfer,
+  );
+  if (patch) post({ ...patch, type: 'tile', session: sessionId, sampleRate: tiling.rate, cfg: filterKey(f) }, [patch.left.buffer, patch.right.buffer]);
+  updateStatus();
+}
+
+/**
+ * Two-stage pipeline: while the GPU runs the model on one tile, the CPU decodes and transforms
+ * the next one, and the next tile's model run starts before this tile's iSTFT. (Not with speech
+ * recognition, which needs the GPU after the separation: runs on the GPU never overlap.)
+ */
 async function pump(): Promise<void> {
   if (busy) return;
-  const pick = pickTile();
-  if (pick === null) return;
-  const { sessionId, k, validFrom } = pick;
-  const s = sessions.get(sessionId)!;
-  const debug = !!s.pos?.debug;
-  const f = s.pos?.filter ?? DEFAULT_FILTER;
   busy = true;
-  const key = `${sessionId}:${k}`;
+  let job: Job | null = null;
+  let next: Job | null = null;
   try {
-    const t0 = performance.now();
-    const [a, b] = tiling.inputRange(k);
-    const ctxS = f.profanity !== 'off' ? CONTEXT_S : 0; // speech recognition also hears around the tile
-    const decoded = await decodePackets(s.store.range(a - 0.12 - ctxS, b + 0.05 + ctxS));
-    if (!decoded) throw new Error('nothing decoded');
-    // The viewer may have seeked while this was being decoded: don't spend the model on a tile
-    // that is no longer ahead of the playhead.
-    if (s.pos && (k < tiling.tileAt(playhead(s)) || tiling.tileStart(k) > playhead(s) + (LOOKAHEAD_TILES + 1) * tiling.tileSeconds)) return;
-    const L = resampleCubic(decoded.left, decoded.sampleRate, decoded.start, tiling.rate, a, tiling.chunkSize);
-    const R = resampleCubic(decoded.right, decoded.sampleRate, decoded.start, tiling.rate, a, tiling.chunkSize);
-    const mixLeft = debug ? L.slice(tiling.trim, tiling.trim + tiling.genSize) : undefined;
-    const [left, right] = f.musicRemoval
-      ? await separateWindow(mdx, model!.run, L, R, scratch)
-      : [L.slice(tiling.trim, tiling.trim + tiling.genSize), R.slice(tiling.trim, tiling.trim + tiling.genSize)];
-    const { report, patch } =
-      f.profanity !== 'off'
-        ? await profanity.filterTile({ session: sessionId, k, start: tiling.tileStart(k), validFrom, rate: tiling.rate, left, right, decoded, separated: f.musicRemoval, mode: f.profanity, debug })
-        : {};
-    const dt = (performance.now() - t0) / 1000;
-    computeSec += dt;
-    audioSec += tiling.tileSeconds;
-    model$.tilesDone++;
-    model$.rtf = computeSec / audioSec;
-    sentAt.set(key, Date.now());
-    const transfer: Transferable[] = [left.buffer, right.buffer];
-    if (mixLeft) transfer.push(mixLeft.buffer);
-    post(
-      { type: 'tile', session: sessionId, k, start: tiling.tileStart(k), validFrom, sampleRate: tiling.rate, left, right, mixLeft, computeMs: dt * 1000, cfg: filterKey(f), profanity: report },
-      transfer,
-    );
-    if (patch) post({ ...patch, type: 'tile', session: sessionId, sampleRate: tiling.rate, cfg: filterKey(f) }, [patch.left.buffer, patch.right.buffer]);
-  } catch (e) {
-    console.warn('[music-remover] tile failed', k, e);
-    failedAt.set(key, Date.now());
+    job = await prepareNext();
+    let running = job?.spec ? infer(job) : null;
+    while (job) {
+      next = await prepareNext(); // CPU work while the GPU computes `job`
+      let pred: Float32Array | undefined;
+      try {
+        pred = running ? await running : undefined;
+      } catch (e) {
+        console.warn('[music-remover] tile failed', job.pick.k, e);
+        failedAt.set(job.key, Date.now());
+        drop(job);
+        job = null;
+      }
+      // a seek since `next` was picked: what is due now goes first
+      const better = next && pickTile();
+      if (next && (!stillWanted(next.pick) || (better && better.due < dueOf(next.pick) - tiling.tileSeconds))) {
+        drop(next);
+        next = await prepareNext();
+      }
+      let nextRunning: Promise<Float32Array> | null = null;
+      if (next?.spec && job && !usesAsr(job)) nextRunning = infer(next);
+      if (job) {
+        try {
+          await finish(job, pred);
+        } catch (e) {
+          console.warn('[music-remover] tile failed', job.pick.k, e);
+          failedAt.set(job.key, Date.now());
+          drop(job);
+        }
+      }
+      if (next?.spec && !nextRunning) nextRunning = infer(next);
+      job = next;
+      next = null;
+      running = nextRunning;
+    }
   } finally {
+    for (const j of [job, next]) if (j) drop(j);
     busy = false;
     schedule();
   }

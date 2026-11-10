@@ -2,7 +2,7 @@
 // each face crop. Usage: npx tsx tests/vision-calib.node.ts <dir of 640×640 letterboxed .rgba>
 import * as ort from 'onnxruntime-node';
 import { readFileSync, readdirSync } from 'node:fs';
-import { GENDER_INPUT, detectFaces, faceCrop, femaleProb, rgbaToChw, rgbaToGenderInput, scoreFrames } from '../src/core/nudenet';
+import { GENDER_CROPS, GENDER_INPUT, detectFaces, faceCrop, femaleProb, rgbaToChw, rgbaToGenderInput, scoreFrames } from '../src/core/nudenet';
 
 const dir = process.argv[2];
 const HI = 640; // fixture resolution; detector input is a 2× downscale of it
@@ -35,12 +35,14 @@ for (const f of readdirSync(dir).sort()) {
   const faces = detectFaces(o, 1, 0);
   const probs: string[] = [];
   for (const b of faces) {
-    const c = faceCrop(b);
-    const crop = resize(hi, HI, c.x * 2, c.y * 2, c.side * 2, GENDER_INPUT);
-    const inp = new Float32Array(3 * GENDER_INPUT * GENDER_INPUT);
-    rgbaToGenderInput(crop, GENDER_INPUT, inp);
-    const g = (await gen.run({ data: new ort.Tensor('float32', inp, [1, 3, GENDER_INPUT, GENDER_INPUT]) })).fc1.data as Float32Array;
-    probs.push(`${femaleProb(g, 0).toFixed(2)}(age ${Math.round(g[2] * 100)})`);
+    const n = GENDER_CROPS.length;
+    const inp = new Float32Array(n * 3 * GENDER_INPUT * GENDER_INPUT);
+    GENDER_CROPS.forEach((cr, i) => {
+      const c = faceCrop(b, cr);
+      rgbaToGenderInput(resize(hi, HI, c.x * 2, c.y * 2, c.side * 2, GENDER_INPUT), GENDER_INPUT, inp, i * 3 * GENDER_INPUT * GENDER_INPUT);
+    });
+    const g = (await gen.run({ data: new ort.Tensor('float32', inp, [n, 3, GENDER_INPUT, GENDER_INPUT]) })).fc1.data as Float32Array;
+    probs.push(`${femaleProb(g, 0, n).toFixed(2)}(age ${Math.round(g[2] * 100)})`);
   }
   console.log(f.slice(0, 32).padEnd(33), `nude=${sc.nude.toFixed(2)} skin=${sc.skin.toFixed(2)} faces=${faces.length} P(woman)=[${probs.join(' ')}]`);
 }

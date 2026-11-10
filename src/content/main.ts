@@ -198,6 +198,7 @@ declare global {
       } else if (msg.type === 'status') {
         if (msg.session === undefined || msg.session === player.session) workerStatus = msg.status;
       } else if (msg.type === 'tile') {
+        if (msg.voice) vision.onVoice(msg.session, msg.start, msg.voice);
         player.onTile(msg);
       }
     }
@@ -622,6 +623,10 @@ declare global {
       },
       visionCuts() {
         return vision.timeline(player.session)?.cutTimes ?? [];
+      },
+      /** [t, Hz] voice pitch windows (0: no voice). */
+      voice() {
+        return vision.timeline(player.session)?.voiceDump() ?? [];
       },
       tile(k: number) {
         const t = player.tiles.get(k);

@@ -3,9 +3,15 @@
 //  • NudeNet v3 320n (~12 MB, YOLOv8n): nudity + face detector for blurring
 //    (from the official PyPI wheel: the GitHub release asset now requires signing in);
 //  • InsightFace genderage (~1.3 MB, 96×96): man / woman classifier for detected faces
-//    (from the official buffalo_l release).
+//    (from the official buffalo_l release);
+//  • MobileCLIP-S0 image encoder (~45 MB, 256×256, Apple, via Xenova's ONNX export): are there
+//    women in the frame at all, for figures the face pipeline can't see.
+// Kim Vocal 2 is also converted to fp16 (models/Kim_Vocal_2.fp16.onnx, ~33 MB; scripts/make-fp16.py
+// in a Python venv under node_modules/.cache): on GPUs with shader-f16 it runs ~25% faster. Without
+// Python the extension uses the fp32 model everywhere.
 // Files inside zip archives are fetched with HTTP Range requests: only the central directory
 // and the one entry are downloaded, not the whole archive.
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, renameSync, writeFileSync } from 'node:fs';
 import { Readable } from 'node:stream';
@@ -31,6 +37,13 @@ const MODELS = [
     zipEntry: 'genderage.onnx',
     size: 1322532,
     sha256: '4fde69b1c810857b88c64a335084f1c3fe8f01246c9a191b48c7bb756d6652fb',
+  },
+  {
+    // image encoder only; the prompt embeddings are in src/core/clip-text.ts (scripts/make-clip-text.mjs)
+    name: 'mobileclip-s0-vision.onnx',
+    url: 'https://huggingface.co/Xenova/mobileclip_s0/resolve/main/onnx/vision_model.onnx',
+    size: 45543630,
+    sha256: '17d3c037b1d488c10c50e09f6009ea5a198caef4e0e8f4ea5617b7cb2d067ac0',
   },
 ];
 
@@ -92,4 +105,28 @@ for (const m of MODELS) {
   }
   renameSync(`${out}.part`, out);
   console.log(`✓ saved ${out} (${(size / 1e6).toFixed(1)} MB)`);
+}
+
+// fp16 variants (optional)
+const FP16 = [['Kim_Vocal_2.onnx', 'Kim_Vocal_2.fp16.onnx']];
+const venv = 'node_modules/.cache/onnx-venv';
+const py = `${venv}/bin/python`;
+for (const [src, dst] of FP16) {
+  const out = `models/${dst}`;
+  if (existsSync(out) && statSync(out).mtimeMs >= statSync(`models/${src}`).mtimeMs) {
+    console.log(`✓ ${out} already present`);
+    continue;
+  }
+  try {
+    if (!existsSync(py)) {
+      console.log(`Setting up ${venv} (onnx, onnxconverter-common) for the fp16 conversion …`);
+      execFileSync('python3', ['-m', 'venv', venv], { stdio: 'inherit' });
+      execFileSync(py, ['-m', 'pip', 'install', '-q', 'onnx', 'onnxconverter-common'], { stdio: 'inherit' });
+    }
+    execFileSync(py, ['-I', 'scripts/make-fp16.py', `models/${src}`, `${out}.part`], { stdio: ['ignore', 'inherit', 'ignore'] });
+    renameSync(`${out}.part`, out);
+    console.log(`✓ saved ${out} (${(statSync(out).size / 1e6).toFixed(1)} MB)`);
+  } catch (e) {
+    console.warn(`⚠ ${dst} not made (${e instanceof Error ? e.message.split('\n')[0] : e}): the fp32 model will be used everywhere.`);
+  }
 }
