@@ -18,7 +18,7 @@ fn rms(x: &[f32]) -> f64 {
 
 #[test]
 #[ignore = "needs the System Audio Recording permission; silences the system's output while it runs"]
-fn a_session_removes_a_tone_and_follows_the_strength() {
+fn a_session_removes_a_tone_survives_a_restart_and_follows_the_strength() {
     let model = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(mr_core::MODEL_FILE);
     if !model.exists() {
         eprintln!("skip: model not found");
@@ -51,7 +51,12 @@ fn a_session_removes_a_tone_and_follows_the_strength() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let mut player = Command::new("afplay").arg(&tone).spawn().expect("afplay");
-    std::thread::sleep(Duration::from_secs(7));
+    std::thread::sleep(Duration::from_secs(3));
+    // what a change of the default output device does: the output stream and the tap are made again
+    handle.restart_audio();
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(handle.stats.restarts.load(Ordering::Relaxed), 1, "the audio should have been reopened once");
+    assert_eq!(handle.stats.state(), LiveState::Running);
     handle.set_strength(0); // from now on the original is heard in full
     std::thread::sleep(Duration::from_secs(7));
     let _ = player.wait();
@@ -66,8 +71,8 @@ fn a_session_removes_a_tone_and_follows_the_strength() {
     // half) removes the tone, strength 0 % (second half) passes it.
     let level = |x: &[f32], from: f64, to: f64| rms(&x[(from * rate as f64) as usize..(to * rate as f64) as usize]);
     let (inp, out) = (&report.input.0, &report.output.0);
-    let first = (level(out, 3.0, 6.5), level(inp, 3.0, 6.5));
-    let second = (level(out, 11.0, 14.0), level(inp, 11.0, 14.0));
+    let first = (level(out, 4.5, 6.0), level(inp, 4.5, 6.0));
+    let second = (level(out, 9.5, 11.5), level(inp, 9.5, 11.5));
     eprintln!("100 %: output {:.4} vs input {:.4} · 0 %: output {:.4} vs input {:.4}", first.0, first.1, second.0, second.1);
     assert!(first.1 > 0.05, "the tone should have been captured: {}", first.1);
     assert!(first.0 < first.1 * 0.1, "the tone should be removed at 100 %");

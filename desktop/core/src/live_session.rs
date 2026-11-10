@@ -110,6 +110,10 @@ pub struct LiveStats {
     pub capture_rate: AtomicU32,
     /// Hops processed.
     pub runs: AtomicU64,
+    /// Times the audio was reopened because the output device changed (or a restart was asked for).
+    pub restarts: AtomicU64,
+    /// Asks the session to reopen the audio (the output stream and the tap) at the next check.
+    pub restart: AtomicBool,
     /// The GPU computed wrong numbers in the self-test and the CPU is used.
     pub gpu_check_failed: AtomicBool,
     pub backend: Mutex<String>,
@@ -170,6 +174,11 @@ impl LiveHandle {
         self.stats.strength.store(percent.min(100) as u32, Ordering::Relaxed);
     }
 
+    /// Reopens the output stream and the tap now (what a change of the default output device does by itself).
+    pub fn restart_audio(&self) {
+        self.stats.restart.store(true, Ordering::Relaxed);
+    }
+
     /// The thread has ended (stopped by itself, or failed).
     pub fn is_finished(&self) -> bool {
         self.join.as_ref().map(|j| j.is_finished()).unwrap_or(true)
@@ -215,62 +224,80 @@ pub fn start(cfg: LiveConfig) -> LiveHandle {
     LiveHandle { stats, stop, join: Some(join) }
 }
 
+/// The output side: the default device's stream, fed from a ring. Opening it also makes this
+/// process an audio client, which the tap needs in order to exclude it (what we play must not be
+/// captured again).
+struct Output {
+    _stream: cpal::Stream,
+    ring: Arc<Ring>,
+    armed: Arc<AtomicBool>,
+    rate: u32,
+    /// Which device it is on, to notice when the default output changes (headphones, AirPods).
+    device: String,
+}
+
+/// The default output device and its rate, as a key for "did it change".
+fn default_output_key() -> Option<String> {
+    let d = cpal::default_host().default_output_device()?;
+    let rate = d.default_output_config().ok()?.sample_rate().0;
+    Some(format!("{}@{rate}", d.name().unwrap_or_default()))
+}
+
+fn open_output() -> Result<Output, Error> {
+    let device = cpal::default_host().default_output_device().ok_or_else(|| Error::Capture("no output device".into()))?;
+    let dcfg = device.default_output_config().map_err(|e| Error::Capture(e.to_string()))?;
+    let rate = dcfg.sample_rate().0;
+    let out_ch = dcfg.channels() as usize;
+    let ring = Arc::new(Ring::new(rate as usize * 2 * 6));
+    let armed = Arc::new(AtomicBool::new(false));
+    let (r, a) = (ring.clone(), armed.clone());
+    let mut tmp = vec![0f32; 16384];
+    let stream = device
+        .build_output_stream(
+            &dcfg.config(),
+            move |data: &mut [f32], _| {
+                let frames = data.len() / out_ch;
+                if !a.load(Ordering::Relaxed) || tmp.len() < frames * 2 {
+                    data.fill(0.0);
+                    return;
+                }
+                r.pop_padded(&mut tmp[..frames * 2]);
+                for f in 0..frames {
+                    for c in 0..out_ch {
+                        data[f * out_ch + c] = if c < 2 { tmp[f * 2 + c] } else { 0.0 };
+                    }
+                }
+            },
+            |e| eprintln!("output stream error: {e}"),
+            None,
+        )
+        .map_err(|e| Error::Capture(format!("cannot open the output device: {e}")))?;
+    stream.play().map_err(|e| Error::Capture(e.to_string()))?;
+    Ok(Output { _stream: stream, ring, armed, rate, device: default_output_key().unwrap_or_default() })
+}
+
+fn start_capture(stats: &LiveStats, stop: &AtomicBool, mute: bool) -> Result<Capture, Error> {
+    stats.set_state(LiveState::StartingCapture);
+    // the process object of an audio client appears a moment after its stream opens
+    for _ in 0..40 {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        match Capture::start(mute, 4.0) {
+            Ok(c) => return Ok(c),
+            Err(Error::Capture(m)) if m.starts_with("not_audio_client") => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Capture("this process never became an audio client".into()))
+}
+
 fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut LiveReport) -> Result<(), Error> {
     stats.set_state(LiveState::Starting);
-    // ── output: the default device. Opening it also makes this process an audio client, which the
-    //    tap needs in order to exclude it (what we play must not be captured again).
-    let host = cpal::default_host();
-    let device = host.default_output_device().ok_or_else(|| Error::Capture("no output device".into()))?;
-    let dcfg = device.default_output_config().map_err(|e| Error::Capture(e.to_string()))?;
-    let out_rate = dcfg.sample_rate().0;
-    let out_ch = dcfg.channels() as usize;
-    let out_ring = Arc::new(Ring::new(out_rate as usize * 2 * 6));
-    let armed = Arc::new(AtomicBool::new(false));
-    let _stream = {
-        let (ring, armed) = (out_ring.clone(), armed.clone());
-        let mut tmp = vec![0f32; 16384];
-        let stream = device
-            .build_output_stream(
-                &dcfg.config(),
-                move |data: &mut [f32], _| {
-                    let frames = data.len() / out_ch;
-                    if !armed.load(Ordering::Relaxed) || tmp.len() < frames * 2 {
-                        data.fill(0.0);
-                        return;
-                    }
-                    ring.pop_padded(&mut tmp[..frames * 2]);
-                    for f in 0..frames {
-                        for c in 0..out_ch {
-                            data[f * out_ch + c] = if c < 2 { tmp[f * 2 + c] } else { 0.0 };
-                        }
-                    }
-                },
-                |e| eprintln!("output stream error: {e}"),
-                None,
-            )
-            .map_err(|e| Error::Capture(format!("cannot open the output device: {e}")))?;
-        stream.play().map_err(|e| Error::Capture(e.to_string()))?;
-        stream
-    };
-
-    let start_capture = |mute: bool| -> Result<Capture, Error> {
-        stats.set_state(LiveState::StartingCapture);
-        // the process object of an audio client appears a moment after its stream opens
-        for _ in 0..40 {
-            if stop.load(Ordering::Relaxed) {
-                return Err(Error::Cancelled);
-            }
-            match Capture::start(mute, 4.0) {
-                Ok(c) => return Ok(c),
-                Err(Error::Capture(m)) if m.starts_with("not_audio_client") => std::thread::sleep(Duration::from_millis(100)),
-                Err(e) => return Err(e),
-            }
-        }
-        Err(Error::Capture("this process never became an audio client".into()))
-    };
+    let mut out = open_output()?;
 
     if cfg.capture_only {
-        let cap = start_capture(false)?;
+        let cap = start_capture(stats, stop, false)?;
         stats.capture_rate.store(cap.sample_rate, Ordering::Relaxed);
         stats.set_state(LiveState::Running);
         let started = Instant::now();
@@ -308,13 +335,12 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
     // a model run is a few hundred ms of work: the output starts after a margin that covers a slow
     // run, so that it doesn't run dry between hops
     const MARGIN_S: f64 = 0.4;
-    let margin = (out_rate as f64 * MARGIN_S) as usize;
     stats.latency_ms.store(((live.latency() as f64 / model_rate as f64 + MARGIN_S + 0.3) * 1000.0) as u32, Ordering::Relaxed);
-    let mut from_model = StreamResampler::new(model_rate, out_rate)?;
+    let mut from_model = StreamResampler::new(model_rate, out.rate)?;
 
     // capture starts only now: audio heard while the model loaded would only add delay
-    let cap = start_capture(cfg.mute_original)?;
-    let mut cap_rate = cap.sample_rate;
+    let mut cap = Some(start_capture(stats, stop, cfg.mute_original)?);
+    let mut cap_rate = cap.as_ref().map(|c| c.sample_rate).unwrap_or(model_rate);
     stats.capture_rate.store(cap_rate, Ordering::Relaxed);
     let mut to_model = StreamResampler::new(cap_rate, model_rate)?;
     stats.set_state(LiveState::Running);
@@ -323,13 +349,31 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
     let (mut in_buf, mut l, mut r) = (vec![0f32; 4800 * 2], Vec::new(), Vec::new());
     let (mut ml, mut mr_, mut pl, mut pr, mut ol, mut or) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut began, mut last_slow) = (false, Instant::now());
-    let (mut last_rate_check, mut worst_ms, mut last_strength) = (Instant::now(), 0u32, stats.strength.load(Ordering::Relaxed));
+    let (mut last_check, mut worst_ms, mut last_strength) = (Instant::now(), 0u32, stats.strength.load(Ordering::Relaxed));
     let mut inter: Vec<f32> = Vec::new();
     while !stop.load(Ordering::Relaxed) && cfg.max_seconds.map(|m| started.elapsed().as_secs_f64() < m).unwrap_or(true) {
-        if last_rate_check.elapsed() >= Duration::from_millis(300) {
-            last_rate_check = Instant::now();
+        if last_check.elapsed() >= Duration::from_millis(300) {
+            last_check = Instant::now();
+            // the user plugged in headphones / switched to AirPods, or asked for a restart: the output
+            // stream and the tap (whose clock is the output device) are made again on the new default
+            let changed = default_output_key().map(|k| k != out.device).unwrap_or(false);
+            if changed || stats.restart.swap(false, Ordering::Relaxed) {
+                eprintln!("the output device changed: reopening the audio");
+                drop(cap.take()); // releases the tap first: the system's own output is heard while we switch
+                out = open_output()?;
+                from_model = StreamResampler::new(model_rate, out.rate)?;
+                began = false;
+                let c = start_capture(stats, stop, cfg.mute_original)?;
+                cap_rate = c.sample_rate;
+                stats.capture_rate.store(cap_rate, Ordering::Relaxed);
+                to_model = StreamResampler::new(cap_rate, model_rate)?;
+                cap = Some(c);
+                stats.set_state(LiveState::Running);
+                stats.restarts.fetch_add(1, Ordering::Relaxed);
+            }
+            let capture = cap.as_ref().expect("capture");
             // a player may switch the output device to the rate of its file (44.1 ↔ 48 kHz): follow it
-            let now = cap.current_rate();
+            let now = capture.current_rate();
             if now != cap_rate {
                 eprintln!("the capture rate changed: {cap_rate} → {now} Hz");
                 cap_rate = now;
@@ -341,11 +385,11 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
                 last_strength = pct;
                 live.set_options(opts(pct));
             }
-            stats.out_ring_ms.store((out_ring.len() as f64 / (out_rate as f64 * 2.0) * 1000.0) as u32, Ordering::Relaxed);
+            stats.out_ring_ms.store((out.ring.len() as f64 / (out.rate as f64 * 2.0) * 1000.0) as u32, Ordering::Relaxed);
             if cfg.playback {
-                stats.underruns.store(out_ring.underruns.load(Ordering::Relaxed), Ordering::Relaxed);
+                stats.underruns.store(out.ring.underruns.load(Ordering::Relaxed), Ordering::Relaxed);
             }
-            stats.overruns.store(cap.ring.overruns.load(Ordering::Relaxed), Ordering::Relaxed);
+            stats.overruns.store(capture.ring.overruns.load(Ordering::Relaxed), Ordering::Relaxed);
             stats.skipped_hops.store(live.skipped, Ordering::Relaxed);
         }
         if last_slow.elapsed() >= Duration::from_secs(5) {
@@ -353,7 +397,7 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
             last_slow = Instant::now();
             worst_ms = 0;
         }
-        let n = cap.ring.pop(&mut in_buf) / 2;
+        let n = cap.as_ref().expect("capture").ring.pop(&mut in_buf) / 2;
         if n == 0 {
             std::thread::sleep(Duration::from_millis(4));
             continue;
@@ -394,15 +438,15 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
         from_model.process(&pl, &pr, &mut ol, &mut or)?;
         if cfg.playback {
             if !began {
-                out_ring.push(&vec![0f32; margin * 2]);
+                out.ring.push(&vec![0f32; (out.rate as f64 * MARGIN_S) as usize * 2]);
             }
             inter.clear();
             inter.extend(ol.iter().zip(&or).flat_map(|(a, b)| [*a, *b]));
-            out_ring.push(&inter);
+            out.ring.push(&inter);
         }
         if !began {
             began = true;
-            armed.store(true, Ordering::Relaxed);
+            out.armed.store(true, Ordering::Relaxed);
         }
     }
     // dropping `cap` releases the tap: the system's own output is heard as before
