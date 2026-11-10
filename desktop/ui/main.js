@@ -162,6 +162,8 @@
   // ---------- live mode (macOS) ----------
   let liveView = { supported: false, state: 'off' };
   let liveTimer = 0;
+  let liveDevice = store.get('liveDevice', '');
+  let liveCapture = store.get('liveCapture', '');
   function renderLive() {
     const v = liveView;
     $('#live').hidden = !v.supported;
@@ -179,8 +181,10 @@
       text = t('liveRunning')(v.latency.toFixed(1).replace('.', lang === 'ru' ? ',' : '.'), Math.round(v.load * 100)) + (v.activity ? '' : ' · ' + t('liveQuiet')) + (v.gpuCheckFailed ? ' · ' + t('liveGpuWrong') : '');
     } else if (v.state === 'error') text = t('liveError')(v.errorMessage || v.errorCode || '');
     $('#live-status').textContent = text;
+    $('#live-device').disabled = on; // the device is chosen before starting
+    $('#live-capture').disabled = on;
     const help = $('#live-help');
-    help.textContent = t('liveHelp');
+    help.textContent = isMac ? t('liveHelp') : t('liveHelpWin');
     help.hidden = !(v.state === 'running' || v.state === 'error' || v.state === 'capture');
     if (on || v.state === 'error') { if (!liveTimer) liveTimer = setInterval(liveRefresh, 1000); }
     else if (liveTimer) { clearInterval(liveTimer); liveTimer = 0; }
@@ -188,9 +192,40 @@
   async function liveRefresh() { liveView = (await api.invoke('live_status')) || liveView; renderLive(); }
   $('#live-toggle').addEventListener('click', async () => {
     const on = liveView.state !== 'off' && liveView.state !== 'error';
-    liveView = (await api.invoke(on ? 'live_stop' : 'live_start', { strength })) || liveView;
+    liveView = (await api.invoke(on ? 'live_stop' : 'live_start', { strength, device: liveDevice || null, captureDevice: liveCapture || null })) || liveView;
     renderLive();
   });
+
+  async function fillDevices() {
+    const sel = $('#live-device');
+    const list = (await api.invoke('live_devices')) || [];
+    sel.innerHTML = '';
+    const def = document.createElement('option');
+    def.value = '';
+    def.textContent = t('liveDeviceDefault');
+    sel.appendChild(def);
+    for (const d of list) {
+      const o = document.createElement('option');
+      o.value = d.name;
+      o.textContent = d.name + (d.isDefault ? ' ★' : '');
+      sel.appendChild(o);
+    }
+    if (liveDevice && !list.some((d) => d.name === liveDevice)) liveDevice = ''; // gone since last time
+    sel.value = liveDevice;
+    sel.parentElement.hidden = list.length < 2; // one device: nothing to choose
+    if (!isMac) {
+      // Windows listens to one render device (a virtual cable) and plays to another
+      const cap = $('#live-capture');
+      cap.innerHTML = '';
+      for (const d of list) { const o = document.createElement('option'); o.value = d.name; o.textContent = d.name; cap.appendChild(o); }
+      if (!list.some((d) => d.name === liveCapture)) liveCapture = list[0] ? list[0].name : '';
+      cap.value = liveCapture;
+      $('#live-capture-row').hidden = false;
+      sel.parentElement.hidden = false;
+    }
+  }
+  $('#live-capture').addEventListener('change', (e) => { liveCapture = e.target.value; store.set('liveCapture', liveCapture); });
+  $('#live-device').addEventListener('change', (e) => { liveDevice = e.target.value; store.set('liveDevice', liveDevice); });
 
   const strengthEl = $('#strength');
   const renderStrength = () => {
@@ -233,6 +268,7 @@
     engine = await api.invoke('engine_status');
     renderEngine();
     await liveRefresh();
+    await fillDevices();
     (await api.invoke('list_jobs')).forEach(upsert);
     syncLayout();
     takePending();
@@ -256,6 +292,7 @@
         if (cmd === 'engine_status') return params.has('empty') ? { state: 'idle' } : { state: 'ready', backend: 'CoreML' };
         if (cmd === 'list_jobs') return params.has('empty') ? [] : demo.map((d) => ({ id: id++, input: '/Users/me/Movies/' + d.name, output: '/Users/me/Movies/x', ...d }));
         if (cmd === 'take_pending_files') return [];
+        if (cmd === 'live_devices') return [{ name: 'MacBook Pro Speakers', isDefault: true }, { name: 'AirPods', isDefault: false }];
         if (cmd === 'live_status') return liveDemo;
         if (cmd === 'live_start') return (liveDemo = { supported: true, state: 'running', backend: 'CoreML', latency: 1.8, load: 0.27, activity: true, strength: args.strength });
         if (cmd === 'live_stop') return (liveDemo = { supported: true, state: 'off' });

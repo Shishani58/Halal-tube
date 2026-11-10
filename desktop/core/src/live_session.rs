@@ -30,6 +30,10 @@ pub struct LiveConfig {
     pub model_path: PathBuf,
     pub cache_dir: Option<PathBuf>,
     pub prefer: Option<Backend>,
+    /// The output device to play to (and whose clock the capture runs on), by its name; None: the system's default.
+    pub output_device: Option<String>,
+    /// Windows only: the render device to listen to (loopback), different from `output_device`; see capture_win.rs.
+    pub capture_device: Option<String>,
     /// How often the model runs, seconds (1: ~25 % of a CoreML GPU, latency ~1.8 s).
     pub hop_s: f64,
     pub keep_plain_speech: bool,
@@ -49,11 +53,23 @@ pub struct LiveConfig {
 }
 
 impl LiveConfig {
+    /// What the capture is pointed at: on macOS the device whose clock it runs on (the one played to), on
+    /// Windows the render device whose output is listened to.
+    fn capture_target(&self) -> Option<&str> {
+        if cfg!(windows) {
+            self.capture_device.as_deref()
+        } else {
+            self.output_device.as_deref()
+        }
+    }
+
     pub fn new(model_path: PathBuf, cache_dir: Option<PathBuf>) -> Self {
         LiveConfig {
             model_path,
             cache_dir,
             prefer: None,
+            output_device: None,
+            capture_device: None,
             hop_s: 1.0,
             keep_plain_speech: true,
             strength: 100,
@@ -236,15 +252,43 @@ struct Output {
     device: String,
 }
 
-/// The default output device and its rate, as a key for "did it change".
-fn default_output_key() -> Option<String> {
-    let d = cpal::default_host().default_output_device()?;
+/// An output device the user can play to.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct OutputDevice {
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// The output devices of this Mac, the default one marked.
+pub fn list_output_devices() -> Vec<OutputDevice> {
+    let host = cpal::default_host();
+    let default = host.default_output_device().and_then(|d| d.name().ok());
+    host.output_devices()
+        .map(|it| it.filter_map(|d| d.name().ok()).map(|name| OutputDevice { is_default: Some(&name) == default.as_ref(), name }).collect())
+        .unwrap_or_default()
+}
+
+/// The device called `name` (None: the default one).
+fn find_output(name: Option<&str>) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    match name {
+        Some(n) => host.output_devices().ok()?.find(|d| d.name().ok().as_deref() == Some(n)),
+        None => host.default_output_device(),
+    }
+}
+
+/// The chosen (or default) output device and its rate, as a key for "did it change".
+fn output_key(name: Option<&str>) -> Option<String> {
+    let d = find_output(name)?;
     let rate = d.default_output_config().ok()?.sample_rate().0;
     Some(format!("{}@{rate}", d.name().unwrap_or_default()))
 }
 
-fn open_output() -> Result<Output, Error> {
-    let device = cpal::default_host().default_output_device().ok_or_else(|| Error::Capture("no output device".into()))?;
+fn open_output(name: Option<&str>) -> Result<Output, Error> {
+    let device = find_output(name).ok_or_else(|| Error::Capture(match name {
+        Some(n) => format!("the output device \"{n}\" was not found"),
+        None => "no output device".into(),
+    }))?;
     let dcfg = device.default_output_config().map_err(|e| Error::Capture(e.to_string()))?;
     let rate = dcfg.sample_rate().0;
     let out_ch = dcfg.channels() as usize;
@@ -273,17 +317,17 @@ fn open_output() -> Result<Output, Error> {
         )
         .map_err(|e| Error::Capture(format!("cannot open the output device: {e}")))?;
     stream.play().map_err(|e| Error::Capture(e.to_string()))?;
-    Ok(Output { _stream: stream, ring, armed, rate, device: default_output_key().unwrap_or_default() })
+    Ok(Output { _stream: stream, ring, armed, rate, device: output_key(name).unwrap_or_default() })
 }
 
-fn start_capture(stats: &LiveStats, stop: &AtomicBool, mute: bool) -> Result<Capture, Error> {
+fn start_capture(stats: &LiveStats, stop: &AtomicBool, mute: bool, device: Option<&str>) -> Result<Capture, Error> {
     stats.set_state(LiveState::StartingCapture);
     // the process object of an audio client appears a moment after its stream opens
     for _ in 0..40 {
         if stop.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
-        match Capture::start(mute, 4.0) {
+        match Capture::start(mute, 4.0, device) {
             Ok(c) => return Ok(c),
             Err(Error::Capture(m)) if m.starts_with("not_audio_client") => std::thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(e),
@@ -294,10 +338,10 @@ fn start_capture(stats: &LiveStats, stop: &AtomicBool, mute: bool) -> Result<Cap
 
 fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut LiveReport) -> Result<(), Error> {
     stats.set_state(LiveState::Starting);
-    let mut out = open_output()?;
+    let mut out = open_output(cfg.output_device.as_deref())?;
 
     if cfg.capture_only {
-        let cap = start_capture(stats, stop, false)?;
+        let cap = start_capture(stats, stop, false, cfg.capture_target())?;
         stats.capture_rate.store(cap.sample_rate, Ordering::Relaxed);
         stats.set_state(LiveState::Running);
         let started = Instant::now();
@@ -339,7 +383,7 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
     let mut from_model = StreamResampler::new(model_rate, out.rate)?;
 
     // capture starts only now: audio heard while the model loaded would only add delay
-    let mut cap = Some(start_capture(stats, stop, cfg.mute_original)?);
+    let mut cap = Some(start_capture(stats, stop, cfg.mute_original, cfg.capture_target())?);
     let mut cap_rate = cap.as_ref().map(|c| c.sample_rate).unwrap_or(model_rate);
     stats.capture_rate.store(cap_rate, Ordering::Relaxed);
     let mut to_model = StreamResampler::new(cap_rate, model_rate)?;
@@ -356,14 +400,14 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
             last_check = Instant::now();
             // the user plugged in headphones / switched to AirPods, or asked for a restart: the output
             // stream and the tap (whose clock is the output device) are made again on the new default
-            let changed = default_output_key().map(|k| k != out.device).unwrap_or(false);
+            let changed = output_key(cfg.output_device.as_deref()).map(|k| k != out.device).unwrap_or(false);
             if changed || stats.restart.swap(false, Ordering::Relaxed) {
                 eprintln!("the output device changed: reopening the audio");
                 drop(cap.take()); // releases the tap first: the system's own output is heard while we switch
-                out = open_output()?;
+                out = open_output(cfg.output_device.as_deref())?;
                 from_model = StreamResampler::new(model_rate, out.rate)?;
                 began = false;
-                let c = start_capture(stats, stop, cfg.mute_original)?;
+                let c = start_capture(stats, stop, cfg.mute_original, cfg.capture_target())?;
                 cap_rate = c.sample_rate;
                 stats.capture_rate.store(cap_rate, Ordering::Relaxed);
                 to_model = StreamResampler::new(cap_rate, model_rate)?;

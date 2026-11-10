@@ -13,7 +13,7 @@ use std::sync::Arc;
 type Callback = extern "C" fn(*const f32, u32, u32, *mut c_void);
 
 extern "C" {
-    fn mr_tap_start(cb: Callback, ctx: *mut c_void, mute_original: i32, sample_rate: *mut f64, channels: *mut u32, status: *mut i32, err: *mut c_char, err_len: usize) -> *mut c_void;
+    fn mr_tap_start(cb: Callback, ctx: *mut c_void, mute_original: i32, output_name: *const c_char, sample_rate: *mut f64, channels: *mut u32, status: *mut i32, err: *mut c_char, err_len: usize) -> *mut c_void;
     fn mr_tap_rate(tap: *mut c_void) -> f64;
     fn mr_tap_stop(tap: *mut c_void);
 }
@@ -61,13 +61,14 @@ impl Capture {
     /// Starts capturing. This process must already be an audio client (an output stream is open),
     /// or it can't be excluded from the tap: the error then says so and the caller may retry.
     /// `ring_seconds`: how much captured audio the ring holds.
-    pub fn start(mute_original: bool, ring_seconds: f64) -> Result<Capture, Error> {
+    pub fn start(mute_original: bool, ring_seconds: f64, output_name: Option<&str>) -> Result<Capture, Error> {
+        let name = output_name.map(|n| std::ffi::CString::new(n).map_err(|_| Error::Capture("bad device name".into()))).transpose()?;
         // the rate isn't known before the tap exists: room for 192 kHz stereo
         let ring = Arc::new(Ring::new((ring_seconds * 192_000.0 * 2.0) as usize));
         let ctx = Box::into_raw(Box::new(Ctx { ring: ring.clone() }));
         let (mut rate, mut channels, mut status) = (0f64, 0u32, 0i32);
         let mut err = [0 as c_char; 256];
-        let tap = unsafe { mr_tap_start(on_audio, ctx as *mut c_void, mute_original as i32, &mut rate, &mut channels, &mut status, err.as_mut_ptr(), err.len()) };
+        let tap = unsafe { mr_tap_start(on_audio, ctx as *mut c_void, mute_original as i32, name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()), &mut rate, &mut channels, &mut status, err.as_mut_ptr(), err.len()) };
         if tap.is_null() {
             drop(unsafe { Box::from_raw(ctx) });
             let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }.to_string_lossy().to_string();

@@ -9,9 +9,12 @@
 
 #[cfg(target_os = "macos")]
 pub mod capture;
+#[cfg(target_os = "windows")]
+#[path = "capture_win.rs"]
+pub mod capture;
 pub mod job;
 pub mod live;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod live_session;
 pub mod mdx;
 pub mod media;

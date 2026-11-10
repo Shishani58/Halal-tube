@@ -27,7 +27,35 @@ static BOOL getProp(AudioObjectID obj, AudioObjectPropertySelector sel, UInt32 q
     return AudioObjectGetPropertyData(obj, &a, qsize, q, size, out) == noErr;
 }
 
-MrTap *mr_tap_start(MrTapCallback cb, void *ctx, int mute_original, double *sample_rate, uint32_t *channels, int32_t *status, char *err, size_t err_len) {
+/// The UID of the output device called `name` (as listed by Core Audio), or nil.
+static NSString *outputUIDNamed(const char *name) {
+    UInt32 size = 0;
+    AudioObjectPropertyAddress all = {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &all, 0, NULL, &size) != noErr || size == 0) return nil;
+    AudioObjectID *ids = malloc(size);
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &all, 0, NULL, &size, ids) != noErr) { free(ids); return nil; }
+    NSString *want = [NSString stringWithUTF8String:name];
+    NSString *found = nil;
+    for (UInt32 i = 0; i < size / sizeof(AudioObjectID) && !found; i++) {
+        CFStringRef n = NULL;
+        UInt32 s = sizeof(n);
+        AudioObjectPropertyAddress na = {kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+        if (AudioObjectGetPropertyData(ids[i], &na, 0, NULL, &s, &n) != noErr || !n) continue;
+        BOOL match = [(__bridge NSString *)n isEqualToString:want];
+        CFRelease(n);
+        if (!match) continue;
+        UInt32 cs = 0;
+        AudioObjectPropertyAddress out = {kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain};
+        if (AudioObjectGetPropertyDataSize(ids[i], &out, 0, NULL, &cs) != noErr || cs == 0) continue;
+        CFStringRef uid = NULL;
+        s = sizeof(uid);
+        if (getProp(ids[i], kAudioDevicePropertyDeviceUID, 0, NULL, &uid, &s) && uid) found = (__bridge_transfer NSString *)uid;
+    }
+    free(ids);
+    return found;
+}
+
+MrTap *mr_tap_start(MrTapCallback cb, void *ctx, int mute_original, const char *output_name, double *sample_rate, uint32_t *channels, int32_t *status, char *err, size_t err_len) {
     if (@available(macOS 14.2, *)) {
         // our own audio object: the tap must not hear what this process plays
         pid_t pid = getpid();
@@ -50,18 +78,26 @@ MrTap *mr_tap_start(MrTapCallback cb, void *ctx, int mute_original, double *samp
             return NULL;
         }
 
-        // the aggregate device needs a clock: the default output device
-        AudioObjectID outDev = kAudioObjectUnknown;
-        size = sizeof(outDev);
-        CFStringRef uidRef = NULL;
-        UInt32 usize = sizeof(uidRef);
-        if (!getProp(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultSystemOutputDevice, 0, NULL, &outDev, &size) ||
-            !getProp(outDev, kAudioDevicePropertyDeviceUID, 0, NULL, &uidRef, &usize) || !uidRef) {
+        // the aggregate device needs a clock: the chosen output device, else the default one
+        NSString *outUID = (output_name && output_name[0]) ? outputUIDNamed(output_name) : nil;
+        if (output_name && output_name[0] && !outUID) {
             AudioHardwareDestroyProcessTap(tap);
-            fail(err, err_len, status, -1, "no default output device");
+            fail(err, err_len, status, -3, "the chosen output device was not found");
             return NULL;
         }
-        NSString *outUID = (__bridge_transfer NSString *)uidRef;
+        if (!outUID) {
+            AudioObjectID outDev = kAudioObjectUnknown;
+            size = sizeof(outDev);
+            CFStringRef uidRef = NULL;
+            UInt32 usize = sizeof(uidRef);
+            if (!getProp(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultSystemOutputDevice, 0, NULL, &outDev, &size) ||
+                !getProp(outDev, kAudioDevicePropertyDeviceUID, 0, NULL, &uidRef, &usize) || !uidRef) {
+                AudioHardwareDestroyProcessTap(tap);
+                fail(err, err_len, status, -1, "no default output device");
+                return NULL;
+            }
+            outUID = (__bridge_transfer NSString *)uidRef;
+        }
         NSString *tapUID = desc.UUID.UUIDString;
         NSDictionary *dict = @{
             @kAudioAggregateDeviceNameKey: @"Music Remover tap",

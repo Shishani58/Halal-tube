@@ -39,7 +39,7 @@ fn rms_and_peak(cap: &Capture, secs: f64) -> (f64, f32) {
 fn the_tap_hears_what_the_system_plays_and_only_that() {
     let _client = become_audio_client();
     let cap = (0..30)
-        .find_map(|_| match Capture::start(false, 4.0) {
+        .find_map(|_| match Capture::start(false, 4.0, None) {
             Ok(c) => Some(c),
             Err(_) => {
                 std::thread::sleep(Duration::from_millis(100));

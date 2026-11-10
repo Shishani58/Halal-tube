@@ -7,16 +7,16 @@ use tauri::{AppHandle, Manager, State};
 
 #[derive(Default)]
 pub struct LiveSlot {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     handle: Mutex<Option<mr_core::live_session::LiveHandle>>,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     _unused: Mutex<()>,
 }
 
 impl LiveSlot {
     /// Stops a running session (the app is closing): the system's own output is heard again.
     pub fn shutdown(&self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let Some(h) = self.handle.lock().unwrap().take() {
             h.stop();
         }
@@ -42,7 +42,7 @@ pub struct LiveView {
     gpu_check_failed: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn view_of(slot: &LiveSlot) -> LiveView {
     use mr_core::live_session::LiveState;
     use std::sync::atomic::Ordering;
@@ -73,9 +73,20 @@ fn view_of(slot: &LiveSlot) -> LiveView {
     view
 }
 
+/// Output devices the sound can be played to (the default one marked); empty off macOS.
+#[tauri::command]
+pub fn live_devices() -> Vec<serde_json::Value> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        mr_core::live_session::list_output_devices().into_iter().map(|d| serde_json::json!({ "name": d.name, "isDefault": d.is_default })).collect()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    Vec::new()
+}
+
 #[tauri::command(async)]
-pub fn live_start(app: AppHandle, slot: State<LiveSlot>, strength: u8) -> LiveView {
-    #[cfg(target_os = "macos")]
+pub fn live_start(app: AppHandle, slot: State<LiveSlot>, strength: u8, device: Option<String>, capture_device: Option<String>) -> LiveView {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         use mr_core::live_session::{self, LiveConfig};
         {
@@ -90,13 +101,15 @@ pub fn live_start(app: AppHandle, slot: State<LiveSlot>, strength: u8) -> LiveVi
             let cache = app.path().app_cache_dir().ok().map(|d| d.join("coreml"));
             let mut cfg = LiveConfig::new(crate::model_path(&app), cache);
             cfg.strength = strength.min(100);
+            cfg.output_device = device.filter(|d| !d.is_empty());
+            cfg.capture_device = capture_device.filter(|d| !d.is_empty());
             *guard = Some(live_session::start(cfg));
         }
         return view_of(&slot);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (&app, &slot, strength);
+        let _ = (&app, &slot, strength, &device, &capture_device);
         LiveView { supported: false, state: "off", ..Default::default() }
     }
 }
@@ -109,11 +122,11 @@ pub fn live_stop(slot: State<LiveSlot>) -> LiveView {
 
 #[tauri::command]
 pub fn live_status(slot: State<LiveSlot>) -> LiveView {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         view_of(&slot)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = &slot;
         LiveView { supported: false, state: "off", ..Default::default() }
@@ -122,10 +135,10 @@ pub fn live_status(slot: State<LiveSlot>) -> LiveView {
 
 #[tauri::command]
 pub fn live_set_strength(slot: State<LiveSlot>, strength: u8) {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Some(h) = slot.handle.lock().unwrap().as_ref() {
         h.set_strength(strength);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = (&slot, strength);
 }

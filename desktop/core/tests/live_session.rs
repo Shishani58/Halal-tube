@@ -79,3 +79,59 @@ fn a_session_removes_a_tone_survives_a_restart_and_follows_the_strength() {
     assert!(second.0 > second.1 * 0.5, "the tone should pass at 0 %");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_unknown_output_device_is_an_error_not_a_silent_fallback() {
+    let model = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(mr_core::MODEL_FILE);
+    let mut cfg = LiveConfig::new(model, None);
+    cfg.output_device = Some("No Such Device 123".into());
+    let handle = live_session::start(cfg);
+    let t = Instant::now();
+    while handle.stats.state() != LiveState::Error {
+        assert!(t.elapsed() < Duration::from_secs(10), "should fail at once");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (_, msg) = handle.stats.error.lock().unwrap().clone().expect("an error message");
+    assert!(msg.contains("No Such Device 123"), "{msg}");
+}
+
+#[test]
+#[ignore = "needs the System Audio Recording permission; silences the system's output while it runs"]
+fn playing_to_a_device_chosen_by_name_works() {
+    let model = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(mr_core::MODEL_FILE);
+    if !model.exists() {
+        return;
+    }
+    let devices = live_session::list_output_devices();
+    let Some(device) = devices.iter().find(|d| d.is_default).or(devices.first()) else { return };
+    eprintln!("devices: {devices:?}");
+    let dir = std::env::temp_dir().join(format!("mr-live-dev-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tone = dir.join("tone.wav");
+    if !Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=8", "-ar", "44100", "-ac", "2"]).arg(&tone).status().map(|s| s.success()).unwrap_or(false) {
+        return;
+    }
+    let mut cfg = LiveConfig::new(model, Some(dir.join("cache")));
+    cfg.output_device = Some(device.name.clone());
+    cfg.playback = false;
+    cfg.record_output = true;
+    cfg.record_input = true;
+    cfg.keep_plain_speech = false;
+    let handle = live_session::start(cfg);
+    let t = Instant::now();
+    while handle.stats.state() != LiveState::Running {
+        assert!(handle.stats.state() != LiveState::Error, "failed: {:?}", handle.stats.error.lock().unwrap());
+        assert!(t.elapsed() < Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut player = Command::new("afplay").arg(&tone).spawn().unwrap();
+    std::thread::sleep(Duration::from_secs(8));
+    let _ = player.wait();
+    let report = handle.stop();
+    let rate = report.model_rate as usize;
+    let (a, b) = (3 * rate, 6 * rate);
+    let (out, inp) = (rms(&report.output.0[a..b]), rms(&report.input.0[a..b]));
+    eprintln!("named device {:?}: output {out:.4} vs input {inp:.4}", device.name);
+    assert!(inp > 0.05 && out < inp * 0.1, "the tone should be captured and removed");
+    let _ = std::fs::remove_dir_all(&dir);
+}

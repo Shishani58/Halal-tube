@@ -413,6 +413,7 @@ fn main() {
             remove_job,
             clear_finished,
             take_pending_files,
+            live::live_devices,
             live::live_start,
             live::live_stop,
             live::live_status,

@@ -34,3 +34,4 @@ cc = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ort = { version = "=2.0.0-rc.15", features = ["directml"] }
+cpal = "=0.15.3"

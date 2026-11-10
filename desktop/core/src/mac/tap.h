@@ -14,7 +14,9 @@ typedef void (*MrTapCallback)(const float *samples, uint32_t frames, uint32_t ch
 /// (have opened an output stream) so that it can be excluded from the tap; otherwise returns NULL
 /// with `*status` = 1. Returns NULL on failure with the OSStatus (or 1 for "not an audio client yet",
 /// 2 for "macOS too old") in `*status` and a message in `err`.
-MrTap *mr_tap_start(MrTapCallback cb, void *ctx, int mute_original, double *sample_rate, uint32_t *channels, int32_t *status, char *err, size_t err_len);
+/// `output_name`: the output device whose clock the capture runs on and which the caller plays to
+/// (NULL: the system's default output). The tap hears everything the system plays, whichever device it goes to.
+MrTap *mr_tap_start(MrTapCallback cb, void *ctx, int mute_original, const char *output_name, double *sample_rate, uint32_t *channels, int32_t *status, char *err, size_t err_len);
 
 /// The rate blocks arrive at now: the aggregate device's clock, which follows the output device and
 /// changes when a player switches the device to the rate of its file (0 if unknown).

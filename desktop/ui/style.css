@@ -192,3 +192,5 @@ h2 { margin: 0; font-size: 11.5px; font-weight: 650; text-transform: uppercase; 
 .live-btn.on { background: var(--bar-bg); color: var(--ink); }
 .live.err .live-text span { color: var(--danger); }
 .live-help { margin: 10px 0 0; font-size: 12px; line-height: 1.45; }
+.live-device { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12.5px; }
+.live-device select { font: inherit; padding: 3px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); max-width: 260px; }

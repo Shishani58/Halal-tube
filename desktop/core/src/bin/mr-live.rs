@@ -1,8 +1,10 @@
-//! Live mode, command line: removes the music from everything the Mac plays, as it plays (macOS 14.2+).
+//! Live mode, command line: removes the music from everything the computer plays, as it plays
+//! (macOS 14.2+; Windows: untested, see capture_win.rs).
 //!
 //! ```text
 //! mr-live [--hop S] [--strength 0-100] [--no-passthrough] [--keep-original] [--seconds N]
 //!         [--record FILE.wav] [--no-playback] [--capture-test] [--cpu|--gpu] [--model PATH]
+//!         [--device NAME] [--list-devices] [--capture-device NAME (Windows)]
 //! ```
 //! System audio → tap (the system's own output of it is silenced) → resample to 44.1 kHz → the
 //! sliding-window separator (live.rs) → resample back → the default output device. The first sound
@@ -11,18 +13,18 @@
 //! `--no-playback` plays nothing (the original is silenced too), `--capture-test` only measures
 //! what the tap hears.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn main() {
-    eprintln!("mr-live works on macOS only for now");
+    eprintln!("mr-live works on macOS and Windows only");
     std::process::exit(2);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn main() {
     mac::main();
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod mac {
     use mr_core::live_session::{self, LiveConfig, LiveState};
     use mr_core::model::Backend;
@@ -82,6 +84,14 @@ mod mac {
                 "--record" => record = args.next(),
                 "--record-input" => record_input = args.next(),
                 "--no-playback" => cfg.playback = false,
+                "--device" => cfg.output_device = args.next(),
+                "--capture-device" => cfg.capture_device = args.next(),
+                "--list-devices" => {
+                    for d in live_session::list_output_devices() {
+                        println!("{}{}", d.name, if d.is_default { "  (default)" } else { "" });
+                    }
+                    return;
+                }
                 "--capture-test" => cfg.capture_only = true,
                 other => fail(&format!("unknown option {other}")),
             }
