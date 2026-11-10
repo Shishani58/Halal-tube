@@ -41,6 +41,7 @@
     document.querySelectorAll('.lang button').forEach((b) => b.classList.toggle('on', b.dataset.lang === lang));
     renderDest();
     renderStrength();
+    renderLive();
     renderEngine();
     jobs.forEach((j) => renderJob(j));
   }
@@ -158,13 +159,46 @@
     const d = await api.pickFolder();
     if (typeof d === 'string' && d) { outDir = d; store.set('outDir', d); renderDest(); }
   });
+  // ---------- live mode (macOS) ----------
+  let liveView = { supported: false, state: 'off' };
+  let liveTimer = 0;
+  function renderLive() {
+    const v = liveView;
+    $('#live').hidden = !v.supported;
+    if (!v.supported) return;
+    const on = v.state !== 'off' && v.state !== 'error';
+    const btn = $('#live-toggle');
+    btn.textContent = on ? t('liveOff') : t('liveOn');
+    btn.classList.toggle('on', on);
+    $('#live').classList.toggle('err', v.state === 'error');
+    let text = t('liveIdle');
+    if (v.state === 'starting') text = t('liveStarting');
+    else if (v.state === 'loading') text = t('liveLoading');
+    else if (v.state === 'capture') text = t('liveCapture');
+    else if (v.state === 'running') {
+      text = t('liveRunning')(v.latency.toFixed(1).replace('.', lang === 'ru' ? ',' : '.'), Math.round(v.load * 100)) + (v.activity ? '' : ' · ' + t('liveQuiet')) + (v.gpuCheckFailed ? ' · ' + t('liveGpuWrong') : '');
+    } else if (v.state === 'error') text = t('liveError')(v.errorMessage || v.errorCode || '');
+    $('#live-status').textContent = text;
+    const help = $('#live-help');
+    help.textContent = t('liveHelp');
+    help.hidden = !(v.state === 'running' || v.state === 'error' || v.state === 'capture');
+    if (on || v.state === 'error') { if (!liveTimer) liveTimer = setInterval(liveRefresh, 1000); }
+    else if (liveTimer) { clearInterval(liveTimer); liveTimer = 0; }
+  }
+  async function liveRefresh() { liveView = (await api.invoke('live_status')) || liveView; renderLive(); }
+  $('#live-toggle').addEventListener('click', async () => {
+    const on = liveView.state !== 'off' && liveView.state !== 'error';
+    liveView = (await api.invoke(on ? 'live_stop' : 'live_start', { strength })) || liveView;
+    renderLive();
+  });
+
   const strengthEl = $('#strength');
   const renderStrength = () => {
     strengthEl.value = String(strength);
     $('#strength-val').textContent = `${strength}%`;
     strengthEl.parentElement.title = t('strengthHint');
   };
-  strengthEl.addEventListener('input', () => { strength = Number(strengthEl.value); store.set('strength', String(strength)); renderStrength(); });
+  strengthEl.addEventListener('input', () => { strength = Number(strengthEl.value); store.set('strength', String(strength)); renderStrength(); api.invoke('live_set_strength', { strength }); });
   renderStrength();
   $('#dest-reset').addEventListener('click', () => { outDir = null; store.set('outDir', null); renderDest(); });
 
@@ -198,6 +232,7 @@
     applyLang();
     engine = await api.invoke('engine_status');
     renderEngine();
+    await liveRefresh();
     (await api.invoke('list_jobs')).forEach(upsert);
     syncLayout();
     takePending();
@@ -215,11 +250,16 @@
       { name: 'notes.txt', isVideo: false, status: 'error', progress: 0, errorCode: 'unsupported', errorMessage: 'txt' },
     ];
     const params = new URLSearchParams(location.search);
+    let liveDemo = params.has('live') ? { supported: true, state: 'running', backend: 'CoreML', latency: 1.8, load: 0.27, activity: true } : { supported: true, state: 'off' };
     return {
       invoke: async (cmd, args) => {
         if (cmd === 'engine_status') return params.has('empty') ? { state: 'idle' } : { state: 'ready', backend: 'CoreML' };
         if (cmd === 'list_jobs') return params.has('empty') ? [] : demo.map((d) => ({ id: id++, input: '/Users/me/Movies/' + d.name, output: '/Users/me/Movies/x', ...d }));
         if (cmd === 'take_pending_files') return [];
+        if (cmd === 'live_status') return liveDemo;
+        if (cmd === 'live_start') return (liveDemo = { supported: true, state: 'running', backend: 'CoreML', latency: 1.8, load: 0.27, activity: true, strength: args.strength });
+        if (cmd === 'live_stop') return (liveDemo = { supported: true, state: 'off' });
+        if (cmd === 'live_set_strength') return null;
         if (cmd === 'add_files') return args.paths.map((p) => ({ id: id++, input: p, name: p.split('/').pop(), status: 'queued', progress: 0, isVideo: true }));
         return null;
       },

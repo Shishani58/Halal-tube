@@ -11,6 +11,8 @@
 pub mod capture;
 pub mod job;
 pub mod live;
+#[cfg(target_os = "macos")]
+pub mod live_session;
 pub mod mdx;
 pub mod media;
 pub mod model;

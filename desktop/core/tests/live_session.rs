@@ -1,0 +1,76 @@
+//! A live session against the real Core Audio and the real model, with a synthetic tone as the
+//! "music" (a plain tone is music to the model). Not part of the normal run: it needs the System
+//! Audio Recording permission, and while the session runs the system's own output is silenced
+//! (the tone is not heard), so a few seconds of the Mac's sound go missing.
+//!
+//!     cargo test -p mr-core --release --test live_session -- --ignored --nocapture
+#![cfg(target_os = "macos")]
+
+use mr_core::live_session::{self, LiveConfig, LiveState};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+fn rms(x: &[f32]) -> f64 {
+    (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len().max(1) as f64).sqrt()
+}
+
+#[test]
+#[ignore = "needs the System Audio Recording permission; silences the system's output while it runs"]
+fn a_session_removes_a_tone_and_follows_the_strength() {
+    let model = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(mr_core::MODEL_FILE);
+    if !model.exists() {
+        eprintln!("skip: model not found");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("mr-live-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tone = dir.join("tone.wav");
+    let ok = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=14", "-ar", "44100", "-ac", "2"])
+        .arg(&tone)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("skip: ffmpeg not found");
+        return;
+    }
+
+    let mut cfg = LiveConfig::new(model, Some(dir.join("cache")));
+    cfg.playback = false; // nothing is played; the system's own output is silenced by the tap
+    cfg.record_output = true;
+    cfg.record_input = true;
+    cfg.keep_plain_speech = false;
+    let handle = live_session::start(cfg);
+    let t = Instant::now();
+    while handle.stats.state() != LiveState::Running {
+        assert!(handle.stats.state() != LiveState::Error, "session failed: {:?}", handle.stats.error.lock().unwrap());
+        assert!(t.elapsed() < Duration::from_secs(60), "never got running");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut player = Command::new("afplay").arg(&tone).spawn().expect("afplay");
+    std::thread::sleep(Duration::from_secs(7));
+    handle.set_strength(0); // from now on the original is heard in full
+    std::thread::sleep(Duration::from_secs(7));
+    let _ = player.wait();
+    let runs = handle.stats.runs.load(Ordering::Relaxed);
+    let report = handle.stop();
+    let rate = report.model_rate as usize;
+    eprintln!("model runs {runs}, output {:.1} s", report.output.0.len() as f64 / rate as f64);
+    assert!(runs >= 10, "runs {runs}");
+
+    // the tone started about 1 s into the session's running state and lasted 14 s; the output lags by
+    // the latency. Compare the same stretches of the input and the output: strength 100 % (first
+    // half) removes the tone, strength 0 % (second half) passes it.
+    let level = |x: &[f32], from: f64, to: f64| rms(&x[(from * rate as f64) as usize..(to * rate as f64) as usize]);
+    let (inp, out) = (&report.input.0, &report.output.0);
+    let first = (level(out, 3.0, 6.5), level(inp, 3.0, 6.5));
+    let second = (level(out, 11.0, 14.0), level(inp, 11.0, 14.0));
+    eprintln!("100 %: output {:.4} vs input {:.4} · 0 %: output {:.4} vs input {:.4}", first.0, first.1, second.0, second.1);
+    assert!(first.1 > 0.05, "the tone should have been captured: {}", first.1);
+    assert!(first.0 < first.1 * 0.1, "the tone should be removed at 100 %");
+    assert!(second.0 > second.1 * 0.5, "the tone should pass at 0 %");
+    let _ = std::fs::remove_dir_all(&dir);
+}

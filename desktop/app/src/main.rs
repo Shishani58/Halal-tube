@@ -1,6 +1,8 @@
 // Music Remover desktop app: a queue of files processed one at a time on a worker thread.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod live;
+
 use mr_core::job;
 use mr_core::mdx::{Mdx, KIM_VOCAL_2};
 use mr_core::media::{self, Tools};
@@ -243,7 +245,7 @@ fn clear_finished(state: State<AppState>) {
         .retain(|j| matches!(j.status, Status::Queued | Status::Running));
 }
 
-fn model_path(app: &AppHandle) -> PathBuf {
+pub(crate) fn model_path(app: &AppHandle) -> PathBuf {
     let bundled = app
         .path()
         .resource_dir()
@@ -384,6 +386,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .manage(live::LiveSlot::default())
         .manage(AppState {
             jobs: Mutex::new(Vec::new()),
             tx: Mutex::new(tx),
@@ -409,11 +412,19 @@ fn main() {
             cancel_job,
             remove_job,
             clear_finished,
-            take_pending_files
+            take_pending_files,
+            live::live_start,
+            live::live_stop,
+            live::live_status,
+            live::live_set_strength
         ])
         .build(tauri::generate_context!())
         .expect("error while building Music Remover")
         .run(|_app, _event| {
+            // release the audio tap when the app quits: the system's own output is heard again
+            if let tauri::RunEvent::Exit = _event {
+                _app.state::<live::LiveSlot>().shutdown();
+            }
             // macOS delivers "Open With" / Dock-icon drops as an Opened event.
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = _event {

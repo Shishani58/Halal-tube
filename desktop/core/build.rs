@@ -5,7 +5,7 @@ fn main() {
         // system audio capture (Core Audio process tap, macOS 14.2+): a thin Objective-C layer
         println!("cargo:rerun-if-changed=src/mac/tap.m");
         println!("cargo:rerun-if-changed=src/mac/tap.h");
-        cc::Build::new().file("src/mac/tap.m").flag("-fobjc-arc").flag("-Wno-unguarded-availability-new").compile("mr_tap");
+        cc::Build::new().file("src/mac/tap.m").flag("-fobjc-arc").flag("-Wno-unguarded-availability-new").flag("-Wno-unused-parameter").compile("mr_tap");
         println!("cargo:rustc-link-lib=framework=CoreAudio");
         println!("cargo:rustc-link-lib=framework=Foundation");
         let out = std::process::Command::new("clang").arg("--print-runtime-dir").output();

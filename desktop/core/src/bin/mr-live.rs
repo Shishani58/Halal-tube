@@ -24,18 +24,9 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use mr_core::capture::Capture;
-    use mr_core::job::Options;
-    use mr_core::live::Live;
-    use mr_core::mdx::{Mdx, KIM_VOCAL_2};
-    use mr_core::model::{Backend, Model, SelfTest, Separator};
-    use mr_core::ring::Ring;
-    use mr_core::stream::StreamResampler;
-    use mr_core::Error;
+    use mr_core::live_session::{self, LiveConfig, LiveState};
+    use mr_core::model::Backend;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn fail(msg: &str) -> ! {
@@ -74,213 +65,75 @@ mod mac {
     }
 
     pub fn main() {
-        let (mut prefer, mut model_path, mut hop, mut strength) = (None, None::<PathBuf>, 1.0f64, 100u32);
-        let (mut keep_plain_speech, mut mute, mut seconds, mut record, mut playback, mut capture_test) = (true, true, 0f64, None::<String>, true, false);
-        let mut record_input = None::<String>;
+        let model = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(mr_core::MODEL_FILE);
+        let mut cfg = LiveConfig::new(model, Some(std::env::temp_dir().join("mr-coreml-cache")));
+        let (mut seconds, mut record, mut record_input) = (0f64, None::<String>, None::<String>);
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             match a.as_str() {
-                "--cpu" => prefer = Some(Backend::Cpu),
-                "--gpu" => prefer = Some(Backend::Gpu),
-                "--model" => model_path = args.next().map(PathBuf::from),
-                "--hop" => hop = args.next().and_then(|v| v.parse().ok()).unwrap_or(1.0),
-                "--strength" => strength = args.next().and_then(|v| v.parse().ok()).unwrap_or(100).min(100),
-                "--no-passthrough" => keep_plain_speech = false,
-                "--keep-original" => mute = false,
+                "--cpu" => cfg.prefer = Some(Backend::Cpu),
+                "--gpu" => cfg.prefer = Some(Backend::Gpu),
+                "--model" => cfg.model_path = args.next().map(PathBuf::from).unwrap_or(cfg.model_path),
+                "--hop" => cfg.hop_s = args.next().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+                "--strength" => cfg.strength = args.next().and_then(|v| v.parse().ok()).unwrap_or(100).min(100),
+                "--no-passthrough" => cfg.keep_plain_speech = false,
+                "--keep-original" => cfg.mute_original = false,
                 "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
                 "--record" => record = args.next(),
                 "--record-input" => record_input = args.next(),
-                "--no-playback" => playback = false,
-                "--capture-test" => capture_test = true,
+                "--no-playback" => cfg.playback = false,
+                "--capture-test" => cfg.capture_only = true,
                 other => fail(&format!("unknown option {other}")),
             }
         }
+        cfg.record_output = record.is_some();
+        cfg.record_input = record_input.is_some();
+        cfg.max_seconds = if seconds > 0.0 { Some(seconds) } else { None };
 
-        // ── output: the default device; opening it also makes this process an audio client, which
-        //    the tap needs to exclude it (what we play must not be captured again)
-        let host = cpal::default_host();
-        let device = host.default_output_device().unwrap_or_else(|| fail("no output device"));
-        let cfg = device.default_output_config().unwrap_or_else(|e| fail(&e.to_string()));
-        let out_rate = cfg.sample_rate().0;
-        let out_ch = cfg.channels() as usize;
-        let out_ring = Arc::new(Ring::new(out_rate as usize * 2 * 6));
-        let armed = Arc::new(AtomicBool::new(false));
-        let stream = {
-            let (ring, armed) = (out_ring.clone(), armed.clone());
-            let mut tmp = vec![0f32; 8192];
-            device
-                .build_output_stream(
-                    &cfg.config(),
-                    move |data: &mut [f32], _| {
-                        let frames = data.len() / out_ch;
-                        if !armed.load(Ordering::Relaxed) || tmp.len() < frames * 2 {
-                            data.fill(0.0);
-                            return;
-                        }
-                        ring.pop_padded(&mut tmp[..frames * 2]);
-                        for f in 0..frames {
-                            for c in 0..out_ch {
-                                data[f * out_ch + c] = if c < 2 { tmp[f * 2 + c] } else { 0.0 };
-                            }
-                        }
-                    },
-                    |e| eprintln!("output stream error: {e}"),
-                    None,
-                )
-                .unwrap_or_else(|e| fail(&format!("cannot open the output device: {e}")))
-        };
-        stream.play().unwrap_or_else(|e| fail(&e.to_string()));
-        eprintln!("output: {} at {out_rate} Hz, {out_ch} channels", device.name().unwrap_or_default());
-
-        let start_capture = || {
-            // ── capture (retry: the process object of an audio client appears a moment after the stream opens)
-            let mut cap = None;
-            for _ in 0..30 {
-                match Capture::start(mute && !capture_test, 4.0) {
-                    Ok(c) => {
-                        cap = Some(c);
-                        break;
-                    }
-                    Err(Error::Capture(m)) if m.starts_with("not_audio_client") => std::thread::sleep(Duration::from_millis(100)),
-                    Err(e) => fail(&e.to_string()),
-                }
+        let handle = live_session::start(cfg.clone());
+        let (mut last, mut state) = (Instant::now(), LiveState::Starting);
+        while !handle.is_finished() {
+            std::thread::sleep(Duration::from_millis(100));
+            let s = &handle.stats;
+            if s.state() != state {
+                state = s.state();
+                eprintln!("{state:?} (backend {})", s.backend.lock().unwrap());
             }
-            let cap = cap.unwrap_or_else(|| fail("this process never became an audio client"));
-            eprintln!("capturing system audio at {} Hz{}", cap.sample_rate, if mute && !capture_test { " (the system's own output of it is silenced)" } else { "" });
-            cap
-        };
-        if capture_test {
-            let cap = start_capture();
-            let t_end = if seconds > 0.0 { Some(Instant::now() + Duration::from_secs_f64(seconds)) } else { None };
-            let mut buf = vec![0f32; 4096];
-            let (mut sum, mut peak, mut frames) = (0f64, 0f32, 0u64);
-            while t_end.map(|t| Instant::now() < t).unwrap_or(true) {
-                let n = cap.ring.pop(&mut buf);
-                for v in &buf[..n] {
-                    sum += (*v as f64).powi(2);
-                    peak = peak.max(v.abs());
-                }
-                frames += n as u64 / 2;
-                std::thread::sleep(Duration::from_millis(5));
+            if state == LiveState::Running && last.elapsed() >= Duration::from_secs(2) {
+                last = Instant::now();
+                eprintln!(
+                    "input peak {:.3} · slowest model hop {} ms · skipped silent hops {} · output ring {:.2} s · underruns {} · capture overruns {} · capture {} Hz · latency about {:.1} s",
+                    s.take_input_peak(),
+                    s.worst_run_ms(),
+                    s.skipped_hops.load(std::sync::atomic::Ordering::Relaxed),
+                    s.out_ring_seconds(),
+                    s.underruns.load(std::sync::atomic::Ordering::Relaxed),
+                    s.overruns.load(std::sync::atomic::Ordering::Relaxed),
+                    s.capture_rate.load(std::sync::atomic::Ordering::Relaxed),
+                    s.latency_seconds(),
+                );
             }
-            println!("captured {:.2} s, rms {:.2} dB, peak {:.4}", frames as f64 / cap.sample_rate as f64, 10.0 * (sum / (frames * 2) as f64 + 1e-12).log10(), peak);
+        }
+        if let Some((code, msg)) = handle.stats.error.lock().unwrap().clone() {
+            fail(&format!("{msg} ({code})"));
+        }
+        let report = handle.stop();
+        if let Some((secs, rms, peak)) = report.capture {
+            println!("captured {secs:.2} s, rms {rms:.2} dB, peak {peak:.4}");
             return;
         }
-
-        // ── the model
-        let model_path = model_path.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(mr_core::MODEL_FILE));
-        let mdx = Mdx::new(KIM_VOCAL_2);
-        let cache = std::env::temp_dir().join("mr-coreml-cache");
-        let t0 = Instant::now();
-        let model = Model::load(&model_path, mdx.tensor_shape(), prefer, Some(&cache)).unwrap_or_else(|e| fail(&e.to_string()));
-        eprintln!("model on {} ({:.1} s)", model.backend.label(), t0.elapsed().as_secs_f64());
-        let mut sep = Separator::new(mdx, model);
-        match sep.self_test(Some(&cache)) {
-            Ok(SelfTest::FellBack(why)) => eprintln!("the GPU computes wrong results ({why}): using the CPU"),
-            Ok(_) => {}
-            Err(e) => eprintln!("GPU self-test could not run: {e}"),
-        }
-        let mut live = Live::new(&sep, hop, Options { strength: strength as f32 / 100.0, keep_plain_speech });
-        let model_rate = sep.mdx.cfg.sample_rate;
-        // the model's windows are a few hundred ms of work: the output starts after a safety margin
-        // that covers a slow run, so that it doesn't run dry between hops
-        let margin = (out_rate as f64 * 0.4) as usize;
-        let mut from_model = StreamResampler::new(model_rate, out_rate).unwrap_or_else(|e| fail(&e.to_string()));
-
-        // capture starts only now: audio heard while the model loaded would only add delay
-        let cap = start_capture();
-        let t_end = if seconds > 0.0 { Some(Instant::now() + Duration::from_secs_f64(seconds)) } else { None };
-        let mut to_model = StreamResampler::new(cap.sample_rate, model_rate).unwrap_or_else(|e| fail(&e.to_string()));
-        eprintln!("running: hop {hop} s → latency about {:.1} s{}", hop + 0.09 + 0.3 + 0.4, if playback { "" } else { " (no playback)" });
-        let (mut in_buf, mut l, mut r) = (vec![0f32; 4800 * 2], Vec::new(), Vec::new());
-        let (mut ml, mut mr_) = (Vec::new(), Vec::new());
-        let (mut pl, mut pr) = (Vec::new(), Vec::new());
-        let (mut ol, mut or) = (Vec::new(), Vec::new());
-        let (mut rec_l, mut rec_r) = (Vec::<f32>::new(), Vec::<f32>::new());
-        let (mut in_rec_l, mut in_rec_r) = (Vec::<f32>::new(), Vec::<f32>::new());
-        let (mut started, mut last_report) = (false, Instant::now());
-        let (mut cap_rate, mut last_rate_check) = (cap.sample_rate, Instant::now());
-        let (mut worst_run, mut in_peak) = (0f64, 0f32);
-        loop {
-            if t_end.map(|t| Instant::now() >= t).unwrap_or(false) {
-                break;
-            }
-            // a player may switch the output device to the rate of its file (44.1 ↔ 48 kHz): follow it
-            if last_rate_check.elapsed() >= Duration::from_millis(300) {
-                last_rate_check = Instant::now();
-                let now = cap.current_rate();
-                if now != cap_rate {
-                    eprintln!("the capture rate changed: {cap_rate} → {now} Hz");
-                    cap_rate = now;
-                    to_model = StreamResampler::new(cap_rate, model_rate).unwrap_or_else(|e| fail(&e.to_string()));
-                }
-            }
-            let n = cap.ring.pop(&mut in_buf) / 2;
-            if n == 0 {
-                std::thread::sleep(Duration::from_millis(4));
-            } else {
-                l.clear();
-                r.clear();
-                for f in in_buf[..n * 2].chunks_exact(2) {
-                    l.push(f[0]);
-                    r.push(f[1]);
-                    in_peak = in_peak.max(f[0].abs()).max(f[1].abs());
-                }
-                ml.clear();
-                mr_.clear();
-                to_model.process(&l, &r, &mut ml, &mut mr_).unwrap_or_else(|e| fail(&e.to_string()));
-                if record_input.is_some() {
-                    in_rec_l.extend_from_slice(&ml);
-                    in_rec_r.extend_from_slice(&mr_);
-                }
-                pl.clear();
-                pr.clear();
-                let t = Instant::now();
-                if let Err(e) = live.push(&mut sep, &ml, &mr_, &mut pl, &mut pr) {
-                    fail(&e.to_string());
-                }
-                if !pl.is_empty() {
-                    worst_run = worst_run.max(t.elapsed().as_secs_f64());
-                    if record.is_some() {
-                        rec_l.extend_from_slice(&pl);
-                        rec_r.extend_from_slice(&pr);
-                    }
-                    ol.clear();
-                    or.clear();
-                    from_model.process(&pl, &pr, &mut ol, &mut or).unwrap_or_else(|e| fail(&e.to_string()));
-                    if playback {
-                        if !started {
-                            out_ring.push(&vec![0f32; margin * 2]);
-                        }
-                        let inter: Vec<f32> = ol.iter().zip(&or).flat_map(|(a, b)| [*a, *b]).collect();
-                        out_ring.push(&inter);
-                    }
-                    if !started {
-                        started = true;
-                        armed.store(true, Ordering::Relaxed);
-                    }
-                }
-            }
-            if last_report.elapsed() >= Duration::from_secs(2) {
-                last_report = Instant::now();
-                eprintln!(
-                    "input peak {in_peak:.3} · slowest model hop {worst_run:.2} s · skipped silent hops {} · output ring {:.2} s · underruns {} · capture overruns {}",
-                    live.skipped,
-                    out_ring.len() as f64 / (out_rate as f64 * 2.0),
-                    out_ring.underruns.load(Ordering::Relaxed),
-                    cap.ring.overruns.load(Ordering::Relaxed)
-                );
-                in_peak = 0.0;
-            }
-        }
-        drop(cap); // stops the tap: the system's output is heard as before
         if let Some(path) = record_input {
-            write_wav(&path, &in_rec_l, &in_rec_r, model_rate).unwrap_or_else(|e| fail(&e.to_string()));
-            eprintln!("wrote {path}: the captured input at {model_rate} Hz");
+            write_wav(&path, &report.input.0, &report.input.1, report.model_rate).unwrap_or_else(|e| fail(&e.to_string()));
+            eprintln!("wrote {path}: the captured input at {} Hz", report.model_rate);
         }
         if let Some(path) = record {
-            write_wav(&path, &rec_l, &rec_r, model_rate).unwrap_or_else(|e| fail(&e.to_string()));
-            eprintln!("wrote {path}: {:.1} s, rms {:.1} dB (the sound is delayed by {:.2} s against what was played)", rec_l.len() as f64 / model_rate as f64, rms_db(&rec_l), live.latency() as f64 / model_rate as f64);
+            write_wav(&path, &report.output.0, &report.output.1, report.model_rate).unwrap_or_else(|e| fail(&e.to_string()));
+            eprintln!(
+                "wrote {path}: {:.1} s, rms {:.1} dB (the sound is delayed by {:.2} s against what was played)",
+                report.output.0.len() as f64 / report.model_rate as f64,
+                rms_db(&report.output.0),
+                report.latency as f64 / report.model_rate as f64
+            );
         }
     }
 }
