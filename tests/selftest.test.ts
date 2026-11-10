@@ -31,3 +31,14 @@ test('selftest: fp16-sized noise passes, broken output does not', () => {
   assert(!compareSamples([0, 0], [0, 0]).ok, 'a reference of zeros proves nothing');
   assert(SELFTEST_MAX_ERR > 0.02 && SELFTEST_MAX_ERR < 0.5, 'threshold between fp16 noise and garbage');
 });
+
+test('selftest: the audio test signal is deterministic, finite and quiet enough, with a voice and a chord in it', async () => {
+  const { testAudio } = await import('../src/core/selftest');
+  const [a, b] = testAudio(44100, 44100, 5), [c] = testAudio(44100, 44100, 5), [d] = testAudio(44100, 44100, 6);
+  assert(a.every((x, i) => x === c[i]), 'same seed, same signal');
+  assert(a.some((x, i) => x !== d[i]), 'the seed changes the noise');
+  assert(a.every((x) => Number.isFinite(x) && Math.abs(x) < 1), 'finite, below full scale');
+  assert(a.some((x, i) => x !== b[i]), 'the channels differ a little');
+  const rms = Math.sqrt(a.reduce((s, x) => s + x * x, 0) / a.length);
+  assert(rms > 0.02 && rms < 0.5, `level ${rms.toFixed(3)}`);
+});

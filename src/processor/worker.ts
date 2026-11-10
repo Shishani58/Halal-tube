@@ -10,6 +10,7 @@ import { KIM_VOCAL_2, MdxProcessor } from '../core/mdx';
 import { wordsIn } from '../core/captions';
 import type { Word } from '../core/profanity';
 import { keepOriginalWhereClean } from '../core/passthrough';
+import { testAudio } from '../core/selftest';
 import { resampleCubic } from '../core/resample';
 import { voicePitch } from '../core/voice';
 import { Tiling } from '../core/tiles';
@@ -180,7 +181,7 @@ async function initModel(): Promise<void> {
   model$.error = undefined;
   updateStatus(true);
   try {
-    model = await serial(() => loadModel({ base, modelFile: MODEL_FILE, fp16File: MODEL_FP16_FILE, shape: mdx.tensorShape }));
+    model = await serial(() => loadModel({ base, modelFile: MODEL_FILE, fp16File: MODEL_FP16_FILE, shape: mdx.tensorShape, selfTestInput: (r) => mdx.stft(...testAudio(mdx.chunkSize, 44100, r.seed)) }));
     modelEverLoaded = true;
     model$.model = 'ready';
     model$.backend = model.backend;

@@ -1,6 +1,7 @@
 /** Diagnostics page: measures how fast this computer separates audio. */
 import { KIM_VOCAL_2, MdxProcessor } from '../core/mdx';
 import { loadModel } from '../processor/model';
+import { testAudio } from '../core/selftest';
 
 const out = document.getElementById('out')!;
 const log = (s: string) => {
@@ -12,8 +13,17 @@ async function bench(backend: 'webgpu' | 'wasm', iters: number) {
   const base = new URL('../', location.href).href;
   log(`\n[${backend}] loading model…`);
   const t0 = performance.now();
-  const model = await loadModel({ base, modelFile: 'Kim_Vocal_2.onnx', fp16File: params.get('fp16') === '0' ? undefined : 'Kim_Vocal_2.fp16.onnx', shape: mdx.tensorShape, backend });
-  log(`[${backend}${model.fp16 ? ', fp16' : ''}] loaded + warm-up in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  const model = await loadModel({ base, modelFile: 'Kim_Vocal_2.onnx', fp16File: params.get('fp16') === '0' ? undefined : 'Kim_Vocal_2.fp16.onnx', shape: mdx.tensorShape, backend, selfTestInput: (r) => mdx.stft(...testAudio(mdx.chunkSize, 44100, r.seed)) });
+  log(`[${backend}${model.fp16 ? ', fp16' : ''}] loaded + warm-up in ${((performance.now() - t0) / 1000).toFixed(1)} s ${JSON.stringify(model.timings)}`);
+  if (params.get('twice') === '1') {
+    // a second load in the same page: what the first one pays once (runtime and shader caches, cold files)
+    await model.release();
+    const t1 = performance.now();
+    const again = await loadModel({ base, modelFile: 'Kim_Vocal_2.onnx', fp16File: params.get('fp16') === '0' ? undefined : 'Kim_Vocal_2.fp16.onnx', shape: mdx.tensorShape, backend, selfTestInput: (r) => mdx.stft(...testAudio(mdx.chunkSize, 44100, r.seed)) });
+    log(`[${backend}] second load in ${((performance.now() - t1) / 1000).toFixed(1)} s ${JSON.stringify(again.timings)}`);
+    await again.release();
+    return { backend, fp16: again.fp16, avgMs: 0, speed: 0 };
+  }
   const L = new Float32Array(mdx.chunkSize).map(() => (Math.random() - 0.5) * 0.2);
   const R = new Float32Array(mdx.chunkSize).map(() => (Math.random() - 0.5) * 0.2);
   const times: number[] = [];

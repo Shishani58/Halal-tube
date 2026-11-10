@@ -14,6 +14,8 @@ export interface LoadedModel {
   selfTest: 'passed' | 'skipped' | 'fell back';
   /** Error of the self-test run, share of the reference (set when it ran). */
   selfTestErr?: number;
+  /** Milliseconds spent per loading phase: ort (runtime import), adapter, fetch, create (session), warm (first run, shaders + self-test). */
+  timings?: Record<string, number>;
   release: () => Promise<void>;
 }
 
@@ -26,6 +28,8 @@ export interface LoadOptions {
    * when the GPU has `shader-f16` and the file was shipped; otherwise `modelFile`.
    */
   fp16File?: string;
+  /** Builds the self-test input of a model whose reference is made from a real-looking signal (SelfTestRef.kind 'audio'). */
+  selfTestInput?: (ref: SelfTestRef) => Float32Array;
   /** Default input shape (warm-up, and calls that don't pass one). */
   shape: [number, number, number, number];
   /** Force a backend (benchmarking); default tries WebGPU then WASM. */
@@ -58,14 +62,30 @@ function loadRefs(base: string): Promise<Record<string, SelfTestRef>> {
   return refs;
 }
 
+/** Milliseconds of the last fetchModel: until the response started, and to read its body. */
+const fetchMs = { head: 0, body: 0 };
+
 async function fetchModel(base: string, file: string): Promise<Uint8Array | null> {
+  const t0 = performance.now();
   const res = await fetch(`${base}models/${file}`).catch(() => null);
-  return res?.ok ? new Uint8Array(await res.arrayBuffer()) : null;
+  const t1 = performance.now();
+  const bytes = res?.ok ? new Uint8Array(await res.arrayBuffer()) : null;
+  fetchMs.head = Math.round(t1 - t0);
+  fetchMs.body = Math.round(performance.now() - t1);
+  return bytes;
 }
 
 export async function loadModel(opts: LoadOptions): Promise<LoadedModel> {
+  const timings: Record<string, number> = {};
+  let mark = performance.now();
+  const lap = (k: string) => {
+    const now = performance.now();
+    timings[k] = Math.round((timings[k] ?? 0) + now - mark);
+    mark = now;
+  };
   const ort = await loadOrt(opts.base);
   const ref = (await loadRefs(opts.base))[opts.modelFile];
+  lap('ort');
   let fp32: Uint8Array | null = null;
   const tryBackends: ('webgpu' | 'wasm')[] = opts.backend ? [opts.backend] : ['webgpu', 'wasm'];
   let lastErr: unknown = null;
@@ -78,6 +98,7 @@ export async function loadModel(opts: LoadOptions): Promise<LoadedModel> {
         const gpu = (navigator as Navigator & { gpu?: GPU }).gpu;
         if (!gpu) throw new Error('WebGPU unavailable');
         const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
+        lap('adapter');
         if (!adapter) throw new Error('No WebGPU adapter');
         // fp16 weights: half the download, ~25% faster on the GPU, same output to −45 dB
         if (opts.fp16File && adapter.features.has('shader-f16')) variants.unshift(true);
@@ -99,10 +120,14 @@ export async function loadModel(opts: LoadOptions): Promise<LoadedModel> {
           if (!fp32) throw new Error(`model fetch failed: ${opts.modelFile}`);
           bytes = fp32;
         }
+        lap('fetch');
+        timings.fetchHead = fetchMs.head;
+        timings.fetchBody = fetchMs.body;
         const session = await ort.InferenceSession.create(bytes, {
           executionProviders: [backend],
           graphOptimizationLevel: 'all',
         });
+        lap('create');
         const inName = session.inputNames[0];
         const outName = session.outputNames[0];
         const run: RunModel = async (input, shape = opts.shape) => {
@@ -114,9 +139,12 @@ export async function loadModel(opts: LoadOptions): Promise<LoadedModel> {
         };
         // The warm-up (compiles shaders so the first real tile isn't slow) is also the self-test: on
         // the GPU it runs the reference input and the result must match the CPU's.
-        const test = backend === 'webgpu' && ref && ref.shape.join() === opts.shape.join() ? ref : null;
+        let test = backend === 'webgpu' && ref && ref.shape.join() === opts.shape.join() ? ref : null;
+        const input = test ? (test.kind === 'audio' ? opts.selfTestInput?.(test) : testInput(test.shape, test.seed, test.range)) : undefined;
+        if (test && !input) test = null; // the caller can't build this model's input: no test
         let selfErr = 0;
-        const out = await run(test ? testInput(test.shape, test.seed, test.range) : new Float32Array(size(opts.shape)));
+        mark = performance.now();
+        const out = await run(input ?? new Float32Array(size(opts.shape)));
         if (test) {
           const r = compareSamples(sampleOutput(out, test.ref.length), test.ref);
           selfErr = r.err;
@@ -129,7 +157,7 @@ export async function loadModel(opts: LoadOptions): Promise<LoadedModel> {
           }
         }
         if (test) console.debug(`[music-remover] WebGPU self-test passed for ${fp16 ? opts.fp16File : opts.modelFile}: error ${(selfErr * 100).toFixed(3)} % of the reference`);
-        return { run, backend, fp16, selfTest: test ? 'passed' : fellBack ? 'fell back' : 'skipped', selfTestErr: test ? selfErr : undefined, release: () => session.release() };
+        return { run, backend, fp16, selfTest: test ? 'passed' : fellBack ? 'fell back' : 'skipped', selfTestErr: test ? selfErr : undefined, timings: (lap('warm'), timings), release: () => session.release() };
       } catch (e) {
         lastErr = e;
       }

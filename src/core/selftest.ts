@@ -11,7 +11,9 @@ export interface SelfTestRef {
   /** Input the reference was made with (the model's usual input shape). */
   shape: number[];
   seed: number;
-  /** The input is uniform in [lo, hi). */
+  /** 'audio': the input is the spectrogram of testAudio (the caller builds it, LoadOptions.selfTestInput); otherwise uniform noise. */
+  kind?: 'audio';
+  /** The noise input is uniform in [lo, hi). */
   range: [number, number];
   /** Evenly spaced samples of the model's first output on the CPU. */
   ref: number[];
@@ -37,6 +39,43 @@ export function testInput(shape: readonly number[], seed: number, range: readonl
     out[i] = lo + (hi - lo) * (x / 4294967296);
   }
   return out;
+}
+
+/**
+ * A deterministic stereo test signal that looks like what the separation model gets: a voice (a
+ * gliding pitch with harmonics, a formant-like envelope and a syllable rhythm), a chord with
+ * tremolo behind it, and a little noise. Random noise is no stand-in: its spectrogram makes the
+ * network's activations huge, and fp16 then differs from fp32 by ~12 % where real audio differs by
+ * ~0.5 % — a test on noise would reject a perfectly good fp16 model.
+ */
+export function testAudio(n: number, rate: number, seed: number): [Float32Array, Float32Array] {
+  const L = new Float32Array(n), R = new Float32Array(n);
+  let x = seed >>> 0 || 1;
+  const noise = () => {
+    x ^= x << 13;
+    x >>>= 0;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    x >>>= 0;
+    return x / 2147483648 - 1;
+  };
+  const chord = [220, 277.18, 329.63, 440];
+  let phase = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / rate;
+    const f0 = 130 + 50 * Math.sin(2 * Math.PI * 0.35 * t); // pitch glides 80–180 Hz
+    phase += (2 * Math.PI * f0) / rate;
+    let voice = 0;
+    for (let h = 1; h <= 18; h++) voice += Math.sin(h * phase) * Math.exp(-0.5 * ((h * f0 - 700) / 500) ** 2) / h;
+    voice *= Math.max(0, Math.sin(2 * Math.PI * 3.3 * t)) ** 0.5; // syllables
+    let music = 0;
+    for (const f of chord) music += Math.sin(2 * Math.PI * f * t) + 0.3 * Math.sin(2 * Math.PI * 2 * f * t);
+    music *= 0.12 * (0.7 + 0.3 * Math.sin(2 * Math.PI * 2 * t));
+    const e = 0.01 * noise();
+    L[i] = 0.35 * voice + music + e;
+    R[i] = 0.35 * voice + 0.9 * music - e;
+  }
+  return [L, R];
 }
 
 /** `n` evenly spaced values of an output. */
