@@ -23,6 +23,8 @@ import { createDemuxer, type Demuxer, type Packet } from '../core/demux';
 import { IntervalSet } from '../core/intervals';
 import {
   BODY_CLASSES,
+  BODY_WEIGHT,
+  MAN_FACE,
   GENDER_CROPS,
   GENDER_INPUT as GS,
   GROUPS,
@@ -44,6 +46,7 @@ import {
   toFrame,
   type Rect,
 } from '../core/nudenet';
+import { findPlates } from '../core/plates';
 import { CLIP_INPUT as CS, CLIP_VIEWS, clipViews, rgbaToClip } from '../core/clip';
 import type { FromClip, ToClip } from './clip-worker';
 import { ShotTracker, THUMB_H, THUMB_W, isEdgeCut, makeThumb, type Thumb } from '../core/shots';
@@ -64,15 +67,13 @@ const NC = GENDER_CROPS.length;
 const G = 8 * NC;
 /** Longest side of the frame copy kept for face crops. */
 const HI = 960;
-/**
- * Faces the gender classifier calls a woman at least this surely are reported; the page applies
- * the threshold, a lower one where a woman's voice is heard (vision-timeline FACE_FEMALE_*).
- */
-const WOMAN_REPORT = 0.05;
 /** Analysed GOP edges remembered per session (cuts across GOP boundaries). */
 const MAX_EDGES = 256;
-/** Faces smaller than this (longer box edge, px in the HI copy) are too small to classify. */
-const MIN_FACE = 17;
+/**
+ * Faces smaller than this (longer box edge, px in the HI copy) are too small to classify: the
+ * 96×96 crop would be blown up 3× and the classifier's answer is a coin toss.
+ */
+const MIN_FACE = 22;
 /** A still-growing GOP under the playhead is re-analysed once this many new seconds arrived. */
 const PARTIAL_MIN = 1;
 /** …or, on its first pass, once it holds this much. */
@@ -569,15 +570,30 @@ async function classify(shots: Shot[], scene: ClipBudget | null = null): Promise
       });
       people.push({ rects, at });
     };
-    for (const f of faces[j]) if (f.p >= WOMAN_REPORT) add(personFromFace(f.face, parts), f.p, [PART.head, PART.body]);
-    // a woman's body: makes the person it belongs to a woman; or one without a face found
-    // (turned away, face cut off)
+    // every face goes to the page with its woman probability, men's too: the page decides who is
+    // a woman from all of a person's looks, and the men's looks are what speaks against a stray one
+    for (const f of faces[j]) add(personFromFace(f.face, parts), f.p, [PART.head, PART.body]);
+    // a woman's body: lifts the person it belongs to (a little: these classes fire on clothed men
+    // too, and never over a face that is surely a man's); or one without a face found (turned
+    // away, face cut off)
     for (const x of detectBoxes(out, B, j, GROUPS.femaleBody, FEMALE_BODY_MIN, 4)) {
       const part = toFrame(x, dw, dh);
       const cx = part.x + part.w / 2, cy = part.y + part.h / 2;
       const who = people.find((o) => o.rects.some((q) => cx >= q.x && cx <= q.x + q.w && cy >= q.y && cy <= q.y + q.h));
-      if (who) for (const i of who.at) women[i * 5 + 4] = Math.max(women[i * 5 + 4], r(x.score));
-      else add([personFromBody(part)], x.score, [PART.whole]);
+      if (who) {
+        for (const i of who.at) if (women[i * 5 + 4] >= MAN_FACE) women[i * 5 + 4] = Math.max(women[i * 5 + 4], r(x.score * BODY_WEIGHT));
+      } else add([personFromBody(part)], x.score, [PART.whole]);
+    }
+    // slides and cards laid over the picture (video frames; not those holding a face)
+    const plates: number[] = [];
+    if (scene) {
+      for (const p of findPlates(px.subarray(j * plane * 4, (j + 1) * plane * 4), iw, dw, dh)) {
+        const holdsFace = faces[j].some((f) => {
+          const cx = f.face.x + f.face.w / 2, cy = f.face.y + f.face.h / 2;
+          return cx >= p[0] && cx <= p[0] + p[2] && cy >= p[1] && cy <= p[1] + p[3];
+        });
+        if (!holdsFace) plates.push(r(p[0]), r(p[1]), r(p[2]), r(p[3]));
+      }
     }
     frames.push({
       t: shots[j].t,
@@ -586,6 +602,7 @@ async function classify(shots: Shot[], scene: ClipBudget | null = null): Promise
       female: r(femaleScore(faces[j].map((f) => f.p), sc.femaleBody)),
       women,
       ...(kinds.some((k) => k !== PART.whole) ? { parts: kinds } : {}),
+      ...(plates.length ? { plates } : {}),
     });
   }
   tl = lap('post', tl);

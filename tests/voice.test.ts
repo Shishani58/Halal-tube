@@ -35,9 +35,9 @@ test('Voice pitch: a man, a woman, silence', () => {
 
 test('VisionTimeline: a woman’s voice lets an unsure face count', () => {
   const tl = new VisionTimeline();
-  // one shot, a face the classifier is unsure about (0.12) on the left
+  // one shot, a face the classifier is unsure about (0.25) on the left: head and body
   const frames = [];
-  for (let t = 0; t < 10; t += 0.5) frames.push({ t, nude: 0, skin: 0, female: 0.12, women: [0.1, 0.2, 0.2, 0.6, 0.12] });
+  for (let t = 0; t < 10; t += 0.5) frames.push({ t, nude: 0, skin: 0, female: 0.25, women: [0.1, 0.2, 0.1, 0.15, 0.25, 0.05, 0.35, 0.2, 0.5, 0.25], parts: [1, 2] });
   tl.add({ from: 0, to: 10, frames, cuts: [], cutRange: [0, 10], edges: [] });
   const all = { women: true };
   assert(tl.decide(3, all, 10).verdict === 'clear', 'unsure face alone: not blurred');
@@ -47,7 +47,7 @@ test('VisionTimeline: a woman’s voice lets an unsure face count', () => {
   // the same tile again, now a woman speaks (replaces what was known there)
   tl.addVoice(0, [0, 0, 220, 215, 0, 230, 210, 0, 205, 0, 225, 0]);
   const d = tl.decide(3, all, 10);
-  assert(d.verdict === 'region' && d.rects.length === 1, `a woman’s voice: blurred ${JSON.stringify(d)}`);
+  assert(d.verdict === 'region' && d.rects.length === 2, `a woman’s voice: blurred ${JSON.stringify(d)}`);
   // mostly a man, a little of a woman: not enough
   tl.addVoice(0, [115, 120, 220, 118, 117, 116, 119, 121, 118, 0, 0, 0]);
   assert(tl.decide(3, all, 10).verdict === 'clear', 'mostly a man’s voice: not blurred');

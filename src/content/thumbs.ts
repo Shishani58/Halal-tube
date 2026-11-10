@@ -115,7 +115,7 @@ export class ThumbBlur {
   }
 
   private hides(f: Scores): boolean {
-    return f.nude >= THRESHOLDS.nude || f.skin >= THRESHOLDS.skin || (this.women && f.female >= THRESHOLDS.female);
+    return f.nude >= THRESHOLDS.nude || f.skin >= THRESHOLDS.skin || (this.women && f.female >= THRESHOLDS.thumbFemale);
   }
 
   private setup(): void {

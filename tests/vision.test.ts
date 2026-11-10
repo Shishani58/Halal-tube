@@ -1,7 +1,7 @@
 import { IntervalSet } from '../src/core/intervals';
 import { NUDENET_LABELS, detectFaces, faceCrop, femaleProb, femaleScore, letterbox, personFromBody, personFromFace, rgbaToChw, scoreFrames } from '../src/core/nudenet';
 import { ShotTracker, THUMB_H, THUMB_W, isCut, makeThumb, thumbDiff } from '../src/core/shots';
-import { VisionTimeline } from '../src/core/vision-timeline';
+import { VisionTimeline, isWoman } from '../src/core/vision-timeline';
 import { StableBoxes } from '../src/core/stable-boxes';
 import { thumbKey } from '../src/content/thumbs';
 import { assert, test } from './harness';
@@ -64,7 +64,7 @@ test('NudeNet faces: boxes + NMS; gender softmax; woman score', () => {
   assert(Math.abs(c.side - 70) < 1e-6 && Math.abs(c.x - 65) < 1e-6 && Math.abs(c.y - 60) < 1e-6, JSON.stringify(c));
   assert(Math.abs(femaleProb(new Float32Array([2, 0, 0.3]), 0) - 0.8808) < 1e-3, 'softmax');
   assert(Math.abs(femaleProb(new Float32Array([3, 0, 0.3, 0, 1, 0.3]), 0, 2) - 0.7311) < 1e-3, 'mean logit over crops');
-  assert(femaleScore([0.2, 0.9], 0) === 0.9 && femaleScore([], 0.5) === 0 && femaleScore([0.1], 0.7) === 0.7, 'female score');
+  assert(femaleScore([0.2, 0.9], 0) === 0.9 && femaleScore([], 0.5) === 0 && Math.abs(femaleScore([0.1], 0.7) - 0.56) < 1e-9, 'female score (a body class counts 0.8×)');
 });
 
 type F = { t: number; nude: number; skin: number; female: number; women: number[] };
@@ -247,4 +247,77 @@ test('Heads and bodies are tracked apart but shown as one blur', () => {
   assert(shown.length === 1, `head and body are shown as one blur: ${JSON.stringify(shown)}`);
   const far = sb.update([[0.02, 0.02, 0.1, 0.1, 1], [0.7, 0.6, 0.25, 0.35, 2]], 'far', 0);
   assert(far.length === 2, `boxes far apart stay separate: ${JSON.stringify(far)}`);
+});
+
+/** A person seen by her face: head and body rects, both at probability p; `at` is the head's left edge. */
+const person = (t: number, p: number, at: number): F & { parts: number[] } => ({
+  t, nude: 0, skin: 0, female: p, women: [at, 0.1, 0.12, 0.2, p, at - 0.05, 0.3, 0.22, 0.6, p], parts: [1, 2],
+});
+const some = (tl: VisionTimeline, t: number, women = true) => tl.decide(t, { women }, 20);
+
+test('VisionTimeline: one stray "woman" look does not make a man a woman', () => {
+  // a man on the left (looks at 0.02–0.1, one at 0.55), a woman on the right (0.6–0.95, one at 0.1)
+  const man = [0.05, 0.1, 0.02, 0.55, 0.04, 0.08, 0.03, 0.06, 0.1, 0.02];
+  const her = [0.9, 0.85, 0.1, 0.95, 0.6, 0.8, 0.9, 0.7, 0.88, 0.92];
+  const tl = new VisionTimeline();
+  const frames = man.map((p, i) => {
+    const a = person(i * 0.5, p, 0.1), b = person(i * 0.5, her[i], 0.7);
+    return { ...a, female: Math.max(p, her[i]), women: [...a.women, ...b.women], parts: [1, 2, 1, 2] };
+  });
+  tl.add({ from: 0, to: 6, frames, cuts: [], cutRange: [0, 6], edges: [] });
+  const d = some(tl, 2.5);
+  assert(d.verdict === 'region' && d.rects.length === 2, `only her (head and body): ${JSON.stringify(d.rects)}`);
+  assert(d.rects.every((r) => r[0] > 0.55), `not him: ${JSON.stringify(d.rects)}`);
+});
+
+test('VisionTimeline: a woman the classifier is unsure of is still found; one look needs to be sure', () => {
+  const tl = new VisionTimeline();
+  tl.add({ from: 0, to: 6, frames: [0.9, 0.2, 0.6, 0.15, 0.7, 0.5].map((p, i) => person(i, p, 0.4)), cuts: [], cutRange: [0, 6], edges: [] });
+  assert(some(tl, 2).verdict === 'region', 'mean 0.5, three looks vote woman');
+  const one = new VisionTimeline();
+  one.add({ from: 0, to: 3, frames: [person(0, 0.4, 0.4), person(1, 0.4, 0.4)].slice(0, 1), cuts: [], cutRange: [0, 3], edges: [] });
+  assert(some(one, 0.5).verdict === 'clear', 'a single look at 0.4 is not enough');
+  const sure = new VisionTimeline();
+  sure.add({ from: 0, to: 3, frames: [person(0, 0.8, 0.4)], cuts: [], cutRange: [0, 3], edges: [] });
+  assert(some(sure, 0.5).verdict === 'region', 'a single look at 0.8 is');
+  assert(isWoman({ n: 4, votes: 1, mean: 0.5, max: 0.9 }, 1) === false, 'one voting look of four is not a majority');
+});
+
+test('VisionTimeline: a woman\'s voice lifts only the most woman-like face', () => {
+  const tl = new VisionTimeline();
+  const frames = [0, 1, 2, 3, 4, 5].map((t) => {
+    const a = person(t, 0.22, 0.1), b = person(t, 0.08, 0.6); // two faces the classifier doubts, her more
+    return { ...a, women: [...a.women, ...b.women], parts: [1, 2, 1, 2] };
+  });
+  tl.add({ from: 0, to: 6, frames, cuts: [], cutRange: [0, 6], edges: [] });
+  assert(some(tl, 2).verdict === 'clear', 'nobody is a woman by the picture');
+  tl.addVoice(0, [220, 230, 210, 225, 240, 0, 215, 220, 235, 228, 0, 0]);
+  const d = some(tl, 2);
+  assert(d.verdict === 'region' && d.rects.length === 2 && d.rects.every((r) => r[0] < 0.4), `the likelier face only: ${JSON.stringify(d.rects)}`);
+  const men = new VisionTimeline();
+  men.add({ from: 0, to: 6, frames: [0, 1, 2, 3, 4, 5].map((t) => person(t, 0.05, 0.1)), cuts: [], cutRange: [0, 6], edges: [] });
+  men.addVoice(0, [220, 230, 210, 225, 240, 0, 215, 220, 235, 228, 0, 0]);
+  assert(some(men, 2).verdict === 'clear', 'a face the classifier calls a man (0.05) stays a man');
+});
+
+test('VisionTimeline: a woman seen by her body alone needs two looks; men stay out of the scene-model blur', () => {
+  const body = (t: number, p: number): F => ({ t, nude: 0, skin: 0, female: p, women: [0.3, 0.2, 0.2, 0.6, p] });
+  const one = new VisionTimeline();
+  one.add({ from: 0, to: 5, frames: [fr(0), body(1, 0.7), fr(2), fr(3)], cuts: [], cutRange: [0, 5], edges: [] });
+  assert(some(one, 1).verdict === 'clear', 'one revealing-clothes look at 0.7: a man in a printed T-shirt');
+  const two = new VisionTimeline();
+  two.add({ from: 0, to: 5, frames: [fr(0), body(1, 0.7), body(1.5, 0.65), fr(3)], cuts: [], cutRange: [0, 5], edges: [] });
+  assert(some(two, 1).verdict === 'region', 'two looks');
+  // the scene model says "women" on every look; nobody located
+  const clip = (men: boolean) => {
+    const tl = new VisionTimeline();
+    const frames = [0, 1, 2, 3, 4].map((t) => ({ ...(men ? person(t, 0.03, 0.4) : fr(t)), scene: t === 4 ? 0.1 : 0.8 }));
+    tl.add({ from: 0, to: 6, frames, cuts: [], cutRange: [0, 6], edges: [] });
+    return some(tl, 1.5).verdict;
+  };
+  assert(clip(false) === 'full', 'nobody found, 4 of 5 looks say women: whole frame');
+  assert(clip(true) === 'full', '…and a man in the picture still needs only 80%: 4 of 5');
+  const tl = new VisionTimeline();
+  tl.add({ from: 0, to: 6, frames: [0, 1, 2, 3, 4].map((t) => ({ ...person(t, 0.03, 0.4), scene: t < 3 ? 0.9 : 0.2 })), cuts: [], cutRange: [0, 6], edges: [] });
+  assert(some(tl, 1.5).verdict === 'clear', 'men found, 3 of 5 looks say women: the scene model is probably wrong');
 });

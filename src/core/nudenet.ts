@@ -45,6 +45,10 @@ export const GROUPS = {
 };
 
 export const FEMALE_BODY_MIN = 0.6;
+/** How much a body-class score is worth next to a face probability (femaleScore, body lifting a face). */
+export const BODY_WEIGHT = 0.8;
+/** A face this surely a man is not turned into a woman by a body class firing on his chest. */
+export const MAN_FACE = 0.1;
 
 export interface FrameScores {
   nude: number;
@@ -114,13 +118,19 @@ export interface Box {
 }
 
 const FACE_CLASSES = idx('FACE_FEMALE', 'FACE_MALE');
+/**
+ * Faces the detector is less sure of than this are not classified: at 0.35–0.4 it is mostly
+ * cartoon faces, dolls, statues, car fronts and the like, and the gender classifier gives such
+ * "faces" arbitrary answers.
+ */
+export const FACE_MIN = 0.4;
 
 /**
  * Face boxes of image `b` (in the 320×320 letterboxed input space), after NMS.
  * NudeNet finds faces well but can't tell men from women (both come out as FACE_FEMALE),
  * so gender is decided by a separate classifier on these crops.
  */
-export function detectFaces(out: Float32Array, batch: number, b: number, minScore = 0.35, maxFaces = 6): Box[] {
+export function detectFaces(out: Float32Array, batch: number, b: number, minScore = FACE_MIN, maxFaces = 6): Box[] {
   return detectBoxes(out, batch, b, FACE_CLASSES, minScore, maxFaces);
 }
 
@@ -256,9 +266,13 @@ export function rgbaToGenderInput(rgba: Uint8ClampedArray | Uint8Array, n: numbe
   }
 }
 
-/** Woman score of a frame: the most confident female face, or revealing female body regions. */
+/**
+ * Woman score of a frame: the most confident female face, or revealing female body regions. The
+ * body classes also fire on clothed men (a printed T-shirt, a padded jacket), so they count for
+ * less than a face: 0.6 → 0.48, 1.0 → 0.8.
+ */
 export function femaleScore(faceProbs: number[], femaleBody: number): number {
-  let s = femaleBody >= FEMALE_BODY_MIN ? femaleBody : 0;
+  let s = femaleBody >= FEMALE_BODY_MIN ? femaleBody * BODY_WEIGHT : 0;
   for (const p of faceProbs) s = Math.max(s, p);
   return s;
 }

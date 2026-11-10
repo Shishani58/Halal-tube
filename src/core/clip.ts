@@ -17,10 +17,11 @@ export const CLIP_VIEWS = 3;
 /** Logit scale of the similarities (MobileCLIP's trained one). */
 const SCALE = 100;
 /**
- * A frame shows women at this score; see scripts/clip-prompts.mjs for how it was chosen.
+ * A frame shows women at this score. scripts/clip-prompts.mjs chose 0.5 on labelled pictures (about
+ * 1 in 10 groups of young men over it); 0.65 trades a little of the women found for fewer such errors.
  * The page also needs it on several frames of a shot (vision-timeline CLIP_MIN_*).
  */
-export const CLIP_WOMEN = 0.5;
+export const CLIP_WOMEN = 0.65;
 
 let text: Float32Array | null = null;
 function textEmbeds(): Float32Array {

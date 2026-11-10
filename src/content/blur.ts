@@ -9,7 +9,8 @@
  */
 import { MSG_NS, type Settings } from '../shared/messages';
 import { isInitSegment, type FromVision, type PageVision, type ToVision, type VisionStatus } from '../shared/vision-messages';
-import { VisionTimeline, type Decision } from '../core/vision-timeline';
+import { PART, VisionTimeline, type Decision } from '../core/vision-timeline';
+import { cutPlates, samePlate } from '../core/plates';
 import { StableBoxes } from '../core/stable-boxes';
 import { ThumbBlur } from './thumbs';
 
@@ -244,16 +245,21 @@ export class VisionController {
     if (!tl) return { verdict: 'unknown', rects: [] };
     const t = v.currentTime;
     const d = Number.isFinite(v.duration) ? v.duration : Infinity;
-    const p = { women: s.blurWomen };
+    const p = { women: s.blurWomen, strict: s.blurStrict };
     const lead = v.paused ? 0.04 : LEAD * Math.max(1, v.playbackRate);
     const out: Decision = { verdict: 'clear', rects: [] };
-    const rank = { clear: 0, region: 1, unknown: 2, full: 3 } as const;
+    // Strict: what isn't known yet outranks a found woman (the whole frame is blurred then).
+    // Otherwise a woman found at one of the three moments is blurred whatever the others know.
+    const rank = s.blurStrict ? ({ clear: 0, region: 1, unknown: 2, full: 3 } as const) : ({ clear: 0, unknown: 1, region: 2, full: 3 } as const);
+    const plates: number[][] = [];
     for (const x of [t, Math.max(0, t - LAG), Math.min(t + lead, d - 0.01)]) {
       const r = tl.decide(x, p, d);
       if (x === t) out.shot = r.shot;
       if (rank[r.verdict] > rank[out.verdict]) out.verdict = r.verdict;
       out.rects.push(...r.rects);
+      for (const q of r.plates ?? []) if (!plates.some((o) => samePlate(o, q))) plates.push(q);
     }
+    out.plates = plates;
     return out;
   }
 
@@ -267,7 +273,9 @@ export class VisionController {
     const t = v.currentTime;
     if (Math.abs(t - st.t) > 1.5) st.seeks++;
     st.t = t;
-    return st.boxes.update(d.rects, `${this.sessionOf(v)}|${d.shot ?? ''}|${st.seeks}`, performance.now());
+    const boxes = st.boxes.update(d.rects, `${this.sessionOf(v)}|${d.shot ?? ''}|${st.seeks}`, performance.now());
+    // a slide laid over her isn't her: heads stay covered, the rest gives way to the plate
+    return cutPlates(boxes, d.plates ?? [], d.rects.filter((r) => r[4] === PART.head));
   }
 
   private apply(v: HTMLVideoElement, blur: boolean): void {

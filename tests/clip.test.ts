@@ -38,5 +38,5 @@ test('VisionTimeline: women only CLIP sees blur the whole frame, if seen on enou
   const d = tl.decide(10, all, 16);
   assert(d.verdict === 'region' && d.rects.length === 1, `located: only where she is ${JSON.stringify(d)}`);
   assert(tl.decide(14, all, 16).verdict === 'clear', 'no scene model: clear');
-  assert(CLIP_WOMEN === 0.5, 'threshold');
+  assert(CLIP_WOMEN === 0.65, 'threshold');
 });

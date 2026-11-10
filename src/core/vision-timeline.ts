@@ -1,15 +1,33 @@
 import { CLIP_WOMEN } from './clip';
+import { area, grow, overlap, union } from './rects';
+import { platesBetween, platesOf } from './plates';
+
+export { area, grow, overlap, union };
 import { IntervalSet } from './intervals';
 import { VOICE_STEP, voiceSex } from './voice';
 import type { VisionFrame } from '../shared/vision-messages';
 
 /**
  * Thresholds: nudity groups are NudeNet confidences (it reports detections from 0.2–0.25);
- * `female` is the gender classifier's probability that a visible face is a woman; `femaleVoice`
- * replaces it where mostly a woman's voice is heard (see VOICE_FEMALE_SHARE). On 231 labelled
- * portraits: 0.3 finds 97.4% of women and takes 2.6% of men for women; 0.05 finds 98.3% / 7%.
+ * `female` is the gender classifier's probability that a visible face is a woman, for ONE look
+ * (on 231 labelled portraits 0.3 finds 97.4% of women and takes 2.6% of men for women). A single
+ * look is that unreliable on video — small, turned, blurred faces — so a person is called a woman
+ * only by several looks together (PERSON). `thumbFemale`: a thumbnail is one picture, often a
+ * stylised one with several faces, and gets no second look: it needs a surer one.
  */
-export const THRESHOLDS = { nude: 0.3, skin: 0.65, skinWeak: 0.5, female: 0.3, femaleVoice: 0.05 };
+export const THRESHOLDS = { nude: 0.3, skin: 0.65, skinWeak: 0.5, female: 0.3, thumbFemale: 0.6 };
+/**
+ * When a person (the looks of her face over a shot, clustered by position) is a woman. A look at
+ * `look` or more votes "woman"; she is one when the mean probability over all her looks
+ * (the looks that said "man" included) reaches `mean` and at least min(looks, 2) voted. Her only
+ * look needs `single`. A woman found by her body alone (no face; revealing-clothes classes fire on
+ * clothed men too) needs `bodyLooks` looks of `bodyMean` on average, or one of `bodySure`. Where a woman's voice is heard
+ * the most woman-like face of the shot (within `voiceBest` of the best mean) is enough from `voiceMean`.
+ */
+export const PERSON = { look: 0.3, mean: 0.4, single: 0.5, bodyLooks: 2, bodyMean: 0.5, bodySure: 0.85, voiceMean: 0.2, voiceBest: 0.85 };
+/** A face this surely a man over at least MAN_LOOKS looks: a scene model's "women" doubts then need more votes. */
+export const MAN_MEAN = 0.12;
+export const MAN_LOOKS = 2;
 /**
  * `skin` (bare torso / belly) is a weak signal: NudeNet takes a dark jacket over a printed T-shirt,
  * or a sun-lit forearm, for it at 0.3–0.57 for seconds at a time (a clothed man in a car review
@@ -29,12 +47,15 @@ export const VOICE_MIN_WINDOWS = 2;
 /**
  * Women nobody located (MobileCLIP sees them, no face or body was found): the whole frame is
  * blurred when at least CLIP_MIN_FRAMES looks in this part of the shot, and CLIP_MIN_SHARE of
- * them, score CLIP_WOMEN — one stray frame of a group of men doesn't blur their scene.
+ * them, score CLIP_WOMEN — one stray frame of a group of men doesn't blur their scene. When faces
+ * were found and all of them are men's, the scene model is probably confusing a group of men with
+ * women (it does that for about 1 in 10 such pictures): then CLIP_MIN_SHARE_MEN of the looks.
  */
 export const CLIP_MIN_FRAMES = 2;
+export const CLIP_MIN_SHARE_MEN = 0.8;
 /** What a woman's rect covers (VisionFrame.parts): heads and bodies are kept as separate boxes. */
 export const PART = { whole: 0, head: 1, body: 2 } as const;
-export const CLIP_MIN_SHARE = 0.3;
+export const CLIP_MIN_SHARE = 0.5;
 /**
  * Decisions are made per shot (the frames between two cuts): what is found anywhere in a shot holds
  * for all of it, so a woman is hidden from the shot's first frame even if her face only shows later.
@@ -62,10 +83,17 @@ export const MOTION_MARGIN = 0.25;
  */
 export const PERSON_MARGIN = { x: 0.06, top: 0.03, bottom: 0.06 };
 export const MIN_MARGIN = 0.025;
+/** Plates are taken from the looks this close (seconds) before and after the moment. */
+export const PLATE_REACH = 0.8;
 
 export interface BlurPolicy {
   /** Blur women (besides nudity, which is always blurred). */
   women: boolean;
+  /**
+   * Strict mode blurs whatever isn't certain yet: a shot not checked far enough ahead is 'unknown'
+   * whatever was found in it. Otherwise what was found so far is acted on at once.
+   */
+  strict?: boolean;
 }
 
 /**
@@ -80,13 +108,15 @@ export interface Decision {
   rects: number[][];
   /** Start of the shot t is in (boxes are kept still within a shot). */
   shot?: number;
+  /** Overlay plates in the picture at t (frame-relative [x, y, w, h]): not part of anyone, never blurred. */
+  plates?: number[][];
 }
 
 interface ShotInfo {
   key: string;
   /** Indices (into frames, ascending) of frames with nudity… */
   nude: number[];
-  /** …with someone who may be a woman (at the lowest threshold)… */
+  /** …with a person found (a face or body; whether a woman is decided over all of them)… */
   women: number[];
   /** …and with a scene score: all of them, and those showing women. */
   scene: number[];
@@ -183,7 +213,11 @@ export class VisionTimeline {
     if (!this.checked.has(t)) return none;
     const [a, b] = this.shotAt(t);
     const until = Math.min(b, t + SHOT_AHEAD, end - 0.05);
-    if (until > t && !this.checked.covers(t, until)) return none;
+    // The shot isn't checked far enough ahead. What is found so far still counts (a woman already
+    // seen, nudity), so the blur doesn't drop out whenever the checking is close behind the playhead;
+    // only a clear verdict can't be given yet.
+    const ahead = until <= t || this.checked.covers(t, until);
+    if (!ahead && p.strict) return none;
 
     const s = this.shotInfo(a, b);
     const lo = Math.max(a, t - SHOT_REACH), hi = Math.min(b, t + SHOT_REACH);
@@ -193,25 +227,47 @@ export class VisionTimeline {
     };
     const n = near(s.nude);
     if ((n.prev !== undefined && this.frames[n.prev].t >= lo) || (n.next !== undefined && this.frames[n.next].t < hi)) return { verdict: 'full', rects: [] };
-    if (!p.women) return { verdict: 'clear', rects: [] };
+    if (!p.women) return ahead ? { verdict: 'clear', rects: [] } : none;
 
-    // every look at a woman in this part of the shot, grouped into people; faces the classifier
-    // isn't sure about count when a woman's voice is heard
-    const th = this.womanHeard(lo, hi) ? THRESHOLDS.femaleVoice : THRESHOLDS.female;
+    // every look at anyone in this part of the shot (men's too: they vote against), grouped into
+    // people; each is judged on all her looks together, not on her most woman-like one
     const looks: Look[] = [];
     for (const i of s.women) {
       const f = this.frames[i];
       if (f.t < lo || f.t >= hi) continue;
-      for (const r of womenOf(f, th)) looks.push({ t: f.t, r });
+      looks.push(...looksOf(f));
     }
+    const group = people(looks);
+    const stats = group.map(statsOf);
+    const heads = stats.filter((_, i) => group[i].part !== PART.whole);
+    const best = Math.max(0, ...heads.map((x) => x.mean));
+    const voice = this.womanHeard(lo, hi);
     const rects: number[][] = [];
-    for (const person of people(looks)) rects.push([...this.whereIs(person, t), person[0].r[4]]);
-    if (rects.length) return { verdict: 'region', rects, shot: a };
+    group.forEach((person, i) => {
+      const st = stats[i];
+      const byVoice = voice && person.part !== PART.whole && st.mean >= PERSON.voiceMean && st.mean >= PERSON.voiceBest * best;
+      if (!isWoman(st, person.part) && !byVoice) return;
+      rects.push([...this.whereIs(person.anchors, t), person.part]);
+      if (person.bodies.length) rects.push([...this.whereIs(person.bodies, t), PART.body]);
+    });
+    if (rects.length) return { verdict: 'region', rects, shot: a, plates: this.platesAt(t, a, b) };
+    if (!ahead) return none;
     // women seen in the picture, but not where they are: all of it
     const inRange = (idx: number[]) => idx.filter((i) => this.frames[i].t >= lo && this.frames[i].t < hi).length;
     const k = inRange(s.sceneWomen);
-    if (k >= CLIP_MIN_FRAMES && k >= CLIP_MIN_SHARE * inRange(s.scene)) return { verdict: 'full', rects: [], shot: a };
+    const men = heads.some((x) => x.n >= MAN_LOOKS && x.mean <= MAN_MEAN);
+    if (k >= CLIP_MIN_FRAMES && k >= (men ? CLIP_MIN_SHARE_MEN : CLIP_MIN_SHARE) * inRange(s.scene)) return { verdict: 'full', rects: [], shot: a };
     return { verdict: 'clear', rects: [], shot: a };
+  }
+
+  /**
+   * The overlay plates at t: those of the looks just before and just after it, in this shot (see
+   * platesBetween).
+   */
+  private platesAt(t: number, a: number, b: number): number[][] {
+    const k = this.lowerBound(this.frames, t + 1e-4);
+    const look = (f: VisionFrame | undefined) => (f && f.t >= a - 1e-4 && f.t < b - 1e-4 && Math.abs(f.t - t) <= PLATE_REACH ? platesOf(f.plates) : null);
+    return platesBetween(look(this.frames[k - 1]), look(this.frames[k]));
   }
 
   /** Where to blur one person (her looks in this part of the shot) at t. */
@@ -263,7 +319,7 @@ export class VisionTimeline {
       const f = this.frames[i];
       if (f.skin >= THRESHOLDS.skinWeak && f.skin < THRESHOLDS.skin) weakSkin.push(i);
       if (f.nude >= THRESHOLDS.nude || f.skin >= THRESHOLDS.skin) nude.push(i);
-      if (womenOf(f, Math.min(THRESHOLDS.female, THRESHOLDS.femaleVoice)).length) women.push(i);
+      if (f.women.length) women.push(i);
       if (f.scene !== undefined) {
         scene.push(i);
         if (f.scene >= CLIP_WOMEN) sceneWomen.push(i);
@@ -290,40 +346,85 @@ export class VisionTimeline {
 
 interface Look {
   t: number;
+  /** [x, y, w, h, part] */
   r: number[];
+  /** Probability that this person is a woman, by this look. */
+  p: number;
+  /** A body look: the head look of the same face (they share `p`). */
+  of?: Look;
+}
+
+/** A person: her head (or whole-person) looks, and the body looks that belong to them. */
+interface Person {
+  part: number;
+  anchors: Look[];
+  bodies: Look[];
+}
+
+/** Every look in a frame: for each person a head (or whole) rect, and a body rect that follows it. */
+function looksOf(f: VisionFrame): Look[] {
+  const out: Look[] = [];
+  let anchor: Look | undefined;
+  for (let j = 0, i = 0; j + 4 < f.women.length; j += 5, i++) {
+    const part = f.parts?.[i] ?? PART.whole;
+    const look: Look = { t: f.t, r: [f.women[j], f.women[j + 1], f.women[j + 2], f.women[j + 3], part], p: f.women[j + 4] };
+    if (part === PART.body && anchor) look.of = anchor;
+    else anchor = look;
+    out.push(look);
+  }
+  return out;
 }
 
 /**
- * Looks whose boxes overlap (directly or through others) are the same person — or the same part
- * of her: heads go with heads and bodies with bodies. Mixed, a head seen a little lower in one
- * frame overlaps the body of another, and the chain joins them into one box over the whole frame.
+ * Looks whose boxes overlap (directly or through others) are the same person. Her head (or whole
+ * body, when no face was found) decides who is who: heads go with heads, and a body look follows
+ * its own head. Bodies clustered among themselves chained neighbours into one person, and a head
+ * seen a little lower in one frame overlaps the body of another — one box over the whole frame.
  */
-function people(looks: Look[]): Look[][] {
-  const parent = looks.map((_, i) => i);
+function people(looks: Look[]): Person[] {
+  const anchors = looks.filter((l) => !l.of);
+  const parent = anchors.map((_, i) => i);
   const root = (i: number): number => (parent[i] === i ? i : (parent[i] = root(parent[i])));
-  for (let i = 0; i < looks.length; i++)
-    for (let j = i + 1; j < looks.length; j++)
-      if (looks[i].r[4] === looks[j].r[4] && overlap(looks[i].r, looks[j].r) > 0.3) parent[root(i)] = root(j);
-  const groups = new Map<number, Look[]>();
-  looks.forEach((l, i) => {
+  for (let i = 0; i < anchors.length; i++)
+    for (let j = i + 1; j < anchors.length; j++)
+      if (anchors[i].r[4] === anchors[j].r[4] && overlap(anchors[i].r, anchors[j].r) > 0.3) parent[root(i)] = root(j);
+  const groups = new Map<number, Person>();
+  const of = new Map<Look, Person>();
+  anchors.forEach((l, i) => {
     const k = root(i);
-    const g = groups.get(k);
-    if (g) g.push(l);
-    else groups.set(k, [l]);
+    let g = groups.get(k);
+    if (!g) groups.set(k, (g = { part: l.r[4], anchors: [], bodies: [] }));
+    g.anchors.push(l);
+    of.set(l, g);
   });
+  for (const l of looks) if (l.of) of.get(l.of)?.bodies.push(l);
   return [...groups.values()];
 }
 
-/** Intersection over the smaller of the two areas. */
-export function overlap(a: number[], b: number[]): number {
-  const w = Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0]);
-  const h = Math.min(a[1] + a[3], b[1] + b[3]) - Math.max(a[1], b[1]);
-  if (w <= 0 || h <= 0) return 0;
-  return (w * h) / Math.max(1e-9, Math.min(area(a), area(b)));
+interface Stats {
+  n: number;
+  /** Looks at THRESHOLDS.female or more. */
+  votes: number;
+  mean: number;
+  max: number;
 }
 
-export function area(r: number[]): number {
-  return Math.max(0, r[2]) * Math.max(0, r[3]);
+function statsOf(person: Person): Stats {
+  let votes = 0, sum = 0, max = 0;
+  for (const l of person.anchors) {
+    if (l.p >= PERSON.look) votes++;
+    sum += l.p;
+    max = Math.max(max, l.p);
+  }
+  const n = person.anchors.length;
+  return { n, votes, mean: sum / Math.max(1, n), max };
+}
+
+/** Is this person a woman (PERSON)? */
+export function isWoman(s: Stats, part: number): boolean {
+  if (part === PART.whole) return (s.n >= PERSON.bodyLooks && s.mean >= PERSON.bodyMean) || s.max >= PERSON.bodySure;
+  if (s.n === 1) return s.max >= PERSON.single;
+  return s.mean >= PERSON.mean && s.votes >= 2;
 }
 
 /** A person's box with her margin. */
@@ -333,24 +434,4 @@ function pad(r: number[]): number[] {
   const y0 = Math.max(0, r[1] - Math.max(MIN_MARGIN, PERSON_MARGIN.top * r[2]));
   const y1 = Math.min(1, r[1] + r[3] + Math.max(MIN_MARGIN, PERSON_MARGIN.bottom * r[3]));
   return [x0, y0, x1 - x0, y1 - y0];
-}
-
-/** The women in a frame (score at least th), [x, y, w, h, part] each (PART). */
-function womenOf(f: VisionFrame, th: number): number[][] {
-  const out: number[][] = [];
-  for (let j = 0, i = 0; j + 4 < f.women.length; j += 5, i++) {
-    if (f.women[j + 4] >= th) out.push([f.women[j], f.women[j + 1], f.women[j + 2], f.women[j + 3], f.parts?.[i] ?? PART.whole]);
-  }
-  return out;
-}
-
-export function grow(r: number[], m: number): number[] {
-  const x0 = Math.max(0, r[0] - m), y0 = Math.max(0, r[1] - m);
-  const x1 = Math.min(1, r[0] + r[2] + m), y1 = Math.min(1, r[1] + r[3] + m);
-  return [x0, y0, x1 - x0, y1 - y0];
-}
-
-export function union(a: number[], b: number[]): number[] {
-  const x0 = Math.min(a[0], b[0]), y0 = Math.min(a[1], b[1]);
-  return [x0, y0, Math.max(a[0] + a[2], b[0] + b[2]) - x0, Math.max(a[1] + a[3], b[1] + b[3]) - y0];
 }

@@ -36,6 +36,11 @@ export interface VisionFrame {
   women: number[];
   /** Part of the person each `women` rect covers (vision-timeline PART: 1 head, 2 body); absent: 0 (whole). */
   parts?: number[];
+  /**
+   * Overlay plates (slides, cards laid over the picture), flat [x, y, w, h, …] frame-relative; the
+   * blur leaves them alone. Only plates that hold no face (video frames only).
+   */
+  plates?: number[];
   /** MobileCLIP: how surely the frame shows women at all, wherever they are (video frames only). */
   scene?: number;
 }
