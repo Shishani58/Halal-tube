@@ -23,6 +23,15 @@
     "storage",
     "offscreen"
   ],
+  "commands": {
+    "toggle-enabled": {
+      "suggested_key": { "default": "Alt+Shift+M" },
+      "description": "Включить / выключить расширение"
+    },
+    "toggle-blur": {
+      "description": "Включить / выключить размытие видео"
+    }
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"

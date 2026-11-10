@@ -9,7 +9,19 @@ export type ToVision =
   | { type: 'sb-init'; session: number; sb: number; mime: string }
   | { type: 'append'; session: number; sb: number; data: ArrayBuffer; tsOffset: number }
   | { type: 'abort'; session: number; sb: number }
-  | { type: 'position'; session: number; time: number; duration: number; enabled: boolean }
+  | {
+      type: 'position';
+      session: number;
+      time: number;
+      duration: number;
+      enabled: boolean;
+      /**
+       * The YouTube id of the video, once it has been stable for a moment: with the length, it keys
+       * what the classifier kept from earlier viewings. Absent: don't keep (unknown id, a live
+       * stream, or the page asked not to).
+       */
+      videoId?: string;
+    }
   /** Classify a still image (a video thumbnail), fetched by the worker. */
   | { type: 'image'; url: string };
 
@@ -22,6 +34,8 @@ export type FromVision =
    */
   | { type: 'result'; session: number; from: number; to: number; frames: VisionFrame[]; cuts: number[]; cutRange: [number, number]; edges: [number, number][] }
   | { type: 'status'; status: VisionStatus }
+  /** What an earlier viewing of this session's video found (see processor/vision-store.ts). */
+  | { type: 'cache'; session: number; data: import('../core/vision-timeline').CacheData }
   /** A classified image (`frame`), or why it couldn't be (`error`). */
   | { type: 'image'; url: string; frame?: VisionFrame; error?: string };
 
@@ -55,6 +69,8 @@ export interface VisionStatus {
   speed: number;
   /** Seconds of video checked ahead of the playhead (contiguous). */
   ahead: number;
+  /** Results of the WebGPU self-test of the detector and the scene model (processor/model.ts). */
+  selfTest?: string;
   /** Cumulative milliseconds per pipeline stage since the worker started (profiling). */
   timings?: Record<string, number>;
 }

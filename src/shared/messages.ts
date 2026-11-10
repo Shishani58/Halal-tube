@@ -100,6 +100,8 @@ export interface WorkerStatus {
   asrError?: string;
   /** Average recognition time per tile (ms). */
   asrMs?: number;
+  /** Result of the WebGPU self-test of the separation model (processor/model.ts). */
+  selfTest?: string;
 }
 
 export type ProfanityMode = 'off' | 'mute' | 'beep';
@@ -141,6 +143,12 @@ export interface Settings {
   showBadge: boolean;
   /** Remove background music (off: the profanity filter alone works on the original sound). */
   musicRemoval: boolean;
+  /**
+   * How much of the music to take out, 0–100 %: the clean voice is mixed with the original in this
+   * proportion (100: voice only). Ignored while the profanity filter is on (the original would let
+   * the muted words through).
+   */
+  musicStrength: number;
   /** Profanity (мат) filter: off, silence the word, or beep over it. */
   profanity: ProfanityMode;
   /** Blur video frames with nudity (men and women). */
@@ -151,9 +159,27 @@ export interface Settings {
   blurStrict: boolean;
   /** Also check and blur video thumbnails (feed, recommendations, end screen). */
   blurThumbs: boolean;
+  /** How readily video frames are blurred: soft (fewer false blurs) · normal · strict (blur when in doubt). */
+  blurLevel: 'soft' | 'normal' | 'strict';
+  /** Reveal a blurred thumbnail while the pointer rests on it. */
+  blurHover: boolean;
+  /** How hidden parts look: a blur, or a solid dark cover (nothing of the picture shows through). */
+  blurStyle: 'blur' | 'solid';
+  /** Keep what the frame classifier found in a video, so the next viewing needs no checking. */
+  blurCache: boolean;
 }
 
-export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, musicRemoval: true, profanity: 'off', blur: true, blurWomen: true, blurStrict: true, blurThumbs: true };
+export const DEFAULT_SETTINGS: Settings = { enabled: true, mode: 'strict', showBadge: true, musicRemoval: true, musicStrength: 100, profanity: 'off', blur: true, blurWomen: true, blurStrict: true, blurThumbs: true, blurLevel: 'normal', blurHover: false, blurStyle: 'blur', blurCache: true };
+
+/**
+ * Share of the clean (voice-only) sound in what is heard, 0–1; the rest is the original track.
+ * Always 1 while the profanity filter is on, and out-of-range values are clamped.
+ */
+export function cleanShare(s: Pick<Settings, 'musicStrength' | 'profanity' | 'musicRemoval'>): number {
+  if (s.profanity !== 'off' || !s.musicRemoval) return 1;
+  const v = Number(s.musicStrength);
+  return Number.isFinite(v) ? Math.min(1, Math.max(0, v / 100)) : 1;
+}
 
 /** What the page reports for the popup. */
 export interface PageStatus {

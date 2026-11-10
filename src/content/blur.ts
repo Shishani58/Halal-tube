@@ -25,6 +25,8 @@ interface VideoSb {
 }
 
 const MAX_SBS = 8;
+/** A video id must be shown by the player this long (ms) before findings are kept under it. */
+const ID_STABLE_MS = 1500;
 const MAX_TIMELINES = 8;
 /**
  * The frame on screen can be a little ahead of `currentTime` (and the boxes land on the next
@@ -78,6 +80,7 @@ export class VisionController {
   /** Video thumbnails (feed, sidebar, end screen). */
   private readonly thumbs = new ThumbBlur((m) => this.send(m));
   private raf = 0;
+  private idSeen: { session: number; id: string; duration: number; since: number } | null = null;
   /** Women boxes on the active video right now. */
   private regions = 0;
   status: VisionStatus | null = null;
@@ -139,6 +142,7 @@ export class VisionController {
   onMessage(msg: FromVision): void {
     if (msg.type === 'status') this.status = msg.status;
     else if (msg.type === 'image') this.thumbs.onResult(msg);
+    else if (msg.type === 'cache') this.timelineFor(msg.session).load(msg.data);
     else if (msg.type === 'result') {
       let tl = this.timelines.get(msg.session);
       if (tl) this.timelines.delete(msg.session); // re-inserted below: least-recently-updated order
@@ -161,6 +165,35 @@ export class VisionController {
       if (this.timelines.size > MAX_TIMELINES) this.timelines.delete(this.timelines.keys().next().value!);
     }
     tl.addVoice(start, f0s);
+  }
+
+  private timelineFor(session: number): VisionTimeline {
+    let tl = this.timelines.get(session);
+    if (!tl) {
+      tl = new VisionTimeline();
+      this.timelines.set(session, tl);
+      if (this.timelines.size > MAX_TIMELINES) this.timelines.delete(this.timelines.keys().next().value!);
+    }
+    return tl;
+  }
+
+  /**
+   * The YouTube id of the video in this session, when the player has shown the same one for a
+   * moment (on a page change the player's data lags behind the new stream) and it is a recorded
+   * video, not an ad or a live stream. Undefined: nothing is kept for it.
+   */
+  private videoId(session: number, duration: number): string | undefined {
+    const s = this.getSettings();
+    const p = document.getElementById('movie_player') as (HTMLElement & { getPlayerResponse?: () => { videoDetails?: { videoId?: string; isLive?: boolean } } }) | null;
+    const details = s.blurCache && Number.isFinite(duration) && !p?.classList.contains('ad-showing') ? p?.getPlayerResponse?.()?.videoDetails : undefined;
+    const id = details && !details.isLive ? details.videoId : undefined;
+    const now = performance.now();
+    if (!id) {
+      this.idSeen = null;
+      return undefined;
+    }
+    if (!this.idSeen || this.idSeen.session !== session || this.idSeen.id !== id || this.idSeen.duration !== Math.round(duration)) this.idSeen = { session, id, duration: Math.round(duration), since: now };
+    return now - this.idSeen.since >= ID_STABLE_MS ? id : undefined;
   }
 
   timeline(session: number): VisionTimeline | undefined {
@@ -187,7 +220,8 @@ export class VisionController {
       if (session && (on || this.lastPos)) {
         this.lastPos = on ? now : 0;
         const d = activeVideo.duration;
-        this.send({ type: 'position', session, time: activeVideo.currentTime, duration: Number.isFinite(d) ? d : Infinity, enabled: on });
+        const duration = Number.isFinite(d) ? d : Infinity;
+        this.send({ type: 'position', session, time: activeVideo.currentTime, duration, enabled: on, videoId: on ? this.videoId(session, duration) : undefined });
       }
     }
   }
@@ -245,7 +279,7 @@ export class VisionController {
     if (!tl) return { verdict: 'unknown', rects: [] };
     const t = v.currentTime;
     const d = Number.isFinite(v.duration) ? v.duration : Infinity;
-    const p = { women: s.blurWomen, strict: s.blurStrict };
+    const p = { women: s.blurWomen, strict: s.blurStrict, level: s.blurLevel };
     const lead = v.paused ? 0.04 : LEAD * Math.max(1, v.playbackRate);
     const out: Decision = { verdict: 'clear', rects: [] };
     // Strict: what isn't known yet outranks a found woman (the whole frame is blurred then).
@@ -282,7 +316,7 @@ export class VisionController {
     if (blur) {
       const r = v.getBoundingClientRect();
       const px = Math.max(24, Math.round(Math.min(r.width, r.height) / 8));
-      const want = `blur(${px}px)`;
+      const want = this.getSettings().blurStyle === 'solid' ? 'brightness(0)' : `blur(${px}px)`;
       if (v.style.getPropertyValue('filter') !== want) v.style.setProperty('filter', want, 'important');
       this.blurred.add(v);
     } else if (this.blurred.has(v)) {
@@ -336,7 +370,9 @@ export class VisionController {
         return;
       }
       const w = x1 - x0, h = y1 - y0;
-      const f = `blur(${Math.max(16, Math.round(Math.min(w, h) / 5))}px)`;
+      const solid = this.getSettings().blurStyle === 'solid';
+      const f = solid ? 'none' : `blur(${Math.max(16, Math.round(Math.min(w, h) / 5))}px)`;
+      b.style.background = solid ? '#0b0b0b' : 'rgba(120,120,120,.25)';
       b.style.display = 'block';
       b.style.left = `${x0}px`;
       b.style.top = `${y0}px`;

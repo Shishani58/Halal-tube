@@ -7,6 +7,7 @@
 import {
   DEFAULT_SETTINGS,
   MSG_NS,
+  cleanShare,
   filterKey,
   needsProcessor,
   type FilterConfig,
@@ -21,6 +22,8 @@ import { timeStretch } from '../core/stretch';
 import type { FromVision } from '../shared/vision-messages';
 import { VisionController } from './blur';
 import { Captions } from './captions';
+import { ThumbHover } from './thumb-hover';
+import { ThumbCover } from './thumb-cover';
 
 declare global {
   interface Window {
@@ -50,6 +53,9 @@ declare global {
     () => settings,
     (v) => sessionOf(v),
   );
+
+  const thumbHover = new ThumbHover();
+  const thumbCover = new ThumbCover();
 
   // ───────────────────────── MSE hooks ─────────────────────────
   let nextId = 1;
@@ -184,6 +190,8 @@ declare global {
     }
     if (d.from === 'bridge' && e.source === window && d.kind === 'settings' && d.settings) {
       settings = { ...DEFAULT_SETTINGS, ...d.settings };
+      thumbHover.apply(settings.enabled && settings.blur && settings.blurThumbs && settings.blurHover);
+      thumbCover.apply(settings.enabled && settings.blur && settings.blurThumbs && settings.blurStyle === 'solid');
       tick();
       return;
     }
@@ -407,9 +415,12 @@ declare global {
       for (const [kk, tl] of this.tiles) if (tl.validFrom > tl.start && t < tl.validFrom - 0.5) this.tiles.delete(kk);
       const cur = this.tiles.get(k);
       const hasNow = !!cur && t >= cur.validFrom - 0.02;
-      const origTarget = settings.mode === 'lenient' && !hasNow ? 1 : 0;
+      // Strength below 100 %: the original track is heard too, `share` clean + (1 − share) original
+      // (the original already follows the element's volume and mute; the clean tiles don't).
+      const share = cleanShare(settings);
+      const origTarget = settings.mode === 'lenient' && !hasNow ? 1 : hasNow ? 1 - share : 0;
       a.orig.gain.setTargetAtTime(origTarget, ctx.currentTime, 0.015);
-      this.clean.gain.value = v.muted ? 0 : v.volume;
+      this.clean.gain.setTargetAtTime(v.muted ? 0 : v.volume * share, ctx.currentTime, 0.015);
 
       const playing = !v.paused && !v.ended && !v.seeking && v.readyState >= 3;
       if (!playing || ctx.state !== 'running') {

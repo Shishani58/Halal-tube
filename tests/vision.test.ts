@@ -1,9 +1,10 @@
 import { IntervalSet } from '../src/core/intervals';
 import { NUDENET_LABELS, detectFaces, faceCrop, femaleProb, femaleScore, letterbox, personFromBody, personFromFace, rgbaToChw, scoreFrames } from '../src/core/nudenet';
 import { ShotTracker, THUMB_H, THUMB_W, isCut, makeThumb, thumbDiff } from '../src/core/shots';
-import { VisionTimeline, isWoman } from '../src/core/vision-timeline';
+import { VisionTimeline, isWoman, pictureWomen } from '../src/core/vision-timeline';
 import { StableBoxes } from '../src/core/stable-boxes';
-import { thumbKey } from '../src/content/thumbs';
+import { contentBox, pictureKey, thumbKey } from '../src/content/thumbs';
+import { clipTiles, tileBox } from '../src/core/clip';
 import { assert, test } from './harness';
 
 test('IntervalSet merges, answers coverage, trims', () => {
@@ -320,4 +321,49 @@ test('VisionTimeline: a woman seen by her body alone needs two looks; men stay o
   const tl = new VisionTimeline();
   tl.add({ from: 0, to: 6, frames: [0, 1, 2, 3, 4].map((t) => ({ ...person(t, 0.03, 0.4), scene: t < 3 ? 0.9 : 0.2 })), cuts: [], cutRange: [0, 6], edges: [] });
   assert(some(tl, 1.5).verdict === 'clear', 'men found, 3 of 5 looks say women: the scene model is probably wrong');
+});
+
+test('Thumbnail: a woman is judged by all looks at her; a man outvotes a stray crop', () => {
+  const look = (p: number, x = 0.2): { t: number; nude: number; skin: number; female: number; women: number[] } => ({ t: 0, nude: 0, skin: 0, female: p, women: [x, 0.2, 0.1, 0.15, p] });
+  // seen whole and in a part, both sure: a woman
+  assert(pictureWomen([look(0.9), look(0.8)]).female === 0.9, 'woman');
+  // one crop says 0.7, the whole picture says "man": mean 0.375 → not a woman
+  assert(pictureWomen([look(0.05), look(0.7)]).female === 0, 'man outvotes a stray crop');
+  // a single look needs THRESHOLDS.thumbFemale
+  assert(pictureWomen([look(0.55)]).female === 0 && pictureWomen([look(0.65)]).female === 0.65, 'single look');
+  // a man elsewhere in the picture doesn't hide the woman, and isn't one
+  const both = { t: 0, nude: 0, skin: 0, female: 0, women: [0.2, 0.2, 0.1, 0.15, 0.9, 0.7, 0.2, 0.1, 0.15, 0.03] };
+  assert(pictureWomen([both]).female === 0.9, 'woman and man');
+  const men = { t: 0, nude: 0, skin: 0, female: 0, women: [0.7, 0.2, 0.1, 0.15, 0.03] };
+  assert(pictureWomen([men, men]).female === 0, 'men only');
+  // an unsure face (0.35) counts only in soft mode, i.e. when the scene model backs it up; a man's (0.05) never
+  assert(pictureWomen([look(0.35)]).female === 0 && pictureWomen([look(0.35)], 'unsure').female === 0.6, 'unsure face');
+  assert(pictureWomen([look(0.05)], 'unsure').female === 0, 'a man is no woman even when softened');
+  const men2 = { t: 0, nude: 0, skin: 0, female: 0, women: [0.1, 0.2, 0.1, 0.15, 0.03, 0.7, 0.2, 0.1, 0.15, 0.03] };
+  // the picture's only person is taken whatever the classifier said; with two people, no guessing which
+  assert(pictureWomen([look(0.05), look(0.06)], 'lone').rects.length === 1, 'lone person');
+  assert(pictureWomen([men2], 'lone').rects.length === 0, 'two people: not lone');
+  // only the woman gets a box, the man beside her none
+  const w = pictureWomen([both]);
+  assert(w.rects.length === 1 && w.rects[0][0] <= 0.2 && w.rects[0][0] + w.rects[0][2] < 0.5, JSON.stringify(w.rects));
+});
+
+test('Thumbnail: object-fit maps the picture into the <img> box; keys are per picture', () => {
+  // 4:3 picture in a 16:9 box, cover: scaled to the width, cropped top and bottom
+  const c = contentBox(480, 360, 320, 180, 'cover', '50% 50%');
+  assert(Math.abs(c.w - 320) < 1e-6 && Math.abs(c.h - 240) < 1e-6 && Math.abs(c.y + 30) < 1e-6, JSON.stringify(c));
+  const f = contentBox(480, 360, 320, 180, 'fill', '50% 50%');
+  assert(f.x === 0 && f.w === 320 && f.h === 180, 'fill');
+  const n = contentBox(480, 360, 320, 180, 'contain', '50% 50%');
+  assert(Math.abs(n.w - 240) < 1e-6 && Math.abs(n.x - 40) < 1e-6, JSON.stringify(n));
+  assert(pictureKey('https://i.ytimg.com/vi/a/hqdefault.jpg?sqp=x') === '//i.ytimg.com/vi/a/hqdefault.jpg' && pictureKey('https://i.ytimg.com/vi/a/mqdefault.jpg') !== pictureKey('https://i.ytimg.com/vi/a/hqdefault.jpg'), 'key');
+});
+
+test('Thumbnail strips: the scene model locates women without a face', () => {
+  const tiles = clipTiles(320, 180);
+  assert(tiles.length === 5 && tiles[0][0] === 0 && tiles[4][0] + tiles[4][2] === 320 && clipTiles(100, 200).length === 0, JSON.stringify(tiles));
+  // the real scores of a woman (left) beside a man on a 320×180 thumbnail
+  const box = tileBox([0.873, 0.905, 0.237, 0.1, 0.04], tiles, 320)!;
+  assert(box[0] === 0 && box[3] === 1 && box[2] > 0.3 && box[2] < 0.7, JSON.stringify(box));
+  assert(tileBox([0.2, 0.1, 0.5, 0.3, 0.02], tiles, 320) === null, 'no strip says "woman"');
 });

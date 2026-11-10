@@ -12,6 +12,13 @@ chrome.runtime.onInstalled.addListener(async () => {
   await refreshBadge();
 });
 
+/** Keyboard shortcuts (chrome://extensions/shortcuts): flip a switch the popup also shows. */
+chrome.commands.onCommand.addListener(async (command) => {
+  const s = (await chrome.storage.sync.get(DEFAULT_SETTINGS)) as Settings;
+  if (command === 'toggle-enabled') await chrome.storage.sync.set({ enabled: !s.enabled });
+  else if (command === 'toggle-blur') await chrome.storage.sync.set({ blur: !s.blur });
+});
+
 chrome.runtime.onStartup.addListener(() => void refreshBadge());
 chrome.storage.onChanged.addListener((_c, area) => {
   if (area === 'sync') void refreshBadge();

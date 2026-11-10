@@ -9,12 +9,13 @@ import { createDemuxer, type Demuxer } from '../core/demux';
 import { KIM_VOCAL_2, MdxProcessor } from '../core/mdx';
 import { wordsIn } from '../core/captions';
 import type { Word } from '../core/profanity';
+import { keepOriginalWhereClean } from '../core/passthrough';
 import { resampleCubic } from '../core/resample';
 import { voicePitch } from '../core/voice';
 import { Tiling } from '../core/tiles';
 import { DEFAULT_FILTER, filterKey, type CaptionState, type FilterConfig, type FromWorker, type ToWorker, type WorkerStatus } from '../shared/messages';
 import { decodePackets, type DecodedAudio } from './decode';
-import { loadModel, type LoadedModel } from './model';
+import { describeSelfTest, loadModel, type LoadedModel } from './model';
 import { PacketStore } from './packet-store';
 import { CONTEXT_S, ProfanityStage } from './profanity-stage';
 
@@ -71,7 +72,7 @@ let model: LoadedModel | null = null;
 let modelEverLoaded = false;
 let busy = false;
 let lastPlayingAt = Date.now();
-const model$: Pick<WorkerStatus, 'model' | 'backend' | 'error' | 'rtf' | 'tilesDone'> = {
+const model$: Pick<WorkerStatus, 'model' | 'backend' | 'error' | 'rtf' | 'tilesDone' | 'selfTest'> = {
   model: 'idle',
   backend: '-',
   rtf: 0,
@@ -183,6 +184,7 @@ async function initModel(): Promise<void> {
     modelEverLoaded = true;
     model$.model = 'ready';
     model$.backend = model.backend;
+    model$.selfTest = describeSelfTest(model);
   } catch (e) {
     model$.model = 'error';
     model$.error = e instanceof Error ? e.message : String(e);
@@ -408,6 +410,8 @@ async function finish(job: Job, pred: Float32Array | undefined): Promise<void> {
   const [left, right] = pred ? mdx.istftTrimmed(pred) : [L.slice(trim, trim + G), R.slice(trim, trim + G)];
   // the voice's pitch on the vocals (before the profanity filter beeps over them)
   const voice = f.musicRemoval ? voicePitch(left, right, tiling.rate) : undefined;
+  // plain speech (nothing taken out) is better left as it was: swap in the original there
+  if (pred) keepOriginalWhereClean(left, right, L.subarray(trim, trim + G), R.subarray(trim, trim + G), tiling.rate);
   const { report, patch } =
     f.profanity !== 'off'
       ? await profanity.filterTile({ session: sessionId, k, start: tiling.tileStart(k), validFrom, rate: tiling.rate, left, right, decoded, separated: f.musicRemoval, mode: f.profanity, debug })

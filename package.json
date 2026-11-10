@@ -16,7 +16,8 @@
     "test:blur": "sh tests/e2e/make-media.sh && sh tests/e2e/make-blur-media.sh && node scripts/build.mjs --test && node tests/e2e/blur.mjs",
     "bench": "node tests/e2e/bench.mjs webgpu",
     "bench:asr": "ASR_BENCH=1 node scripts/build.mjs && node tests/e2e/asr-bench.mjs",
-    "package": "node scripts/build.mjs && rm -f music-remover.zip && cd dist && zip -qr ../music-remover.zip . && echo music-remover.zip"
+    "package": "node scripts/build.mjs && rm -f music-remover.zip && cd dist && zip -qr ../music-remover.zip . && echo music-remover.zip",
+    "make-selftest": "tsx scripts/make-selftest.ts"
   },
   "devDependencies": {
     "@types/chrome": "^0.3.7",

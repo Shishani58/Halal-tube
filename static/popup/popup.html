@@ -38,6 +38,12 @@
         <span class="switch"><input id="musicRemoval" type="checkbox" /><span></span></span>
       </label>
 
+      <div class="field" id="field-strength">
+        <div class="field-label">Сила подавления музыки <b id="strength-val">100%</b></div>
+        <input id="musicStrength" class="range" type="range" min="0" max="100" step="5" aria-label="Сила подавления музыки" />
+        <small class="hint" id="strength-hint">100% — только голос. Меньше — часть оригинала остаётся.</small>
+      </div>
+
       <div class="field">
         <div class="field-label">Мат</div>
         <div class="seg seg3" role="radiogroup" aria-label="Фильтр мата">
@@ -100,6 +106,34 @@
           <span class="switch"><input id="blurThumbs" type="checkbox" /><span></span></span>
         </label>
 
+        <label class="toggle-row" id="row-hover">
+          <div><b>Показывать превью при наведении</b><small>Размытое превью открывается, если задержать на нём курсор</small></div>
+          <span class="switch"><input id="blurHover" type="checkbox" /><span></span></span>
+        </label>
+
+        <div class="field">
+          <div class="field-label">Как скрывать</div>
+          <div class="seg seg2" role="radiogroup" aria-label="Как скрывать">
+            <label><input type="radio" name="blurStyle" value="blur" /><span>Размытие</span></label>
+            <label><input type="radio" name="blurStyle" value="solid" /><span>Тёмная заливка</span></label>
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="field-label">Чувствительность</div>
+          <div class="seg seg3" role="radiogroup" aria-label="Чувствительность размытия">
+            <label><input type="radio" name="blurLevel" value="soft" /><span>Мягко</span></label>
+            <label><input type="radio" name="blurLevel" value="normal" /><span>Обычно</span></label>
+            <label><input type="radio" name="blurLevel" value="strict" /><span>Строго</span></label>
+          </div>
+          <small class="hint" id="level-hint"></small>
+        </div>
+
+        <label class="toggle-row">
+          <div><b>Помнить проверенные видео</b><small id="cache-hint">Повторный просмотр без проверки и без размытия в начале</small></div>
+          <span class="switch"><input id="blurCache" type="checkbox" /><span></span></span>
+        </label>
+
         <div class="field">
           <div class="field-label">Пока кадр не проверен</div>
           <div class="seg seg2" role="radiogroup" aria-label="Пока кадр не проверен">
@@ -111,6 +145,10 @@
         <div class="meter">
           <span>Проверено вперёд</span>
           <b id="vs-ahead">—</b>
+        </div>
+        <div class="meter">
+          <span>Запомнено видео: <b id="cache-count">—</b></span>
+          <button id="cache-clear" class="link" type="button">Очистить</button>
         </div>
       </div>
     </section>

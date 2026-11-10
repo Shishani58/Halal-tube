@@ -47,15 +47,18 @@ import {
   type Rect,
 } from '../core/nudenet';
 import { findPlates } from '../core/plates';
-import { CLIP_INPUT as CS, CLIP_VIEWS, clipViews, rgbaToClip } from '../core/clip';
+import { CLIP_INPUT as CS, CLIP_THUMB_LONE, CLIP_THUMB_WOMEN, CLIP_TILE_GATE, CLIP_VIEWS, clipTiles, clipViews, rgbaToClip, tileBox } from '../core/clip';
 import type { FromClip, ToClip } from './clip-worker';
 import { ShotTracker, THUMB_H, THUMB_W, isEdgeCut, makeThumb, type Thumb } from '../core/shots';
 import type { FromVision, ToVision, VisionFrame, VisionStatus } from '../shared/vision-messages';
-import { PART, THRESHOLDS } from '../core/vision-timeline';
+import { PART, THRESHOLDS, VisionTimeline, pictureWomen } from '../core/vision-timeline';
 import { ClipBudget, clipMode } from '../core/clip-budget';
-import { loadModel, type LoadedModel } from './model';
+import { describeSelfTest, loadModel, type LoadedModel } from './model';
+import { loadVideo, saveVideo, videoKey } from './vision-store';
 
 declare const self: DedicatedWorkerGlobalScope;
+/** Set by the build: records kept by another build of the extension are not trusted (vision-store). */
+declare const __BUILD_ID__: string;
 
 const DETECTOR_FILE = 'nudenet-320n.onnx';
 const GENDER_FILE = 'genderage.onnx';
@@ -74,6 +77,13 @@ const MAX_EDGES = 256;
  * 96×96 crop would be blown up 3× and the classifier's answer is a coin toss.
  */
 const MIN_FACE = 22;
+/**
+ * Thumbnails are small (a face of 20 px is common) and have no neighbouring frames to confirm a
+ * look: faces are taken from a lower detector score and size, and judged by the gender classifier
+ * and the person's looks together (pictureWomen) as before.
+ */
+const STILL_FACE_SCORE = 0.25;
+const STILL_FACE_PX = 14;
 /** A still-growing GOP under the playhead is re-analysed once this many new seconds arrived. */
 const PARTIAL_MIN = 1;
 /** …or, on its first pass, once it holds this much. */
@@ -95,6 +105,8 @@ const RETRY_MS = 30_000;
 /** Thumbnails waiting to be classified (more are asked for again by the page later). */
 const MAX_IMAGES = 200;
 const IMAGE_TIMEOUT_MS = 10_000;
+/** Thumbnails wait this long (ms) for the scene model; without its answer they are judged by faces alone. */
+const SCENE_WAIT_MS = 1500;
 
 interface Gop {
   start: number;
@@ -136,6 +148,12 @@ interface Session {
   checked: IntervalSet;
   edges: Edge[];
   lastUsed: number;
+  /** What this video's findings are kept under (vision-store); absent: not kept. */
+  cacheKey?: string;
+  /** Everything found for it, for the record (also what an earlier viewing found). */
+  mirror?: VisionTimeline;
+  /** When the findings last changed and weren't written yet (0: nothing to write). */
+  dirtyAt: number;
 }
 
 const base = new URL('../', self.location.href).href;
@@ -170,10 +188,17 @@ function clipAsk(m: ToClip, ms: number, transfer: Transferable[] = []): Promise<
   });
 }
 
+/** Self-test result of the scene model (it loads in its own worker). */
+let sceneSelfTest: string | undefined;
+
 async function loadClip(): Promise<void> {
+  sceneSelfTest = undefined;
   clip = new Worker(new URL('./clip-worker.js', self.location.href), { type: 'module' });
   const r = await clipAsk({ type: 'load' }, CLIP_LOAD_MS);
-  if (r?.type === 'loaded' && r.ok) return;
+  if (r?.type === 'loaded' && r.ok) {
+    sceneSelfTest = r.selfTest;
+    return;
+  }
   console.warn('[music-remover] scene model unavailable', r?.type === 'loaded' ? r.error : 'timeout');
   clip.terminate();
   clip = null;
@@ -195,7 +220,7 @@ const post = (m: FromVision) => self.postMessage(m);
 function session(id: number): Session {
   let s = sessions.get(id);
   if (!s) {
-    s = { sbs: new Map(), gops: [], checked: new IntervalSet(), edges: [], lastUsed: Date.now() };
+    s = { sbs: new Map(), gops: [], checked: new IntervalSet(), edges: [], lastUsed: Date.now(), dirtyAt: 0 };
     sessions.set(id, s);
     if (sessions.size > MAX_SESSIONS) {
       const oldest = [...sessions.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
@@ -294,6 +319,7 @@ self.onmessage = (e: MessageEvent<ToVision>) => {
       const s = sessions.get(m.session);
       if (s) {
         s.lastUsed = Date.now();
+        useRecord(m.session, s, m);
         evict(s, m.time);
         // the last GOP of the video has no next keyframe to close it
         if (Number.isFinite(m.duration) && m.duration > 0)
@@ -318,6 +344,38 @@ self.onmessage = (e: MessageEvent<ToVision>) => {
     }
   }
 };
+
+/**
+ * Keep findings under the video's id and length, and take back what an earlier viewing found: its
+ * spans count as checked (their GOPs are skipped) and the page gets its frames and cuts at once.
+ */
+function useRecord(sid: number, s: Session, m: Extract<ToVision, { type: 'position' }>): void {
+  const key = m.videoId && m.enabled && Number.isFinite(m.duration) ? videoKey(m.videoId, m.duration) : undefined;
+  if (key === s.cacheKey) return;
+  flush(s); // the previous video of this session (ad → video, next video): written under its own key
+  s.cacheKey = key;
+  s.mirror = key ? new VisionTimeline() : undefined;
+  if (!key) return;
+  loadVideo(key, __BUILD_ID__)
+    .then((data) => {
+      if (!data || s.cacheKey !== key) return;
+      s.mirror?.load(data);
+      for (const [a, b] of data.spans) s.checked.add(a, b);
+      post({ type: 'cache', session: sid, data });
+      schedule();
+    })
+    .catch((e) => console.warn('[music-remover] reading kept findings failed', e));
+}
+
+/** Write the findings of a session's video (nothing changed since the last write: nothing to do). */
+function flush(s: Session): void {
+  if (!s.cacheKey || !s.mirror || !s.dirtyAt) return;
+  s.dirtyAt = 0;
+  saveVideo(s.cacheKey, __BUILD_ID__, s.mirror.toCache()).catch((e) => console.warn('[music-remover] keeping findings failed', e));
+}
+
+/** How long after the last new finding they are written (a video is analysed GOP by GOP: not for each). */
+const SAVE_EVERY_MS = 10_000;
 
 function evict(s: Session, t: number): void {
   s.gops = s.gops.filter((g) => {
@@ -348,6 +406,7 @@ async function initModel(): Promise<void> {
     await loadClip();
     status.model = 'ready';
     status.backend = model.backend;
+    status.selfTest = `detector ${describeSelfTest(model)}, scene ${sceneSelfTest ?? 'n/a'}`;
     status.error = undefined;
     lastWorkAt = Date.now();
     everLoaded = true;
@@ -413,19 +472,24 @@ const genIn = new Float32Array(G * 3 * GS * GS);
 let clipCtx: OffscreenCanvasRenderingContext2D | null = null;
 
 /** MobileCLIP women score of each frame (null without the model): views stacked, one readback. */
-async function sceneWomen(bmps: ImageBitmap[]): Promise<number[] | null> {
+async function sceneWomen(bmps: ImageBitmap[], quick = false): Promise<number[] | null> {
   if (!clip || !bmps.length) return null;
-  const m = bmps.length * CLIP_VIEWS;
+  // quick: the whole picture squashed into one square, a third of the work (thumbnails)
+  const views = quick ? 1 : CLIP_VIEWS;
+  const m = bmps.length * views;
   clipCtx ??= ctx(CS, CS * B * CLIP_VIEWS);
   const c = clipCtx;
+  if (c.canvas.height < CS * m) c.canvas.height = CS * m; // many strips at once
   let i = 0;
-  for (const bmp of bmps)
-    for (const [x, y, side] of clipViews(bmp.width, bmp.height)) c.drawImage(bmp, x, y, side, side, 0, CS * i++, CS, CS);
+  for (const bmp of bmps) {
+    if (quick) c.drawImage(bmp, 0, 0, bmp.width, bmp.height, 0, CS * i++, CS, CS);
+    else for (const [x, y, side] of clipViews(bmp.width, bmp.height)) c.drawImage(bmp, x, y, side, side, 0, CS * i++, CS, CS);
+  }
   const px = c.getImageData(0, 0, CS, CS * m).data;
   const plane = CS * CS;
   const input = new Float32Array(m * 3 * plane);
   for (let k = 0; k < m; k++) rgbaToClip(px.subarray(k * plane * 4, (k + 1) * plane * 4), CS, input, k * 3 * plane);
-  const r = await clipAsk({ type: 'run', id: ++clipCalls, input, frames: bmps.length }, CLIP_RUN_MS, [input.buffer]);
+  const r = await clipAsk({ type: 'run', id: ++clipCalls, input, frames: bmps.length, views }, CLIP_RUN_MS, [input.buffer]);
   return r?.type === 'result' && r.scores ? r.scores : null;
 }
 
@@ -486,7 +550,7 @@ const lap = (k: string, since: number): number => {
   return now;
 };
 
-async function classify(shots: Shot[], scene: ClipBudget | null = null): Promise<VisionFrame[]> {
+async function classify(shots: Shot[], scene: ClipBudget | null = null, still = false): Promise<VisionFrame[]> {
   const tc0 = performance.now();
   let tl = tc0;
   T.classifyCalls = (T.classifyCalls ?? 0) + 1;
@@ -518,8 +582,8 @@ async function classify(shots: Shot[], scene: ClipBudget | null = null): Promise
   for (let j = 0; j < n; j++) {
     const { bmp } = shots[j];
     const k = Math.max(bmp.width, bmp.height) / S;
-    for (const box of detectFaces(out, B, j)) {
-      if (Math.max(box.w, box.h) * k < MIN_FACE) continue;
+    for (const box of detectFaces(out, B, j, still ? STILL_FACE_SCORE : undefined)) {
+      if (Math.max(box.w, box.h) * k < (still ? STILL_FACE_PX : MIN_FACE)) continue;
       for (const crop of GENDER_CROPS) {
         const c = faceCrop(box, crop);
         crops.push({ bmp, sx: c.x * k, sy: c.y * k, side: c.side * k });
@@ -645,8 +709,26 @@ function imageCrops(w: number, h: number): [number, number, number, number][] {
   ];
 }
 
-/** Fetch and classify the next thumbnails: nudity and female scores, the most of the whole and its parts. */
+/** `p`'s result, or null when it takes longer than `ms` (or fails). */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([p.catch(() => null), new Promise<null>((r) => setTimeout(() => r(null), ms))]);
+}
+
+/** A frame classified from a crop [x, y, w, h] (pixels) of a w×h picture, its women rects in the whole picture's coordinates. */
+function toWhole(f: VisionFrame, crop: [number, number, number, number], w: number, h: number): VisionFrame {
+  const women = f.women.slice();
+  for (let i = 0; i + 4 < women.length; i += 5) {
+    women[i] = (crop[0] + women[i] * crop[2]) / w;
+    women[i + 1] = (crop[1] + women[i + 1] * crop[3]) / h;
+    women[i + 2] = (women[i + 2] * crop[2]) / w;
+    women[i + 3] = (women[i + 3] * crop[3]) / h;
+  }
+  return { ...f, women };
+}
+
+/** Fetch and classify the next thumbnails: nudity (always) and who is a woman (by all looks at her). */
 async function analyseImages(): Promise<void> {
+  const t0 = performance.now();
   const urls = [...images].slice(-B).reverse(); // newest first: what the page shows now
   for (const u of urls) images.delete(u);
   const loaded = await Promise.all(
@@ -668,6 +750,8 @@ async function analyseImages(): Promise<void> {
     }),
   );
   const ok = loaded.filter((x): x is { url: string; bmps: ImageBitmap[] } => !!x);
+  const t1 = lap('imgFetch', t0);
+  T.imgCount = (T.imgCount ?? 0) + ok.length;
   try {
     // as many whole images per detector call as fit
     for (let i = 0; i < ok.length; ) {
@@ -678,13 +762,51 @@ async function analyseImages(): Promise<void> {
         group.push(ok[i++]);
       }
       try {
-        const frames = await classify(group.flatMap((x) => x.bmps.map((bmp) => ({ t: 0, bmp }))));
+        // the scene model looks at each whole picture meanwhile (its own worker and GPU device)
+        const sceneAsk = clip ? withTimeout(sceneWomen(group.map((x) => x.bmps[0]), true), SCENE_WAIT_MS) : Promise.resolve(null);
+        const frames = await classify(group.flatMap((x) => x.bmps.map((bmp) => ({ t: 0, bmp }))), null, true);
+        const scene = await sceneAsk;
         let k = 0;
-        for (const x of group) {
+        // A woman is judged by all looks at her (whole picture and parts), as on video: a man's face
+        // that one crop takes for a woman's is outvoted by the looks that said "man". Only the
+        // women's boxes go to the page ([x, y, w, h, score] each), the rest stays unblurred.
+        const judged = group.map((x, i) => {
           const fs = frames.slice(k, (k += x.bmps.length));
-          const max = (f: (v: VisionFrame) => number) => Math.max(...fs.map(f));
-          post({ type: 'image', url: x.url, frame: { t: 0, nude: max((v) => v.nude), skin: max((v) => v.skin), female: max((v) => v.female), women: fs[0].women } });
+          const crops = imageCrops(x.bmps[0].width, x.bmps[0].height);
+          const looks = fs.map((f, j) => (j === 0 ? f : toWhole(f, crops[j - 1], x.bmps[0].width, x.bmps[0].height)));
+          let { female, rects } = pictureWomen(looks);
+          const whole = scene?.[i];
+          if (!rects.length && whole !== undefined) {
+            // an unsure face (stylised, tired, turned), or the picture's only person: the scene model decides
+            const soft = whole >= CLIP_THUMB_WOMEN ? pictureWomen(looks, 'unsure') : { female: 0, rects: [] };
+            const lone = whole >= CLIP_THUMB_LONE ? pictureWomen(looks, 'lone') : { female: 0, rects: [] };
+            ({ female, rects } = soft.rects.length ? soft : lone);
+          }
+          return { fs, female, rects, tile: !rects.length && whole !== undefined && whole >= CLIP_TILE_GATE };
+        });
+        // No face to go by, yet the scene model sees women: where? Strips of the picture, one call for all.
+        const tiled = judged.map((j, i) => (j.tile ? i : -1)).filter((i) => i >= 0);
+        if (tiled.length) {
+          const strips = tiled.map((i) => clipTiles(group[i].bmps[0].width, group[i].bmps[0].height));
+          const cuts = await Promise.all(tiled.flatMap((i, t) => strips[t].map(([sx, sy, sw, sh]) => createImageBitmap(group[i].bmps[0], sx, sy, sw, sh))));
+          try {
+            const scores = await withTimeout(sceneWomen(cuts), SCENE_WAIT_MS);
+            let at = 0;
+            tiled.forEach((i, t) => {
+              const own = scores?.slice(at, (at += strips[t].length)) ?? [];
+              const box = tileBox(own, strips[t], group[i].bmps[0].width);
+              if (box) [judged[i].female, judged[i].rects] = [Math.max(own.length ? Math.max(...own) : 0, THRESHOLDS.thumbFemale), [box]];
+            });
+          } finally {
+            for (const c of cuts) c.close();
+          }
         }
+        group.forEach((x, i) => {
+          const j = judged[i];
+          const women = j.rects.flatMap((q) => [...q.map((v) => Math.round(v * 1000) / 1000), j.female]);
+          const max = (f: (v: VisionFrame) => number) => Math.max(...j.fs.map(f));
+          post({ type: 'image', url: x.url, frame: { t: 0, nude: max((v) => v.nude), skin: max((v) => v.skin), female: j.female, women } });
+        });
         status.frames += n;
       } catch (e) {
         for (const x of group) post({ type: 'image', url: x.url, error: e instanceof Error ? e.message : String(e) });
@@ -693,6 +815,8 @@ async function analyseImages(): Promise<void> {
     }
   } finally {
     for (const x of ok) for (const b of x.bmps) b.close();
+    lap('imgClassify', t1);
+    updateStatus();
   }
 }
 
@@ -855,8 +979,14 @@ async function analyse(sid: number, s: Session, g: Gop): Promise<void> {
     shotsOf.first && shotsOf.last ? edgeCuts(s, { start: ms(shotsOf.firstT), end: wasClosed ? g.end : frameEnd, first: shotsOf.first, last: shotsOf.last, startRecent: shotsOf.startRecent, endRecent: shotsOf.endRecent }, wasClosed) : [];
   if (spanTo > spanFrom) s.checked.add(spanFrom, spanTo);
   if (wasClosed) free(g);
-  if (spanTo > spanFrom)
-    post({ type: 'result', session: sid, from: spanFrom, to: spanTo, frames, cuts: shotsOf.cuts, cutRange: [g.start, spanTo], edges });
+  if (spanTo > spanFrom) {
+    const result = { type: 'result' as const, session: sid, from: spanFrom, to: spanTo, frames, cuts: shotsOf.cuts, cutRange: [g.start, spanTo] as [number, number], edges };
+    post(result);
+    if (s.mirror) {
+      s.mirror.add(result);
+      s.dirtyAt ||= Date.now();
+    }
+  }
 
   status.frames += shots;
   lap('analyse', t0);
@@ -910,6 +1040,11 @@ async function releaseModels(): Promise<void> {
   status.backend = '-';
   await Promise.all([m?.release(), gm?.release()]).catch(() => undefined);
 }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const s of sessions.values()) if (s.dirtyAt && now - s.dirtyAt >= SAVE_EVERY_MS) flush(s);
+}, 5_000);
 
 setInterval(() => {
   const now = Date.now();

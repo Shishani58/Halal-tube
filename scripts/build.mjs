@@ -69,6 +69,8 @@ const common = {
   minify: !watch,
   logLevel: 'info',
   legalComments: 'none',
+  // identifies this build: findings kept by the vision worker under another build are not trusted
+  define: { __BUILD_ID__: JSON.stringify(String(Date.now())) },
 };
 
 const builds = [

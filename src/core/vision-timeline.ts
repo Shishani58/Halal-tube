@@ -86,6 +86,57 @@ export const MIN_MARGIN = 0.025;
 /** Plates are taken from the looks within this many seconds before and after the moment. */
 export const PLATE_REACH = 0.8;
 
+/**
+ * How readily frames are blurred (the popup's «Чувствительность»). Every threshold above is the
+ * 'normal' level; 'soft' wants more evidence (fewer false blurs, a woman far from the camera may
+ * slip through), 'strict' blurs when in doubt. Nudity is blurred at every level, only its score
+ * thresholds move.
+ */
+export type BlurLevel = 'soft' | 'normal' | 'strict';
+export type PersonTuning = typeof PERSON;
+export interface Tuning {
+  nude: number;
+  skin: number;
+  skinWeak: number;
+  skinLooks: number;
+  person: PersonTuning;
+  /** MobileCLIP "women in the picture" score, and the share of looks that must reach it (the second: when faces found are all men's). */
+  clipWomen: number;
+  clipShare: number;
+  clipShareMen: number;
+  /** A thumbnail's woman: best look, and mean over her looks. */
+  thumbFemale: number;
+  thumbMean: number;
+}
+
+const TUNINGS: Record<BlurLevel, Tuning> = {
+  normal: {
+    nude: THRESHOLDS.nude, skin: THRESHOLDS.skin, skinWeak: THRESHOLDS.skinWeak, skinLooks: SKIN_MIN_LOOKS, person: PERSON,
+    clipWomen: CLIP_WOMEN, clipShare: CLIP_MIN_SHARE, clipShareMen: CLIP_MIN_SHARE_MEN, thumbFemale: THRESHOLDS.thumbFemale, thumbMean: 0.5,
+  },
+  soft: {
+    nude: 0.4, skin: 0.75, skinWeak: 0.6, skinLooks: 4,
+    person: { look: 0.35, mean: 0.5, single: 0.6, bodyLooks: 3, bodyMean: 0.6, bodySure: 0.92, voiceMean: 0.3, voiceBest: 0.9 },
+    clipWomen: CLIP_WOMEN + 0.1, clipShare: 0.65, clipShareMen: 0.9, thumbFemale: 0.7, thumbMean: 0.55,
+  },
+  strict: {
+    nude: 0.25, skin: 0.55, skinWeak: 0.4, skinLooks: 2,
+    person: { look: 0.25, mean: 0.3, single: 0.4, bodyLooks: 1, bodyMean: 0.4, bodySure: 0.75, voiceMean: 0.12, voiceBest: 0.75 },
+    clipWomen: CLIP_WOMEN - 0.1, clipShare: 0.35, clipShareMen: 0.65, thumbFemale: THRESHOLDS.thumbFemale, thumbMean: 0.5,
+  },
+};
+
+export function tuningFor(level: BlurLevel | undefined): Tuning {
+  return TUNINGS[level ?? 'normal'] ?? TUNINGS.normal;
+}
+
+/** A timeline's findings, as kept between viewings of a video. */
+export interface CacheData {
+  frames: VisionFrame[];
+  cuts: number[];
+  spans: [number, number][];
+}
+
 export interface BlurPolicy {
   /** Blur women (besides nudity, which is always blurred). */
   women: boolean;
@@ -94,6 +145,8 @@ export interface BlurPolicy {
    * whatever was found in it. Otherwise what was found so far is acted on at once.
    */
   strict?: boolean;
+  /** Sensitivity (default 'normal'). */
+  level?: BlurLevel;
 }
 
 /**
@@ -150,6 +203,29 @@ export class VisionTimeline {
       if (cut) this.addCut(t);
     }
     this.checked.add(r.from, r.to);
+    this.version++;
+  }
+
+  /**
+   * What was found so far (frames, cuts, analysed spans), for keeping between viewings of a video
+   * (vision-store). The voice pitch isn't included: it is measured again with the audio.
+   */
+  toCache(): CacheData {
+    return { frames: this.frames, cuts: this.cuts.slice(), spans: this.checked.spans.map((s) => [s[0], s[1]]) };
+  }
+
+  /**
+   * Merge a kept record in. What this timeline already knows wins at the same moment (it is newer);
+   * the record fills in the rest, and its spans count as analysed.
+   */
+  load(d: CacheData): void {
+    for (const f of d.frames) {
+      const k = this.lowerBound(this.frames, f.t - 1e-3);
+      if (k < this.frames.length && Math.abs(this.frames[k].t - f.t) < 1e-3) continue;
+      this.frames.splice(k, 0, f);
+    }
+    for (const c of d.cuts) this.addCut(c);
+    for (const [a, b] of d.spans) this.checked.add(a, b);
     this.version++;
   }
 
@@ -224,7 +300,8 @@ export class VisionTimeline {
     const ahead = until <= t || this.checked.covers(t, until);
     if (!ahead && p.strict) return none;
 
-    const s = this.shotInfo(a, b);
+    const tune = tuningFor(p.level);
+    const s = this.shotInfo(a, b, tune, p.level ?? 'normal');
     const lo = Math.max(a, t - SHOT_REACH), hi = Math.min(b, t + SHOT_REACH);
     const near = (idx: number[]) => {
       const k = this.firstAfter(idx, t);
@@ -243,15 +320,15 @@ export class VisionTimeline {
       looks.push(...looksOf(f));
     }
     const group = people(looks);
-    const stats = group.map(statsOf);
+    const stats = group.map((g) => statsOf(g, tune.person.look));
     const heads = stats.filter((_, i) => group[i].part !== PART.whole);
     const best = Math.max(0, ...heads.map((x) => x.mean));
     const voice = this.womanHeard(lo, hi);
     const rects: number[][] = [];
     group.forEach((person, i) => {
       const st = stats[i];
-      const byVoice = voice && person.part !== PART.whole && st.mean >= PERSON.voiceMean && st.mean >= PERSON.voiceBest * best;
-      if (!isWoman(st, person.part) && !byVoice) return;
+      const byVoice = voice && person.part !== PART.whole && st.mean >= tune.person.voiceMean && st.mean >= tune.person.voiceBest * best;
+      if (!isWoman(st, person.part, tune.person) && !byVoice) return;
       rects.push([...this.whereIs(person.anchors, t), person.part]);
       if (person.bodies.length) rects.push([...this.whereIs(person.bodies, t), PART.body]);
     });
@@ -261,7 +338,7 @@ export class VisionTimeline {
     const inRange = (idx: number[]) => idx.filter((i) => this.frames[i].t >= lo && this.frames[i].t < hi).length;
     const k = inRange(s.sceneWomen);
     const men = heads.some((x) => x.n >= MAN_LOOKS && x.mean <= MAN_MEAN);
-    if (k >= CLIP_MIN_FRAMES && k >= (men ? CLIP_MIN_SHARE_MEN : CLIP_MIN_SHARE) * inRange(s.scene)) return { verdict: 'full', rects: [], shot: a };
+    if (k >= CLIP_MIN_FRAMES && k >= (men ? tune.clipShareMen : tune.clipShare) * inRange(s.scene)) return { verdict: 'full', rects: [], shot: a };
     return { verdict: 'clear', rects: [], shot: a };
   }
 
@@ -320,8 +397,8 @@ export class VisionTimeline {
     return lo;
   }
 
-  private shotInfo(a: number, b: number): ShotInfo {
-    const key = `${a}|${b}|${this.version}`;
+  private shotInfo(a: number, b: number, tune: Tuning, level: BlurLevel): ShotInfo {
+    const key = `${a}|${b}|${this.version}|${level}`;
     if (this.shot?.key === key) return this.shot;
     const nude: number[] = [];
     const women: number[] = [];
@@ -330,16 +407,16 @@ export class VisionTimeline {
     const weakSkin: number[] = [];
     for (let i = this.lowerBound(this.frames, a - 1e-4); i < this.frames.length && this.frames[i].t < b - 1e-4; i++) {
       const f = this.frames[i];
-      if (f.skin >= THRESHOLDS.skinWeak && f.skin < THRESHOLDS.skin) weakSkin.push(i);
-      if (f.nude >= THRESHOLDS.nude || f.skin >= THRESHOLDS.skin) nude.push(i);
+      if (f.skin >= tune.skinWeak && f.skin < tune.skin) weakSkin.push(i);
+      if (f.nude >= tune.nude || f.skin >= tune.skin) nude.push(i);
       if (f.women.length) women.push(i);
       if (f.scene !== undefined) {
         scene.push(i);
-        if (f.scene >= CLIP_WOMEN) sceneWomen.push(i);
+        if (f.scene >= tune.clipWomen) sceneWomen.push(i);
       }
     }
     // weak skin looks that repeat (this one included) count; keep `nude` ascending
-    const repeated = weakSkin.filter((i) => weakSkin.filter((j) => Math.abs(this.frames[j].t - this.frames[i].t) <= SKIN_WINDOW).length >= SKIN_MIN_LOOKS);
+    const repeated = weakSkin.filter((i) => weakSkin.filter((j) => Math.abs(this.frames[j].t - this.frames[i].t) <= SKIN_WINDOW).length >= tune.skinLooks);
     if (repeated.length) nude.push(...repeated.filter((i) => !nude.includes(i))), nude.sort((p, q) => p - q);
     this.shot = { key, nude, women, scene, sceneWomen };
     return this.shot;
@@ -422,10 +499,10 @@ interface Stats {
   max: number;
 }
 
-function statsOf(person: Person): Stats {
+function statsOf(person: Person, look: number = PERSON.look): Stats {
   let votes = 0, sum = 0, max = 0;
   for (const l of person.anchors) {
-    if (l.p >= PERSON.look) votes++;
+    if (l.p >= look) votes++;
     sum += l.p;
     max = Math.max(max, l.p);
   }
@@ -434,10 +511,49 @@ function statsOf(person: Person): Stats {
 }
 
 /** Is this person a woman (PERSON)? */
-export function isWoman(s: Stats, part: number): boolean {
-  if (part === PART.whole) return (s.n >= PERSON.bodyLooks && s.mean >= PERSON.bodyMean) || s.max >= PERSON.bodySure;
-  if (s.n === 1) return s.max >= PERSON.single;
-  return s.mean >= PERSON.mean && s.votes >= 2;
+export function isWoman(s: Stats, part: number, t: PersonTuning = PERSON): boolean {
+  if (part === PART.whole) return (s.n >= t.bodyLooks && s.mean >= t.bodyMean) || s.max >= t.bodySure;
+  if (s.n === 1) return s.max >= t.single;
+  return s.mean >= t.mean && s.votes >= 2;
+}
+
+/**
+ * A thumbnail is one picture, seen whole and in parts (the same faces again, not independent
+ * evidence): a person in it is a woman only when her best look reaches THRESHOLDS.thumbFemale
+ * AND the mean over all her looks reaches THUMB_MEAN — a man's face that one crop takes for a
+ * woman's is outvoted by the looks that said "man".
+ */
+export const THUMB_MEAN = 0.5;
+/** An unsure face (best look, mean of looks): a woman only when the scene model agrees (clip.ts CLIP_THUMB_WOMEN). */
+export const THUMB_SOFT = { look: 0.2, mean: 0.2 };
+
+/**
+ * The women in a still picture, judged by all looks at them: `female` is the best look of the most
+ * woman-like one (0: none), `rects` the boxes to blur ([x, y, w, h] in the whole picture's
+ * coordinates, one for each woman: head and body together). `looks`: the whole picture and its
+ * parts, their women rects already in the whole picture's coordinates. `soft`, for when the scene
+ * model backs the verdict up: 'unsure' also takes the unsure faces (THUMB_SOFT); 'lone' takes the
+ * only person of the picture whatever the face classifier said (it can call a woman's face a man's).
+ */
+export function pictureWomen(looks: VisionFrame[], soft?: 'unsure' | 'lone'): { female: number; rects: number[][] } {
+  const [minLook, minMean] = soft === 'unsure' ? [THUMB_SOFT.look, THUMB_SOFT.mean] : soft === 'lone' ? [0, 0] : [THRESHOLDS.thumbFemale, THUMB_MEAN];
+  let female = 0;
+  const rects: number[][] = [];
+  const persons = people(looks.flatMap(looksOf));
+  if (soft === 'lone' && persons.length !== 1) return { female, rects };
+  for (const person of persons) {
+    const s = statsOf(person);
+    if (s.max < minLook || s.mean < minMean) continue;
+    female = Math.max(female, soft ? Math.max(s.max, THRESHOLDS.thumbFemale) : s.max);
+    const hull = (ls: Look[]) => ls.map((l) => l.r).reduce((u, r) => union(u, r));
+    // one box per woman: head and body together (two boxes on one person look like two things)
+    rects.push(pad(hull([...person.anchors, ...person.bodies])));
+  }
+  return { female, rects };
+}
+
+export function pictureFemale(looks: VisionFrame[]): number {
+  return pictureWomen(looks).female;
 }
 
 /** A person's box with her margin. */

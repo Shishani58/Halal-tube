@@ -22,6 +22,14 @@ const SCALE = 100;
  * The page also needs it on several frames of a shot (vision-timeline CLIP_MIN_*).
  */
 export const CLIP_WOMEN = 0.65;
+/**
+ * A thumbnail with a face the gender classifier is unsure about (THUMB_SOFT) counts as a woman's
+ * when the scene model says women at this score: a stylised or tired woman's portrait gets
+ * 0.2–0.4 from the face classifier but ~0.65 here, and men's portraits seldom pass 0.5 (1%).
+ */
+export const CLIP_THUMB_WOMEN = 0.5;
+/** …and when the face classifier says "man" outright but the picture shows one person only: the scene model alone, this surely. */
+export const CLIP_THUMB_LONE = 0.55;
 
 let text: Float32Array | null = null;
 function textEmbeds(): Float32Array {
@@ -32,6 +40,41 @@ function textEmbeds(): Float32Array {
     text = new Float32Array(u8.buffer);
   }
   return text;
+}
+
+/**
+ * Thumbnails whose face the detector can't use (tiny, turned, stylised): the scene model scores the
+ * whole picture, and when that reaches CLIP_TILE_GATE it scores vertical strips of it too — a
+ * woman's clothes and figure give a strip a high score (0.87–0.99 against 0.00–0.24 for strips of
+ * men on a 320×180 thumbnail), which says where she is, roughly.
+ */
+export const CLIP_TILE_GATE = 0.35;
+export const CLIP_TILE_WOMEN = 0.7;
+const TILE_W = 0.34;
+const TILE_STEP = 0.165;
+
+/** Strips [x, y, w, h] (pixels) of a w×h picture, 5 of them from left to right; none for a tall picture. */
+export function clipTiles(w: number, h: number): [number, number, number, number][] {
+  if (w < h * 1.2) return [];
+  const tw = Math.round(w * TILE_W);
+  return [0, 1, 2, 3, 4].map((i) => [Math.min(w - tw, Math.round(w * TILE_STEP * i)), 0, tw, h]);
+}
+
+/**
+ * The box (normalised [x, y, w, h], full height) over the strips that show women: those scoring at
+ * least CLIP_TILE_WOMEN and 90% of the best one. Null when none does.
+ */
+export function tileBox(scores: number[], tiles: [number, number, number, number][], w: number): number[] | null {
+  const best = Math.max(0, ...scores);
+  if (best < CLIP_TILE_WOMEN) return null;
+  const min = Math.max(CLIP_TILE_WOMEN, best * 0.9);
+  let x0 = Infinity, x1 = -Infinity;
+  tiles.forEach((t, i) => {
+    if (scores[i] < min) return;
+    x0 = Math.min(x0, t[0]);
+    x1 = Math.max(x1, t[0] + t[2]);
+  });
+  return [x0 / w, 0, (x1 - x0) / w, 1];
 }
 
 /** The CLIP_VIEWS squares [x, y, side] of a w×h picture: start, middle and end of its longer side. */
@@ -80,9 +123,9 @@ export function clipWomen(embeds: Float32Array, i: number): number {
   return women / all;
 }
 
-/** Women score of a frame from its CLIP_VIEWS consecutive embeddings starting at `i`. */
-export function clipFrameWomen(embeds: Float32Array, i: number): number {
+/** Women score of a frame from its `views` consecutive embeddings starting at `i`. */
+export function clipFrameWomen(embeds: Float32Array, i: number, views = CLIP_VIEWS): number {
   let s = 0;
-  for (let v = 0; v < CLIP_VIEWS; v++) s += clipWomen(embeds, i + v);
-  return s / CLIP_VIEWS;
+  for (let v = 0; v < views; v++) s += clipWomen(embeds, i + v);
+  return s / views;
 }

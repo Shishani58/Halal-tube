@@ -162,3 +162,13 @@ h2 { font-size: 14px; margin: 0; font-weight: 650; }
 .row b { font-weight: 600; text-align: right; }
 
 footer { padding: 0 16px 12px; color: var(--muted); font-size: 11.5px; text-align: center; }
+
+/* ── strength slider ── */
+.field-label b { float: right; color: var(--fg); font-weight: 600; }
+.range { width: 100%; accent-color: var(--accent); margin: 2px 0 0; }
+.field.disabled { opacity: .45; }
+.field.disabled .range { pointer-events: none; }
+
+/* ── small text button ── */
+button.link { background: none; border: 0; padding: 0; font: inherit; font-weight: 600; color: var(--blur); cursor: pointer; }
+button.link:disabled { color: var(--muted); cursor: default; }

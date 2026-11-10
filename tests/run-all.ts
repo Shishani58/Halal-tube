@@ -9,6 +9,10 @@ import './plates.test';
 import './profanity.test';
 import './captions.test';
 import './replay-log.test';
+import './passthrough.test';
+import './levels.test';
+import './vision-cache.test';
+import './selftest.test';
 import { runAll } from './harness';
 
 await runAll();
