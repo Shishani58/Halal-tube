@@ -68,7 +68,7 @@ declare const self: DedicatedWorkerGlobalScope;
 declare const __BUILD_ID__: string;
 
 const DETECTOR_FILE = 'nudenet-320n.onnx';
-const GENDER_FILE = 'genderage.onnx';
+const GENDER_FILE = 'gender.onnx'; // the build copies the chosen classifier here (scripts/build.mjs GENDER_MODEL)
 /** Longest wait for the scene model to load / to score a batch; past it, frames go without. */
 const CLIP_LOAD_MS = 60_000;
 const CLIP_RUN_MS = 10_000;

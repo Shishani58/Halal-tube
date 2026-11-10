@@ -11,7 +11,13 @@ const test = process.argv.includes('--test');
 const dist = join(root, test ? 'dist-test' : 'dist');
 const watch = process.argv.includes('--watch');
 
-const MODELS = ['Kim_Vocal_2.onnx', 'nudenet-320n.onnx', 'genderage.onnx', 'mobileclip-s0-vision.onnx'];
+const MODELS = ['Kim_Vocal_2.onnx', 'nudenet-320n.onnx', 'mobileclip-s0-vision.onnx'];
+/**
+ * The face gender classifier ships as models/gender.onnx in the build. Default: InsightFace genderage
+ * (non-commercial weights). GENDER_MODEL=fairface: our own model trained on FairFace only (CC BY 4.0),
+ * models/gender-fairface.onnx (scripts/gender/). Same input and output, so nothing else changes.
+ */
+const GENDER_SOURCE = process.env.GENDER_MODEL === 'fairface' ? 'gender-fairface.onnx' : 'genderage.onnx';
 /** Faster fp16 variants, used when the GPU supports them (made by npm run fetch-model; optional). */
 const OPTIONAL_MODELS = ['Kim_Vocal_2.fp16.onnx'];
 const ORT_FILES = ['ort.webgpu.min.mjs', 'ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.asyncify.wasm'];
@@ -29,6 +35,16 @@ function copyStatic() {
     }
     const target = join(dist, 'models', name);
     if (!existsSync(target) || statSync(target).size !== statSync(model).size) copyFileSync(model, target);
+  }
+  {
+    const src = join(root, 'models', GENDER_SOURCE);
+    if (!existsSync(src)) {
+      console.error(`\n✗ ${GENDER_SOURCE} not found. Run: npm run fetch-model (genderage) or see scripts/gender/ (fairface)\n`);
+      process.exit(1);
+    }
+    const target = join(dist, 'models', 'gender.onnx');
+    if (!existsSync(target) || statSync(target).size !== statSync(src).size) copyFileSync(src, target);
+    console.log(`gender model: ${GENDER_SOURCE}`);
   }
   for (const name of OPTIONAL_MODELS) {
     const model = join(root, 'models', name);
