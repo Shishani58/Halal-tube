@@ -9,6 +9,7 @@
 
 use crate::media::{output_path, output_rate, plan_output, MediaInfo, OutputPlan, Tools};
 use crate::model::Separator;
+use crate::passthrough::{keep_original_where_clean, mix_original, BELOW_DB};
 use crate::Error;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -88,11 +89,32 @@ impl Drop for Cleanup {
     }
 }
 
+/// How the separated voice is turned into the output sound.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// Share of the clean voice in the output, 0–1; the rest is the original track (1: voice only).
+    pub strength: f32,
+    /// Stretches where nothing was removed (plain speech) play from the original, not the model's estimate.
+    pub keep_plain_speech: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { strength: 1.0, keep_plain_speech: true }
+    }
+}
+
+/// Runs the pipeline with the default options. `on_progress` receives the processed fraction in [0, 1].
+pub fn run(tools: &Tools, sep: &mut Separator, job: &Prepared, cancel: &AtomicBool, on_progress: impl FnMut(f64)) -> Result<PathBuf, Error> {
+    run_with(tools, sep, job, &Options::default(), cancel, on_progress)
+}
+
 /// Runs the pipeline. `on_progress` receives the processed fraction in [0, 1].
-pub fn run(
+pub fn run_with(
     tools: &Tools,
     sep: &mut Separator,
     job: &Prepared,
+    opts: &Options,
     cancel: &AtomicBool,
     mut on_progress: impl FnMut(f64),
 ) -> Result<PathBuf, Error> {
@@ -198,6 +220,12 @@ pub fn run(
             win_r[avail..].fill(0.0);
 
             sep.separate_window(&win_l, &win_r, &mut out_l, &mut out_r)?;
+            // out[i] is the voice at window sample trim + i: the original over the same span
+            let (orig_l, orig_r) = (&win_l[trim..trim + g], &win_r[trim..trim + g]);
+            if opts.keep_plain_speech {
+                keep_original_where_clean(&mut out_l, &mut out_r, orig_l, orig_r, rate, BELOW_DB);
+            }
+            mix_original(&mut out_l, &mut out_r, orig_l, orig_r, opts.strength);
 
             let n_out = if eof { g.min(total_in - k * g) } else { g };
             bytes.clear();

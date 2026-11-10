@@ -3,12 +3,17 @@
 //! - [`mdx`]: STFT/iSTFT for the UVR MDX-Net model (port of the extension's `src/core/mdx.ts`).
 //! - [`model`]: ONNX Runtime session (CoreML / DirectML / CPU).
 //! - [`media`]: FFmpeg probing and output format choice.
+//! - [`passthrough`]: original sound where nothing was removed, and the strength mix.
+//! - [`live`]: the streaming engine for a live (system audio) mode, without audio capture.
 //! - [`job`]: the streaming file pipeline: decode → separate tile by tile → encode + mux.
 
 pub mod job;
+pub mod live;
 pub mod mdx;
 pub mod media;
 pub mod model;
+pub mod passthrough;
+pub mod selftest;
 
 use std::path::PathBuf;
 

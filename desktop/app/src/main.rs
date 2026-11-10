@@ -4,7 +4,7 @@
 use mr_core::job;
 use mr_core::mdx::{Mdx, KIM_VOCAL_2};
 use mr_core::media::{self, Tools};
-use mr_core::model::{Model, Separator};
+use mr_core::model::{Model, SelfTest, Separator};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,6 +28,8 @@ struct Job {
     input: PathBuf,
     out_dir: Option<PathBuf>,
     suffix: String,
+    /// Share of the clean voice in the output, percent (the rest is the original track).
+    strength: u8,
     output: Option<PathBuf>,
     status: Status,
     progress: f64,
@@ -83,6 +85,8 @@ struct EngineView {
     backend: Option<String>,
     error_code: Option<String>,
     error_message: Option<String>,
+    /// The GPU computed wrong numbers in the self-test and the CPU is used instead.
+    gpu_check_failed: bool,
 }
 
 struct AppState {
@@ -155,7 +159,7 @@ fn is_hidden(p: &Path) -> bool {
 }
 
 #[tauri::command]
-fn add_files(app: AppHandle, state: State<AppState>, paths: Vec<String>, suffix: String, out_dir: Option<String>) -> Vec<JobView> {
+fn add_files(app: AppHandle, state: State<AppState>, paths: Vec<String>, suffix: String, out_dir: Option<String>, strength: Option<u8>) -> Vec<JobView> {
     let out_dir = out_dir.filter(|s| !s.is_empty()).map(PathBuf::from);
     let mut added = Vec::new();
     let mut jobs = state.jobs.lock().unwrap();
@@ -170,6 +174,7 @@ fn add_files(app: AppHandle, state: State<AppState>, paths: Vec<String>, suffix:
             input: input.clone(),
             out_dir: out_dir.clone(),
             suffix: suffix.clone(),
+            strength: strength.unwrap_or(100).min(100),
             output: None,
             status: Status::Queued,
             progress: 0.0,
@@ -258,10 +263,10 @@ fn worker(app: AppHandle, rx: Receiver<u64>) {
                 return None;
             }
             j.status = Status::Running;
-            Some((j.input.clone(), j.out_dir.clone(), j.suffix.clone(), j.cancel.clone()))
+            Some((j.input.clone(), j.out_dir.clone(), j.suffix.clone(), j.strength, j.cancel.clone()))
         })
         .flatten();
-        let Some((input, out_dir, suffix, cancel)) = picked else { continue };
+        let Some((input, out_dir, suffix, strength, cancel)) = picked else { continue };
 
         let fail = |code: &str, msg: String| {
             with_job(&app, id, |j| {
@@ -282,18 +287,27 @@ fn worker(app: AppHandle, rx: Receiver<u64>) {
         let tools_ref = tools.as_ref().unwrap();
 
         if sep.is_none() {
-            set_engine(&app, EngineView { state: "loading", backend: None, error_code: None, error_message: None });
+            set_engine(&app, EngineView { state: "loading", backend: None, error_code: None, error_message: None, gpu_check_failed: false });
             let mdx = Mdx::new(KIM_VOCAL_2);
             let cache = app.path().app_cache_dir().ok().map(|d| d.join("coreml"));
             match Model::load(&model_path(&app), mdx.tensor_shape(), None, cache.as_deref()) {
                 Ok(model) => {
+                    let mut s = Separator::new(mdx, model);
+                    // CoreML / DirectML can compute wrong numbers without an error: compare with the CPU once
+                    // (the verdict is kept for a month); on a mismatch the CPU is used
+                    let check = s.self_test(app.path().app_cache_dir().ok().map(|d| d.join("selftest")).as_deref());
+                    let failed = matches!(check, Ok(SelfTest::FellBack(_)));
+                    if let Ok(SelfTest::FellBack(why)) = &check {
+                        eprintln!("GPU self-test failed ({why}): using the CPU");
+                    }
                     set_engine(&app, EngineView {
                         state: "ready",
-                        backend: Some(model.backend.label().to_string()),
+                        backend: Some(s.model.backend.label().to_string()),
                         error_code: None,
                         error_message: None,
+                        gpu_check_failed: failed,
                     });
-                    sep = Some(Separator::new(mdx, model));
+                    sep = Some(s);
                 }
                 Err(e) => {
                     set_engine(&app, EngineView {
@@ -301,6 +315,7 @@ fn worker(app: AppHandle, rx: Receiver<u64>) {
                         backend: None,
                         error_code: Some(e.code().into()),
                         error_message: Some(e.to_string()),
+                        gpu_check_failed: false,
                     });
                     fail(e.code(), e.to_string());
                     continue;
@@ -325,7 +340,7 @@ fn worker(app: AppHandle, rx: Receiver<u64>) {
         let started = Instant::now();
         let mut last_emit = Instant::now();
         // A panic must fail this job, not leave it (and the queue behind it) "running" forever.
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job::run(tools_ref, separator, &prepared, &cancel, |p| {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job::run_with(tools_ref, separator, &prepared, &job::Options { strength: strength as f32 / 100.0, keep_plain_speech: true }, &cancel, |p| {
             if last_emit.elapsed().as_millis() < 150 && p < 1.0 {
                 return;
             }
@@ -373,7 +388,7 @@ fn main() {
             jobs: Mutex::new(Vec::new()),
             tx: Mutex::new(tx),
             next_id: AtomicU64::new(1),
-            engine: Mutex::new(EngineView { state: "idle", backend: None, error_code: None, error_message: None }),
+            engine: Mutex::new(EngineView { state: "idle", backend: None, error_code: None, error_message: None, gpu_check_failed: false }),
             pending: Mutex::new(Vec::new()),
         })
         .setup(move |app| {

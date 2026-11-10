@@ -7,7 +7,7 @@ use crate::mdx::Mdx;
 use crate::Error;
 use ort::session::{builder::GraphOptimizationLevel, builder::SessionBuilder, Session};
 use ort::value::TensorRef;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 fn environment() -> Result<&'static ort::environment::Environment, Error> {
@@ -39,6 +39,8 @@ pub struct Model {
     session: Session,
     shape: [usize; 4],
     pub backend: Backend,
+    /// The model file (the self-test loads a CPU copy of it).
+    path: PathBuf,
 }
 
 impl Model {
@@ -77,7 +79,7 @@ impl Model {
             builder = add_gpu_provider(builder, cache_dir)?;
         }
         let session = builder.commit_from_file(path)?;
-        Ok(Model { session, shape, backend })
+        Ok(Model { session, shape, backend, path: path.to_path_buf() })
     }
 
     /// Runs one model window. Input and output have `shape` = [1, 4, dim_f, dim_t].
@@ -121,6 +123,24 @@ fn add_gpu_provider(_builder: SessionBuilder, _cache_dir: Option<&Path>) -> Resu
     Err(Error::Model("no GPU provider on this platform".into()))
 }
 
+/// What the GPU self-test found (see [`Separator::self_test`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SelfTest {
+    /// The GPU matched the CPU (relative error).
+    Passed(f64),
+    /// Passed on an earlier run (the verdict is kept for a month per model file and backend).
+    Cached,
+    /// Nothing to check: already on the CPU.
+    Skipped,
+    /// The GPU computed wrong numbers: the CPU is used now. Says why.
+    FellBack(String),
+}
+
+/// ONNX Runtime version, part of the key of a kept self-test verdict.
+const ORT_VERSION: &str = "2.0.0-rc.15";
+/// How long a passed self-test is trusted.
+const VERDICT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
 /// Model + DSP state for separating stereo windows.
 pub struct Separator {
     pub mdx: Mdx,
@@ -132,6 +152,56 @@ impl Separator {
     pub fn new(mdx: Mdx, model: Model) -> Self {
         let spec = vec![0f32; mdx.tensor_len()];
         Separator { mdx, model, spec }
+    }
+
+    /// Checks that the GPU computes what the CPU does, on a fixed realistic signal; on a mismatch
+    /// switches to the CPU. The CPU run takes a few seconds, so a passed verdict is kept in
+    /// `cache_dir` (per model file size, backend and ONNX Runtime version, for a month).
+    pub fn self_test(&mut self, cache_dir: Option<&Path>) -> Result<SelfTest, Error> {
+        self.self_test_with(cache_dir, 1.0)
+    }
+
+    /// [`Self::self_test`] with the GPU output scaled by `tamper` (tests use it to simulate a broken GPU).
+    pub fn self_test_with(&mut self, cache_dir: Option<&Path>, tamper: f32) -> Result<SelfTest, Error> {
+        use crate::selftest::{compare_samples, sample_output, test_audio, MAX_ERR, SAMPLES};
+        if self.model.backend == Backend::Cpu {
+            return Ok(SelfTest::Skipped);
+        }
+        let size = std::fs::metadata(&self.model.path).map(|m| m.len()).unwrap_or(0);
+        let verdict = cache_dir.map(|d| d.join(format!("selftest-{size}-{}-{ORT_VERSION}.ok", self.model.backend.label())));
+        if tamper == 1.0 {
+            if let Some(v) = &verdict {
+                let fresh = std::fs::metadata(v).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|age| age < VERDICT_MAX_AGE);
+                if fresh == Some(true) {
+                    return Ok(SelfTest::Cached);
+                }
+            }
+        }
+        let (l, r) = test_audio(self.mdx.chunk_size, self.mdx.cfg.sample_rate, 20240601);
+        let mut spec = vec![0f32; self.mdx.tensor_len()];
+        self.mdx.stft(&l, &r, &mut spec);
+        let gpu: Vec<f32> = self.model.run(&spec)?.into_iter().map(|x| x * tamper).collect();
+        let mut cpu = Self::cpu_copy(&self.model)?;
+        let reference = cpu.run(&spec)?;
+        match compare_samples(&sample_output(&gpu, SAMPLES), &sample_output(&reference, SAMPLES), MAX_ERR) {
+            Ok(err) => {
+                if let Some(v) = &verdict {
+                    if let Some(dir) = v.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(v, format!("{err}"));
+                }
+                Ok(SelfTest::Passed(err))
+            }
+            Err(why) => {
+                self.model = cpu;
+                Ok(SelfTest::FellBack(why))
+            }
+        }
+    }
+
+    fn cpu_copy(m: &Model) -> Result<Model, Error> {
+        Model::try_load(&m.path, m.shape, Backend::Cpu, None)
     }
 
     /// Stereo input of `chunk_size` samples → separated voice, `gen_size` samples per channel.

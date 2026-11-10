@@ -12,6 +12,7 @@
 
   let lang = store.get('lang', (navigator.language || 'ru').toLowerCase().startsWith('ru') ? 'ru' : 'en');
   let outDir = store.get('outDir', null);
+  let strength = Math.min(100, Math.max(0, Number(store.get('strength', 100)) || 0));
   let engine = { state: 'idle' };
   const jobs = new Map(); // id → JobView
   const rows = new Map(); // id → <li>
@@ -39,6 +40,7 @@
     document.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = t(el.dataset.i18n); });
     document.querySelectorAll('.lang button').forEach((b) => b.classList.toggle('on', b.dataset.lang === lang));
     renderDest();
+    renderStrength();
     renderEngine();
     jobs.forEach((j) => renderJob(j));
   }
@@ -54,7 +56,7 @@
     el.classList.toggle('err', engine.state === 'error');
     el.textContent =
       engine.state === 'loading' ? t('engineLoading') :
-      engine.state === 'ready' ? t('engineReady')(engine.backend) :
+      engine.state === 'ready' ? t('engineReady')(engine.backend) + (engine.gpuCheckFailed ? ' · ' + t('engineGpuWrong') : '') :
       engine.state === 'error' ? t('engineError') :
       t('engineIdle');
   }
@@ -140,7 +142,7 @@
   // ---------- actions ----------
   async function addPaths(paths) {
     if (!paths || !paths.length) return;
-    const added = await api.invoke('add_files', { paths, suffix: t('suffix'), outDir });
+    const added = await api.invoke('add_files', { paths, suffix: t('suffix'), outDir, strength });
     added.forEach(upsert);
   }
 
@@ -156,6 +158,14 @@
     const d = await api.pickFolder();
     if (typeof d === 'string' && d) { outDir = d; store.set('outDir', d); renderDest(); }
   });
+  const strengthEl = $('#strength');
+  const renderStrength = () => {
+    strengthEl.value = String(strength);
+    $('#strength-val').textContent = `${strength}%`;
+    strengthEl.parentElement.title = t('strengthHint');
+  };
+  strengthEl.addEventListener('input', () => { strength = Number(strengthEl.value); store.set('strength', String(strength)); renderStrength(); });
+  renderStrength();
   $('#dest-reset').addEventListener('click', () => { outDir = null; store.set('outDir', null); renderDest(); });
 
   $('#clear').addEventListener('click', async () => {

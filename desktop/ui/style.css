@@ -177,3 +177,8 @@ h2 { margin: 0; font-size: 11.5px; font-weight: 650; text-transform: uppercase; 
   background: color-mix(in srgb, var(--accent-soft) 70%, transparent);
   color: var(--accent-ink); font-size: 16px; font-weight: 650;
 }
+
+/* strength slider */
+.strength { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.strength input { width: 110px; accent-color: var(--accent); }
+.strength b { min-width: 34px; font-weight: 600; text-align: right; }

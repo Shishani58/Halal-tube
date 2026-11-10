@@ -72,3 +72,56 @@ fn video_is_copied_and_audio_replaced() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Mean volume (dB) of the first audio stream, by ffmpeg's volumedetect.
+fn mean_volume(tools: &Tools, file: &PathBuf) -> f64 {
+    let out = Command::new(&tools.ffmpeg)
+        .args(["-v", "info", "-i"])
+        .arg(file)
+        .args(["-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    text.lines()
+        .find_map(|l| l.split("mean_volume:").nth(1))
+        .and_then(|v| v.trim().trim_end_matches(" dB").parse().ok())
+        .unwrap_or(-91.0)
+}
+
+#[test]
+fn strength_brings_the_original_back() {
+    let Ok(tools) = Tools::locate() else { return };
+    let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(mr_core::MODEL_FILE);
+    if !model_path.exists() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("mr-strength-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("tone.m4a");
+    // a plain tone is "music" to the model: removed at 100 %, kept at 0 %
+    let st = Command::new(&tools.ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=8", "-c:a", "aac"])
+        .arg(&input)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let mdx = Mdx::new(KIM_VOCAL_2);
+    let model = Model::load(&model_path, mdx.tensor_shape(), None, None).expect("model");
+    let mut sep = Separator::new(mdx, model);
+    let cancel = AtomicBool::new(false);
+    let mut level = |strength: f32, suffix: &str| {
+        let prepared = job::prepare(&tools, &input, None, suffix).unwrap();
+        let opts = job::Options { strength, keep_plain_speech: true };
+        let out = job::run_with(&tools, &mut sep, &prepared, &opts, &cancel, |_| {}).unwrap();
+        mean_volume(&tools, &out)
+    };
+    let orig = mean_volume(&tools, &input);
+    let removed = level(1.0, "full");
+    let half = level(0.5, "half");
+    let none = level(0.0, "none");
+    eprintln!("original {orig:.1} dB · strength 100 %: {removed:.1} dB · 50 %: {half:.1} dB · 0 %: {none:.1} dB");
+    assert!((none - orig).abs() < 1.5, "0 % should be the original: {none} vs {orig}");
+    assert!(removed < orig - 15.0, "100 % should remove the tone: {removed} vs {orig}");
+    assert!(half > removed + 3.0 && half < orig - 3.0, "50 % lies between: {half}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -32,6 +32,9 @@ window.I18N = {
     engineLoading: 'Загружаю нейросеть…',
     engineReady: (b) => `Нейросеть готова · ${b === 'CPU' ? 'процессор' : 'видеокарта (' + b + ')'}`,
     engineError: 'Нейросеть не загрузилась',
+    engineGpuWrong: 'видеокарта считала неверно, работает процессор',
+    strength: 'Убирать музыку',
+    strengthHint: 'Меньше 100%: часть оригинального звука остаётся (действует на новые файлы)',
     errors: {
       ffmpeg_missing: 'Не найден FFmpeg. Установите его: brew install ffmpeg',
       model_missing: 'Не найден файл нейросети',
@@ -78,6 +81,9 @@ window.I18N = {
     engineLoading: 'Loading the neural network…',
     engineReady: (b) => `Neural network ready · ${b === 'CPU' ? 'CPU' : 'GPU (' + b + ')'}`,
     engineError: 'The neural network failed to load',
+    engineGpuWrong: 'the GPU computed wrong results, using the CPU',
+    strength: 'Remove music',
+    strengthHint: 'Below 100%: part of the original sound stays (applies to files added next)',
     errors: {
       ffmpeg_missing: 'FFmpeg not found. Install it: brew install ffmpeg',
       model_missing: 'Neural network file not found',
