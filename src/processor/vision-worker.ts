@@ -198,8 +198,12 @@ function clipAsk(m: ToClip, ms: number, transfer: Transferable[] = []): Promise<
 /** Self-test result of the scene model (it loads in its own worker). */
 let sceneSelfTest: string | undefined;
 
+declare const __SAFARI__: boolean;
+
 async function loadClip(): Promise<void> {
   sceneSelfTest = undefined;
+  // MobileCLIP only runs on the GPU (1.6 s a frame on the CPU); iPhone Safari's memory cannot hold a third model runtime anyway
+  if (__SAFARI__) return;
   clip = new Worker(new URL('./clip-worker.js', self.location.href), { type: 'module' });
   const r = await clipAsk({ type: 'load' }, CLIP_LOAD_MS);
   if (r?.type === 'loaded' && r.ok) {

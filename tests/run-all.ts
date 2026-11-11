@@ -14,6 +14,7 @@ import './levels.test';
 import './vision-cache.test';
 import './selftest.test';
 import './hold.test';
+import './port.test';
 import { runAll } from './harness';
 
 await runAll();

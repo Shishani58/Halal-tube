@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Халал Туб</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <!-- iPhone layout: inset grouped lists (Settings style), the important at the top, the rest below. The name sits in Safari's own sheet title.
+       Element ids are shared with src/popup/popup.ts. -->
+
+  <!-- ───────── 1. Master ───────── -->
+  <section class="group first">
+    <label class="cell">
+      <span class="tile t-green"><svg viewBox="0 0 24 24"><path d="M12 3v9" /><path d="M6.3 7.3a8 8 0 1 0 11.4 0" /></svg></span>
+      <span class="body"><b>Включено</b><small id="hdr-sub">Откройте видео на YouTube</small></span>
+      <span class="switch"><input id="enabled" type="checkbox" /><span></span></span>
+    </label>
+  </section>
+  <p class="banner" id="off-banner" hidden>Расширение выключено: звук и видео не меняются.</p>
+
+  <main id="main">
+    <!-- ───────── 2. Sound ───────── -->
+    <h2 class="section-title">Звук</h2>
+    <section class="group" id="card-sound">
+      <div class="cell">
+        <span class="tile t-pink"><svg viewBox="0 0 24 24"><path d="M11 5L6 9H3v6h3l5 4zM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13" /></svg></span>
+        <span class="body"><b>Звук на вкладке</b><small><i class="dot" id="sound-dot"></i><span id="st-state">—</span></small></span>
+      </div>
+
+      <label class="cell">
+        <span class="tile t-blue"><svg viewBox="0 0 24 24"><path d="M12 4v16M8 8v8M4 11v2M16 7v10M20 10v4" /></svg></span>
+        <span class="body"><b>Убирать музыку</b><small>Остаётся только голос</small></span>
+        <span class="switch"><input id="musicRemoval" type="checkbox" /><span></span></span>
+      </label>
+
+      <div class="cell stack" id="field-strength" hidden>
+        <span class="body"><b>Сила подавления <em id="strength-val">100%</em></b><small id="strength-hint"></small></span>
+        <input id="musicStrength" class="range" type="range" min="0" max="100" step="5" aria-label="Сила подавления музыки" />
+      </div>
+
+      <label class="cell menu">
+        <span class="tile t-orange"><svg viewBox="0 0 24 24"><path d="M4 6l16 12M20 6L4 18" /></svg></span>
+        <span class="body"><b>Мат</b></span>
+        <span class="pick">
+          <select name="profanity" aria-label="Фильтр мата">
+            <option value="off">Не трогать</option>
+            <option value="mute">Заглушать</option>
+            <option value="beep">Запикивать</option>
+          </select>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 9l4-4 4 4M8 15l4 4 4-4" /></svg>
+        </span>
+      </label>
+      <p class="subline" id="profanity-hint"></p>
+    </section>
+
+    <!-- ───────── 3. Blur ───────── -->
+    <h2 class="section-title">Размытие видео</h2>
+    <section class="group" id="card-blur">
+      <label class="cell">
+        <span class="tile t-purple"><svg viewBox="0 0 24 24"><path d="M3 3l18 18" /><path d="M10.6 5.1A10.6 10.6 0 0 1 12 5c5 0 9 4.5 10 7a13 13 0 0 1-2.6 3.8M6.6 6.6A13.5 13.5 0 0 0 2 12c1 2.5 5 7 10 7a9.7 9.7 0 0 0 5.4-1.6" /><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" /></svg></span>
+        <span class="body"><b>Размывать неподобающее</b><small><i class="dot" id="blur-dot"></i><span id="vs-state">—</span></small></span>
+        <span class="switch"><input id="blur" type="checkbox" /><span></span></span>
+      </label>
+
+      <div id="blur-body">
+        <label class="cell">
+          <span class="tile t-red"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" /><path d="M4 21a8 8 0 0 1 16 0" /></svg></span>
+          <span class="body"><b>Женщины</b><small>Только место, где она в кадре</small></span>
+          <span class="switch"><input id="blurWomen" type="checkbox" /><span></span></span>
+        </label>
+
+        <label class="cell">
+          <span class="tile t-teal"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M3 15l5-4 4 3 3-2 6 5" /></svg></span>
+          <span class="body"><b>Превью видео</b><small>Лента, рекомендации, конец ролика</small></span>
+          <span class="switch"><input id="blurThumbs" type="checkbox" /><span></span></span>
+        </label>
+      </div>
+    </section>
+
+    <!-- ───────── 4. Playback ───────── -->
+    <h2 class="section-title">Воспроизведение</h2>
+    <section class="group">
+      <label class="cell menu">
+        <span class="tile t-indigo"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /><path d="M12 8v4l3 2" /></svg></span>
+        <span class="body"><b>Пока звук не готов</b></span>
+        <span class="pick">
+          <select name="mode" aria-label="Пока звук не готов">
+            <option value="strict">Тишина</option>
+            <option value="lenient">Оригинал</option>
+          </select>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 9l4-4 4 4M8 15l4 4 4-4" /></svg>
+        </span>
+      </label>
+      <p class="subline" id="mode-hint"></p>
+      <label class="cell">
+        <span class="tile t-orange"><svg viewBox="0 0 24 24"><path d="M8 5v14M16 5v14" /></svg></span>
+        <span class="body"><b>Пауза, пока не готово</b><small id="hold-hint">Видео ждёт на паузе, если звук или проверка кадров не успели</small></span>
+        <span class="switch"><input id="pauseUntilReady" type="checkbox" /><span></span></span>
+      </label>
+    </section>
+
+    <!-- ───────── 5. Less important ───────── -->
+    <h2 class="section-title">Дополнительно</h2>
+    <section class="group">
+      <label class="cell menu">
+        <span class="tile t-blue"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /><circle cx="12" cy="12" r="3" /></svg></span>
+        <span class="body"><b>Как скрывать</b></span>
+        <span class="pick">
+          <select name="blurStyle" aria-label="Как скрывать">
+            <option value="blur">Размытие</option>
+            <option value="solid">Тёмная заливка</option>
+          </select>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 9l4-4 4 4M8 15l4 4 4-4" /></svg>
+        </span>
+      </label>
+      <label class="cell menu">
+        <span class="tile t-orange"><svg viewBox="0 0 24 24"><path d="M4 18h4V9H4zM10 18h4V5h-4zM16 18h4v-6h-4z" /></svg></span>
+        <span class="body"><b>Чувствительность</b></span>
+        <span class="pick">
+          <select name="blurLevel" aria-label="Чувствительность размытия">
+            <option value="soft">Мягко</option>
+            <option value="normal">Обычно</option>
+            <option value="strict">Строго</option>
+          </select>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 9l4-4 4 4M8 15l4 4 4-4" /></svg>
+        </span>
+      </label>
+      <p class="subline" id="level-hint"></p>
+      <label class="cell menu">
+        <span class="tile t-indigo"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg></span>
+        <span class="body"><b>Непроверенный кадр</b></span>
+        <span class="pick">
+          <select name="blurStrict" aria-label="Пока кадр не проверен">
+            <option value="1">Размывать</option>
+            <option value="0">Показывать</option>
+          </select>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 9l4-4 4 4M8 15l4 4 4-4" /></svg>
+        </span>
+      </label>
+      <label class="cell" id="row-hover">
+        <span class="tile t-gray"><svg viewBox="0 0 24 24"><path d="M9 11V5a2 2 0 0 1 4 0v6l5 1v4a5 5 0 0 1-5 5h-2a5 5 0 0 1-4-2l-3-4 2-1z" /></svg></span>
+        <span class="body"><b>Открывать по нажатию</b><small>Размытое превью открывается, если задержать на нём палец</small></span>
+        <span class="switch"><input id="blurHover" type="checkbox" /><span></span></span>
+      </label>
+      <label class="cell">
+        <span class="tile t-teal"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="12" rx="3" /><path d="M7 12h6" /></svg></span>
+        <span class="body"><b>Плашка на видео</b><small>Что сейчас происходит, в углу плеера</small></span>
+        <span class="switch"><input id="showBadge" type="checkbox" /><span></span></span>
+      </label>
+    </section>
+
+    <!-- ───────── 6. Memory ───────── -->
+    <h2 class="section-title">Память</h2>
+    <section class="group">
+      <label class="cell">
+        <span class="tile t-green"><svg viewBox="0 0 24 24"><path d="M5 12l4 4 10-10" /></svg></span>
+        <span class="body"><b>Помнить проверенные видео</b><small id="cache-hint">Повторный просмотр без проверки и без размытия в начале</small></span>
+        <span class="switch"><input id="blurCache" type="checkbox" /><span></span></span>
+      </label>
+      <div class="cell"><span class="body"><b>Запомнено видео</b></span><span class="value" id="cache-count">—</span></div>
+      <button class="cell action" id="cache-clear" type="button">Очистить память</button>
+    </section>
+
+    <!-- ───────── 7. Technical (last) ───────── -->
+    <h2 class="section-title">Состояние</h2>
+    <section class="group">
+      <div class="cell"><span class="body"><b>Модель звука</b></span><span class="value" id="st-model">—</span></div>
+      <div class="cell"><span class="body"><b>Скорость</b></span><span class="value" id="st-speed">—</span></div>
+      <div class="cell"><span class="body"><b>Готово вперёд</b></span><span class="value" id="st-ahead">—</span></div>
+      <div class="cell"><span class="body"><b>Кадры проверены вперёд</b></span><span class="value" id="vs-ahead">—</span></div>
+      <div class="cell" id="row-asr" hidden><span class="body"><b>Поиск мата</b></span><span class="value" id="st-asr">—</span></div>
+    </section>
+    <p class="footer center">Всё обрабатывается на вашем устройстве.</p>
+  </main>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

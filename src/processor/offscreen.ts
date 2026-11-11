@@ -7,7 +7,7 @@
 import type { FromWorker, ToWorker, WorkerStatus } from '../shared/messages';
 import { decodeToWorker, encodeFromWorker, type FromWorkerWire, type ToWorkerWire } from '../shared/wire';
 import { fromMessagePort, type PortLike } from '../shared/port';
-import { decodeToVision, type FromVision, type ToVisionWire } from '../shared/vision-messages';
+import { decodeToVision, type FromVision, type ToVision, type ToVisionWire } from '../shared/vision-messages';
 
 const SPAN = 1_000_000; // local session ids of one page stay far below this
 
@@ -90,11 +90,13 @@ function drop(link: Link): void {
  * (see src/shared/port.ts). Either way the handler gets one Port-like object per connection.
  */
 const inFrame = window.parent !== window;
+let lockKey = ''; // set by the first 'init' message (see src/shared/port.ts)
 function listen(name: 'mr-proc' | 'mr-vis', handler: (port: PortLike) => void): void {
   if (inFrame) {
     window.addEventListener('message', (e: MessageEvent) => {
-      const d = e.data as { mr?: string; name?: string } | null;
-      if (d?.mr === 'connect' && d.name === name && e.ports[0]) handler(fromMessagePort(e.ports[0]));
+      const d = e.data as { mr?: string; name?: string; key?: string } | null;
+      if (d?.mr === 'init' && typeof d.key === 'string' && !lockKey) lockKey = d.key; // first one wins: the content script's
+      else if (d?.mr === 'connect' && d.name === name && d.key === lockKey && lockKey && e.ports[0]) handler(fromMessagePort(e.ports[0]));
     });
   } else {
     chrome.runtime.onConnect.addListener((port) => {
@@ -121,9 +123,31 @@ listen('mr-proc', (port) => {
 });
 
 // ───────────── frame classifier (blurring), one Worker per connected tab/frame ─────────────
+declare const __SAFARI__: boolean;
+/** Safari: resolves when the sound model is ready or has not been asked for (so loading peaks do not add up). */
+function soundModelSettled(): Promise<void> {
+  if (!__SAFARI__) return Promise.resolve();
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const check = (): void => {
+      if (!worker || greeting.some((g) => g.type === 'ready') || lastModelStatus?.model === 'error' || Date.now() - t0 > 120_000) resolve();
+      else setTimeout(check, 500);
+    };
+    check();
+  });
+}
+
 listen('mr-vis', (port) => {
-  const worker = new Worker(new URL('./vision-worker.js', location.href), { type: 'module' });
+  let worker: Worker | null = null;
+  const queue: ToVision[] = [];
   let alive = true;
+  void soundModelSettled().then(() => {
+    if (!alive) return;
+    worker = startVision();
+    for (const q of queue.splice(0)) worker.postMessage(q, q.type === 'append' ? [q.data] : []);
+  });
+  function startVision(): Worker {
+  const worker = new Worker(new URL('./vision-worker.js', location.href), { type: 'module' });
   worker.onmessage = (e: MessageEvent<FromVision>) => {
     if (!alive) return;
     try {
@@ -137,12 +161,15 @@ listen('mr-vis', (port) => {
     console.error('[music-remover] vision worker error', e.message);
     if (alive) port.postMessage({ type: 'status', status: { model: 'error', backend: '-', error: e.message, frames: 0, speed: 0, ahead: 0 } } satisfies FromVision);
   };
+  return worker;
+  }
   port.onMessage.addListener((m) => {
     const msg = decodeToVision(m as ToVisionWire);
-    worker.postMessage(msg, msg.type === 'append' ? [msg.data] : []);
+    if (worker) worker.postMessage(msg, msg.type === 'append' ? [msg.data] : []);
+    else queue.push(msg);
   });
   port.onDisconnect.addListener(() => {
     alive = false;
-    worker.terminate();
+    worker?.terminate();
   });
 });

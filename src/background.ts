@@ -2,8 +2,12 @@ import { DEFAULT_SETTINGS, type Settings } from './shared/messages';
 
 async function refreshBadge(): Promise<void> {
   const s = (await chrome.storage.sync.get(DEFAULT_SETTINGS)) as Settings;
-  await chrome.action.setBadgeBackgroundColor({ color: '#0f9d76' });
-  await chrome.action.setBadgeText({ text: s.enabled ? 'ON' : '' });
+  try {
+    await chrome.action.setBadgeBackgroundColor({ color: '#0f9d76' });
+    await chrome.action.setBadgeText({ text: s.enabled ? 'ON' : '' });
+  } catch {
+    /* no toolbar badge here (Safari on iPhone) */
+  }
 }
 
 chrome.runtime.onInstalled.addListener(async () => {

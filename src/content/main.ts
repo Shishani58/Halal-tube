@@ -38,6 +38,7 @@ declare global {
   }
 }
 declare const __SAFARI_DEBUG__: boolean;
+declare const __SAFARI__: boolean;
 
 (() => {
   if (window.__musicRemoverMain) return;
@@ -183,7 +184,7 @@ declare const __SAFARI_DEBUG__: boolean;
     mountHookBadge(() => [
       `MR hook: MS=${typeof window.MediaSource} MMS=${typeof window.ManagedMediaSource} SB=${typeof window.SourceBuffer} MSB=${typeof window.ManagedSourceBuffer}`,
       `patched=${MSClasses.length && SB ? 'yes' : 'no'} appends=${hookStats.appends} audio=${hookStats.audioAppends} (${hookStats.audioBytes} B) unknown=${hookStats.unknownSb}`,
-      `proc: link=${link.up} ready=${procReady} model=${workerStatus?.model}/${workerStatus?.backend} tiles=${dbg.tilesReceived} state=${player.state} ctx=${player.ctx?.state} sched=${player.scheduled.size} t=${player.video?.currentTime.toFixed(1)} muted=${player.video?.muted} drift=${dbg.lastDrift}`,
+      `proc: link=${link.up} ready=${procReady} model=${workerStatus?.model}/${workerStatus?.backend} tiles=${dbg.tilesReceived} state=${player.state} ctx=${player.ctx?.state} sched=${player.scheduled.size} t=${player.video?.currentTime.toFixed(1)} muted=${player.video?.muted} drift=${dbg.lastDrift.toFixed(3)} orig=${player.video ? player.attached.get(player.video)?.origValue.toFixed(2) : '-'} nativeMuted=${player.video ? Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'muted')!.get!.call(player.video) : '-'}`,
       ...(workerStatus?.error ? [`err: ${String(workerStatus.error).slice(0, 160)}`] : []),
     ]);
   }
@@ -263,8 +264,11 @@ declare const __SAFARI_DEBUG__: boolean;
     /* storage blocked */
   }
   const dbg = { reanchors: 0, lastDrift: 0, maxDrift: 0, tilesReceived: 0, scheduledTotal: 0, arrivals: [] as string[] };
+  /** How the original track is silenced/restored: a gain node in the audio graph, or (Safari) the element itself. */
   interface Attached {
-    orig: GainNode;
+    /** 0 = silent, 1 = as the page plays it. The native mode can only mute: below 0.5 counts as silent. */
+    setOrig(target: number): void;
+    origValue: number;
   }
 
   let lastPosSent = 0;
@@ -336,10 +340,46 @@ declare const __SAFARI_DEBUG__: boolean;
       if (a) return a;
       const ctx = this.ensureCtx();
       try {
-        const src = ctx.createMediaElementSource(v);
-        const orig = ctx.createGain();
-        src.connect(orig).connect(ctx.destination);
-        a = { orig };
+        if (__SAFARI__) {
+          // iPhone Safari does not feed a video's sound into the audio graph (the node stays silent while the
+          // element keeps playing natively), so the original can only be silenced by muting the element. The
+          // page must not notice: `muted` keeps answering with what the page (or the viewer) set.
+          const d = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'muted')!;
+          let pageMuted = d.get!.call(v) as boolean;
+          let forced = false;
+          const apply = (): void => void d.set!.call(v, pageMuted || forced);
+          Object.defineProperty(v, 'muted', {
+            configurable: true,
+            enumerable: true,
+            get: () => pageMuted,
+            set: (x: boolean) => {
+              pageMuted = !!x;
+              apply();
+            },
+          });
+          a = {
+            origValue: 1,
+            setOrig(t) {
+              this.origValue = t;
+              const f = t < 0.5;
+              if (f !== forced) {
+                forced = f;
+                apply();
+              }
+            },
+          };
+        } else {
+          const src = ctx.createMediaElementSource(v);
+          const orig = ctx.createGain();
+          src.connect(orig).connect(ctx.destination);
+          a = {
+            origValue: 1,
+            setOrig(t) {
+              this.origValue = t;
+              orig.gain.setTargetAtTime(t, ctx.currentTime, 0.015);
+            },
+          };
+        }
         this.attached.set(v, a);
         return a;
       } catch (e) {
@@ -418,7 +458,7 @@ declare const __SAFARI_DEBUG__: boolean;
 
       if (!active() || !sid) {
         const a = this.attached.get(v);
-        if (a) a.orig.gain.value = 1;
+        a?.setOrig(1);
         this.stopAll();
         this.state = active() ? 'no-video' : 'disabled';
         badge.update(v, this.state);
@@ -434,7 +474,7 @@ declare const __SAFARI_DEBUG__: boolean;
       const offline =
         link.orphaned || (!link.up && link.downSince > 0 && performance.now() - link.downSince > LINK_GRACE_MS);
       if (offline || workerStatus?.model === 'error') {
-        a.orig.gain.setTargetAtTime(1, ctx.currentTime, 0.015);
+        a.setOrig(1);
         this.stopAll();
         this.state = 'offline';
         badge.update(v, this.state);
@@ -453,9 +493,9 @@ declare const __SAFARI_DEBUG__: boolean;
       this.audioPart = { kind: 'audio', now: hasNow, ahead: workerStatus?.ahead ?? 0 };
       // Strength below 100 %: the original track is heard too, `share` clean + (1 − share) original
       // (the original already follows the element's volume and mute; the clean tiles don't).
-      const share = cleanShare(settings);
+      const share = __SAFARI__ ? 1 : cleanShare(settings);
       const origTarget = settings.mode === 'lenient' && !hasNow ? 1 : hasNow ? 1 - share : 0;
-      a.orig.gain.setTargetAtTime(origTarget, ctx.currentTime, 0.015);
+      a.setOrig(origTarget);
       this.clean.gain.setTargetAtTime(v.muted ? 0 : v.volume * share, ctx.currentTime, 0.015);
 
       const playing = !v.paused && !v.ended && !v.seeking && v.readyState >= 3;

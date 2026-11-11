@@ -47,6 +47,11 @@ export function fromMessagePort(mp: MessagePort): PortLike {
 }
 
 let frame: Promise<HTMLIFrameElement> | null = null;
+/**
+ * Secret shared with the processor frame right after it loads. The frame sits in the page's DOM, so page
+ * scripts could otherwise open channels to it; only connections that carry this key are accepted.
+ */
+let frameKey = '';
 
 function processorFrame(): Promise<HTMLIFrameElement> {
   frame ??= new Promise((resolve, reject) => {
@@ -55,7 +60,11 @@ function processorFrame(): Promise<HTMLIFrameElement> {
     // not display:none: hidden frames get throttled harder, and the processor needs the GPU
     f.style.cssText = 'position:fixed;width:1px;height:1px;border:0;opacity:0;pointer-events:none;left:0;top:0';
     f.setAttribute('aria-hidden', 'true');
-    f.onload = () => resolve(f);
+    f.onload = () => {
+      frameKey = crypto.randomUUID();
+      f.contentWindow!.postMessage({ mr: 'init', key: frameKey }, '*');
+      resolve(f);
+    };
     f.onerror = () => reject(new Error('processor frame failed to load'));
     (document.documentElement ?? document).appendChild(f);
   });
@@ -70,7 +79,7 @@ export async function connectProcessor(name: 'mr-proc' | 'mr-vis'): Promise<Port
   if (__SAFARI__) {
     const f = await processorFrame();
     const ch = new MessageChannel();
-    f.contentWindow!.postMessage({ mr: 'connect', name }, '*', [ch.port2]);
+    f.contentWindow!.postMessage({ mr: 'connect', name, key: frameKey }, '*', [ch.port2]);
     return fromMessagePort(ch.port1);
   }
   await chrome.runtime.sendMessage({ type: 'ensure-offscreen' });

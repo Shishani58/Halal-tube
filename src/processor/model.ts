@@ -36,6 +36,8 @@ export interface LoadOptions {
   backend?: 'webgpu' | 'wasm';
 }
 
+declare const __SAFARI__: boolean;
+
 let ortPromise: Promise<typeof Ort> | null = null;
 
 export async function loadOrt(base: string): Promise<typeof Ort> {
@@ -123,9 +125,13 @@ export async function loadModel(opts: LoadOptions): Promise<LoadedModel> {
         lap('fetch');
         timings.fetchHead = fetchMs.head;
         timings.fetchBody = fetchMs.body;
+        // iPhone Safari gives a page far less memory than a desktop: no memory arena or pattern planning, lighter graph optimization
+        // (the sound model keeps the full optimization: unfused, it needs more memory, not less)
+        const lean = backend === 'wasm' && typeof __SAFARI__ !== 'undefined' && __SAFARI__ && !opts.modelFile.startsWith('Kim_Vocal');
         const session = await ort.InferenceSession.create(bytes, {
           executionProviders: [backend],
-          graphOptimizationLevel: 'all',
+          graphOptimizationLevel: lean ? 'basic' : 'all',
+          ...(lean ? { enableCpuMemArena: false, enableMemPattern: false } : {}),
         });
         lap('create');
         const inName = session.inputNames[0];

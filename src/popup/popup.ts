@@ -1,6 +1,8 @@
 import { DEFAULT_SETTINGS, type PageStatus, type Settings } from '../shared/messages';
 import { clearVideos, countVideos } from '../processor/vision-store';
 
+declare const __SAFARI__: boolean;
+
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const radios = (name: string) => Array.from(document.querySelectorAll<HTMLInputElement>(`input[name=${name}]`));
 
@@ -14,11 +16,27 @@ const blurHoverEl = $<HTMLInputElement>('blurHover');
 const blurCacheEl = $<HTMLInputElement>('blurCache');
 const holdEl = $<HTMLInputElement>('pauseUntilReady');
 const strengthEl = $<HTMLInputElement>('musicStrength');
-const levelEls = radios('blurLevel');
-const styleEls = radios('blurStyle');
-const modeEls = radios('mode');
-const profEls = radios('profanity');
-const strictEls = radios('blurStrict');
+
+/** One choice among options: a <select> menu (iPhone popup) or radio buttons (desktop popup), found by name. */
+function choice(name: string) {
+  const sel = document.querySelector<HTMLSelectElement>(`select[name=${name}]`);
+  const rs = radios(name);
+  return {
+    set(v: string): void {
+      if (sel) sel.value = v;
+      else for (const r of rs) r.checked = r.value === v;
+    },
+    onChange(fn: (v: string) => void): void {
+      if (sel) sel.addEventListener('change', () => fn(sel.value));
+      else for (const r of rs) r.addEventListener('change', () => r.checked && fn(r.value));
+    },
+  };
+}
+const levelCh = choice('blurLevel');
+const styleCh = choice('blurStyle');
+const modeCh = choice('mode');
+const profCh = choice('profanity');
+const strictCh = choice('blurStrict');
 
 let s: Settings = { ...DEFAULT_SETTINGS };
 
@@ -40,11 +58,15 @@ async function load(): Promise<void> {
   blurCacheEl.checked = s.blurCache;
   holdEl.checked = s.pauseUntilReady;
   strengthEl.value = String(s.musicStrength);
-  for (const l of levelEls) l.checked = l.value === s.blurLevel;
-  for (const x of styleEls) x.checked = x.value === s.blurStyle;
-  for (const m of modeEls) m.checked = m.value === s.mode;
-  for (const p of profEls) p.checked = p.value === s.profanity;
-  for (const x of strictEls) x.checked = (x.value === '1') === s.blurStrict;
+  levelCh.set(s.blurLevel);
+  styleCh.set(s.blurStyle);
+  modeCh.set(s.mode);
+  profCh.set(s.profanity);
+  strictCh.set(s.blurStrict ? '1' : '0');
+  if (__SAFARI__) {
+    $('field-strength').hidden = true;
+    $('strength-hint').hidden = true;
+  } // iPhone Safari can only mute the original, not mix it in
   render();
 }
 
@@ -73,7 +95,7 @@ function render(): void {
 
   const hint = $('profanity-hint');
   const idle = !s.musicRemoval && s.profanity === 'off';
-  hint.textContent = idle ? 'Музыка и мат не фильтруются — звук не меняется.' : 'Русский и английский. Речь распознаётся на вашем компьютере.';
+  hint.textContent = idle ? 'Музыка и мат не фильтруются — звук не меняется.' : `Русский и английский. Речь распознаётся на вашем ${__SAFARI__ ? 'устройстве' : 'компьютере'}.`;
   hint.classList.toggle('warn', idle);
   $('mode-hint').textContent =
     s.mode === 'strict' ? 'Первые секунды тихо, зато музыка и мат не проскочат.' : 'Сразу играет оригинал, обработанный звук подхватывается позже.';
@@ -116,11 +138,11 @@ strengthEl.addEventListener('input', () => {
   clearTimeout(strengthTimer);
   strengthTimer = window.setTimeout(() => void chrome.storage.sync.set({ musicStrength: s.musicStrength }), 250);
 });
-for (const x of styleEls) x.addEventListener('change', () => x.checked && save({ blurStyle: x.value as Settings['blurStyle'] }));
-for (const l of levelEls) l.addEventListener('change', () => l.checked && save({ blurLevel: l.value as Settings['blurLevel'] }));
-for (const m of modeEls) m.addEventListener('change', () => m.checked && save({ mode: m.value as Settings['mode'] }));
-for (const p of profEls) p.addEventListener('change', () => p.checked && save({ profanity: p.value as Settings['profanity'] }));
-for (const x of strictEls) x.addEventListener('change', () => x.checked && save({ blurStrict: x.value === '1' }));
+styleCh.onChange((v) => save({ blurStyle: v as Settings['blurStyle'] }));
+levelCh.onChange((v) => save({ blurLevel: v as Settings['blurLevel'] }));
+modeCh.onChange((v) => save({ mode: v as Settings['mode'] }));
+profCh.onChange((v) => save({ profanity: v as Settings['profanity'] }));
+strictCh.onChange((v) => save({ blurStrict: v === '1' }));
 
 type Dot = '' | 'ok' | 'wait' | 'bad' | 'hidden';
 function dot(id: string, kind: Dot): void {
@@ -174,7 +196,7 @@ async function refresh(): Promise<void> {
   else if (w.model === 'error') set('st-model', `Ошибка: ${w.error ?? ''}`);
   else set('st-model', w.model === 'loading' ? 'Загрузка…' : 'Не загружена');
   set('st-speed', w && w.rtf > 0 ? `${(1 / w.rtf).toFixed(1)}× быстрее реального времени` : '—');
-  set('st-ahead', w ? `${Math.round(w.ahead)} с (аудио загружено на ${Math.round(w.inputAhead)} с)` : '—');
+  set('st-ahead', w ? (__SAFARI__ ? `${Math.round(w.ahead)} с` : `${Math.round(w.ahead)} с (аудио загружено на ${Math.round(w.inputAhead)} с)`) : '—');
   const filterOn = s.profanity !== 'off';
   $('row-asr').hidden = !filterOn;
   if (filterOn) set('st-asr', asrText(w));

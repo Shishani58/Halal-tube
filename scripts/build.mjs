@@ -30,11 +30,15 @@ function adaptManifestForSafari() {
   const m = JSON.parse(readFileSync(mf, 'utf8'));
   delete m.minimum_chrome_version;
   delete m.commands; // no keyboard on a phone
+  m.name = 'Халал Туб';
+  m.short_name = 'Халал Туб';
   m.permissions = m.permissions.filter((p) => p !== 'offscreen');
   m.background = { scripts: ['background.js'], persistent: false };
   m.web_accessible_resources = [{ resources: ['processor/offscreen.html'], matches: m.content_scripts[0].matches }];
   writeFileSync(mf, JSON.stringify(m, null, 2));
   rmSync(join(dist, 'bench'), { recursive: true, force: true });
+  // the popup gets its own iPhone layout and look (same element ids, so src/popup/popup.ts is shared)
+  cpSync(join(root, 'static/popup-ios'), join(dist, 'popup'), { recursive: true, force: true });
 }
 
 function copyStatic() {
