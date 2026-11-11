@@ -3,6 +3,7 @@
 
 mod live;
 mod player;
+mod screen;
 
 use mr_core::blur::detect::Detector;
 use mr_core::blur::job as blur_job;
@@ -541,6 +542,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .manage(live::LiveSlot::default())
         .manage(player::PlayerSlot::default())
+.manage(screen::ScreenSlot::default())
         .manage(AppState {
             jobs: Mutex::new(Vec::new()),
             tx: Mutex::new(tx),
@@ -564,6 +566,18 @@ fn main() {
                     let _ = handle.emit("play-file", ());
                 }
                 args.drain(i..(i + 2).min(args.len()));
+            }
+            if let Some(i) = args.iter().position(|a| a == "--overlay-demo") {
+                // `--overlay-demo`: two blurred patches for 8 s, to see what the overlay looks like (no capture, no permission)
+                args.remove(i);
+                #[cfg(target_os = "macos")]
+                std::thread::spawn(|| {
+                    use mr_core::blur::Rect;
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    mr_core::screen::show_regions(&[Rect::new(0.55, 0.15, 0.3, 0.4), Rect::new(0.1, 0.6, 0.25, 0.25)]);
+                    std::thread::sleep(std::time::Duration::from_secs(8));
+                    mr_core::screen::show_regions(&[]);
+                });
             }
             let args: Vec<String> = args.into_iter().filter(|a| Path::new(a).exists()).collect();
             push_pending(&handle, args);
@@ -596,7 +610,10 @@ fn main() {
             player::player_pause,
             player::player_seek,
             player::player_set_strength,
-            player::player_close
+            player::player_close,
+screen::screen_start,
+screen::screen_stop,
+screen::screen_status
         ])
         .build(tauri::generate_context!())
         .expect("error while building Music Remover")
@@ -605,6 +622,7 @@ fn main() {
             if let tauri::RunEvent::Exit = _event {
                 _app.state::<live::LiveSlot>().shutdown();
                 _app.state::<player::PlayerSlot>().shutdown();
+_app.state::<screen::ScreenSlot>().shutdown();
             }
             // macOS delivers "Open With" / Dock-icon drops as an Opened event.
             #[cfg(target_os = "macos")]

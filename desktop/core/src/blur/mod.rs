@@ -10,6 +10,7 @@
 
 pub mod detect;
 pub mod job;
+pub mod live;
 pub mod render;
 pub mod shots;
 pub mod timeline;

@@ -45,6 +45,7 @@
     renderDest();
     renderStrength();
     renderLive();
+    renderScreen();
     renderEngine();
     jobs.forEach((j) => renderJob(j));
     cmpRender();
@@ -404,6 +405,38 @@
     if (on || v.state === 'error') { if (!liveTimer) liveTimer = setInterval(liveRefresh, 1000); }
     else if (liveTimer) { clearInterval(liveTimer); liveTimer = 0; }
   }
+  // ---------- hide on screen (macOS) ----------
+  let screenView = { supported: false, state: 'off' };
+  let screenTimer = 0;
+  function renderScreen() {
+    const v = screenView;
+    $('#screen').hidden = !v.supported;
+    if (!v.supported) return;
+    const on = v.state !== 'off' && v.state !== 'error';
+    const btn = $('#screen-toggle');
+    btn.textContent = on ? t('liveOff') : t('liveOn');
+    btn.classList.toggle('on', on);
+    $('#screen').classList.toggle('err', v.state === 'error');
+    let text = t('screenIdle');
+    if (v.state === 'starting') text = t('screenStarting');
+    else if (v.state === 'loading') text = t('screenLoading');
+    else if (v.state === 'running') text = t('screenRunning')(v.regions, v.lastMs);
+    else if (v.state === 'error') text = v.errorCode === 'screen_permission' ? t('screenDenied') : t('screenError')(v.errorMessage || v.errorCode || '');
+    $('#screen-status').textContent = text;
+    const help = $('#screen-help');
+    const denied = v.state === 'error' && v.errorCode === 'screen_permission';
+    help.textContent = denied ? t('screenHelpPermission') : t('screenHelpRun');
+    help.hidden = !(v.state === 'running' || denied);
+    if (on || v.state === 'error') { if (!screenTimer) screenTimer = setInterval(screenRefresh, 1000); }
+    else if (screenTimer) { clearInterval(screenTimer); screenTimer = 0; }
+  }
+  async function screenRefresh() { screenView = (await api.invoke('screen_status')) || screenView; renderScreen(); }
+  $('#screen-toggle').addEventListener('click', async () => {
+    const on = screenView.state !== 'off' && screenView.state !== 'error';
+    screenView = (await api.invoke(on ? 'screen_stop' : 'screen_start')) || screenView;
+    renderScreen();
+  });
+
   async function liveRefresh() { liveView = (await api.invoke('live_status')) || liveView; renderLive(); }
   $('#live-toggle').addEventListener('click', async () => {
     const on = liveView.state !== 'off' && liveView.state !== 'error';
@@ -485,6 +518,7 @@
     engine = await api.invoke('engine_status');
     renderEngine();
     await liveRefresh();
+    await screenRefresh();
     await fillDevices();
     (await api.invoke('list_jobs')).forEach(upsert);
     syncLayout();
@@ -523,6 +557,7 @@
         if (cmd === 'take_pending_files') return [];
         if (cmd === 'take_pending_play') return null;
         if (cmd === 'live_devices') return [{ name: 'MacBook Pro Speakers', isDefault: true }, { name: 'AirPods', isDefault: false }];
+        if (cmd === 'screen_status') return { supported: true, state: 'off' };
         if (cmd === 'live_status') return liveDemo;
         if (cmd === 'live_start') return (liveDemo = { supported: true, state: 'running', backend: 'CoreML', latency: 1.8, load: 0.27, activity: true, strength: args.strength });
         if (cmd === 'live_stop') return (liveDemo = { supported: true, state: 'off' });

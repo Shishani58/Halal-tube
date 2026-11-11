@@ -6,6 +6,13 @@ fn main() {
         println!("cargo:rerun-if-changed=src/mac/tap.m");
         println!("cargo:rerun-if-changed=src/mac/tap.h");
         cc::Build::new().file("src/mac/tap.m").flag("-fobjc-arc").flag("-Wno-unguarded-availability-new").flag("-Wno-unused-parameter").compile("mr_tap");
+        // screen capture and the blur overlay for the "hide on screen" mode
+        println!("cargo:rerun-if-changed=src/mac/screen.m");
+        println!("cargo:rerun-if-changed=src/mac/screen.h");
+        cc::Build::new().file("src/mac/screen.m").flag("-fobjc-arc").flag("-Wno-unguarded-availability-new").flag("-Wno-unused-parameter").compile("mr_screen");
+        for f in ["ScreenCaptureKit", "AppKit", "CoreMedia", "CoreVideo", "CoreGraphics", "QuartzCore"] {
+            println!("cargo:rustc-link-lib=framework={f}");
+        }
         println!("cargo:rustc-link-lib=framework=CoreAudio");
         println!("cargo:rustc-link-lib=framework=Foundation");
         let out = std::process::Command::new("clang").arg("--print-runtime-dir").output();

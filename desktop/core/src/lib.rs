@@ -27,6 +27,8 @@ pub mod media;
 pub mod model;
 pub mod passthrough;
 pub mod preview;
+#[cfg(target_os = "macos")]
+pub mod screen;
 pub mod ring;
 pub mod stream;
 pub mod selftest;
