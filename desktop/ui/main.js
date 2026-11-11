@@ -13,6 +13,8 @@
   let lang = store.get('lang', (navigator.language || 'ru').toLowerCase().startsWith('ru') ? 'ru' : 'en');
   let outDir = store.get('outDir', null);
   let strength = Math.min(100, Math.max(0, Number(store.get('strength', 100)) || 0));
+  let music = store.get('music', '1') !== '0';
+  let blur = store.get('blur', '0') === '1';
   let engine = { state: 'idle' };
   const jobs = new Map(); // id → JobView
   const rows = new Map(); // id → <li>
@@ -44,6 +46,8 @@
     renderLive();
     renderEngine();
     jobs.forEach((j) => renderJob(j));
+    cmpRender();
+    renderModes();
   }
 
   function renderDest() {
@@ -84,7 +88,7 @@
       case 'queued': return t('queued');
       case 'running':
         if (j.progress <= 0) return engine.state === 'loading' ? t('loadingModel') : t('starting');
-        return t('working')(Math.floor(j.progress * 100), j.eta != null ? fmtTime(j.eta) : null);
+        return t('working')(Math.floor(j.progress * 100), j.eta != null ? fmtTime(j.eta) : null, j.stage);
       case 'done': return t('done')(j.outputName || '');
       case 'cancelled': return t('cancelled');
       case 'error': return errorText(j);
@@ -99,8 +103,10 @@
       li.querySelector('.stop').addEventListener('click', () => {
         const cur = jobs.get(j.id);
         if (cur.status === 'queued' || cur.status === 'running') api.invoke('cancel_job', { id: j.id });
-        else { api.invoke('remove_job', { id: j.id }); removed.add(j.id); jobs.delete(j.id); li.remove(); rows.delete(j.id); syncLayout(); }
+        else { if (cmp.id === j.id) closeCompare(); api.invoke('remove_job', { id: j.id }); removed.add(j.id); jobs.delete(j.id); li.remove(); rows.delete(j.id); syncLayout(); }
       });
+      li.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = t(el.dataset.i18n); });
+      li.querySelector('.compare').addEventListener('click', () => toggleCompare(j.id, li));
       li.querySelector('.reveal').addEventListener('click', () => {
         const cur = jobs.get(j.id);
         if (cur.output) api.reveal(cur.output);
@@ -118,6 +124,9 @@
     const active = j.status === 'running' || j.status === 'queued';
     li.querySelector('.bar').hidden = j.status !== 'running';
     li.querySelector('.fill').style.width = `${Math.max(1.5, j.progress * 100)}%`;
+    const compare = li.querySelector('.compare');
+    compare.hidden = j.status !== 'done';
+    compare.textContent = t('compare');
     const reveal = li.querySelector('.reveal');
     reveal.hidden = j.status !== 'done';
     reveal.textContent = isMac ? t('reveal') : t('revealWin');
@@ -143,7 +152,8 @@
   // ---------- actions ----------
   async function addPaths(paths) {
     if (!paths || !paths.length) return;
-    const added = await api.invoke('add_files', { paths, suffix: t('suffix'), outDir, strength });
+    const suffix = t(music && blur ? 'suffixBoth' : blur ? 'suffixBlur' : 'suffix');
+    const added = await api.invoke('add_files', { paths, suffix, outDir, strength, music, blur });
     added.forEach(upsert);
   }
 
@@ -159,6 +169,115 @@
     const d = await api.pickFolder();
     if (typeof d === 'string' && d) { outDir = d; store.set('outDir', d); renderDest(); }
   });
+  // ---------- what to do ----------
+  function renderModes() {
+    $('#mode-music').checked = music;
+    $('#mode-blur').checked = blur;
+    $('#mode-blur-label').title = t('modeBlurHint');
+    strengthEl.parentElement.classList.toggle('off', !music);
+  }
+  $('#mode-music').addEventListener('change', (e) => { music = e.target.checked; if (!music && !blur) blur = true; store.set('music', music ? '1' : '0'); store.set('blur', blur ? '1' : '0'); renderModes(); });
+  $('#mode-blur').addEventListener('change', (e) => { blur = e.target.checked; if (!blur && !music) music = true; store.set('music', music ? '1' : '0'); store.set('blur', blur ? '1' : '0'); renderModes(); });
+
+  // ---------- before / after listening ----------
+  // The backend cuts the same ~30 s out of the original and the result as WAV; two <audio> elements play
+  // them together, and the one that isn't selected is muted, so switching is instant and in sync.
+  const cmp = { id: 0, li: null, before: null, after: null, urls: [], side: 'after', length: 0, token: 0 };
+  const clock = (s) => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+  const cq = (sel) => cmp.li && cmp.li.querySelector(sel);
+
+  function cmpMessage(text, isErr) {
+    const m = cq('.cmp-msg');
+    if (!m) return;
+    m.textContent = text || '';
+    m.classList.toggle('err', !!isErr);
+  }
+  function cmpRender() {
+    if (!cmp.li) return;
+    const active = cmp[cmp.side];
+    const playing = !!active && !active.paused;
+    const play = cq('.play');
+    play.textContent = playing ? '⏸' : '▶';
+    play.title = play.ariaLabel = t(playing ? 'cmpPause' : 'cmpPlay');
+    cq('.seek').ariaLabel = t('cmpSeek');
+    cq('.time').textContent = `${clock(active ? active.currentTime : 0)} / ${clock(cmp.length)}`;
+    if (active && cmp.length) cq('.seek').value = String(Math.round((active.currentTime / cmp.length) * 1000));
+    cmp.li.querySelectorAll('.seg button').forEach((b) => b.classList.toggle('on', b.dataset.side === cmp.side));
+    cmp.before && (cmp.before.muted = cmp.side !== 'before');
+    cmp.after && (cmp.after.muted = cmp.side !== 'after');
+  }
+  function cmpStop() {
+    for (const a of [cmp.before, cmp.after]) if (a) { a.pause(); a.removeAttribute('src'); a.load(); }
+    cmp.urls.forEach((u) => URL.revokeObjectURL(u));
+    cmp.urls = []; cmp.before = cmp.after = null;
+  }
+  function closeCompare() {
+    if (!cmp.li) return;
+    cmp.token++;
+    cmpStop();
+    cmp.li.querySelector('.cmp').hidden = true;
+    cmp.li.querySelector('.compare').classList.remove('on');
+    const id = cmp.id;
+    cmp.li = null; cmp.id = 0;
+    api.invoke('clear_preview', { id });
+  }
+  async function loadCompare(position) {
+    const token = ++cmp.token, id = cmp.id;
+    cmpStop();
+    cmp.length = 0;
+    cmpMessage(t('cmpPreparing'));
+    cmpRender();
+    try {
+      const v = await api.invoke('prepare_preview', { id, position });
+      const [b, a] = await Promise.all(['before', 'after'].map((which) => api.invoke('preview_bytes', { id, which })));
+      if (token !== cmp.token) return; // closed or reloaded meanwhile
+      const make = (buf) => {
+        const url = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+        cmp.urls.push(url);
+        const el = new Audio(url);
+        el.preload = 'auto';
+        return el;
+      };
+      cmp.before = make(b); cmp.after = make(a);
+      cmp.length = v.length;
+      for (const el of [cmp.before, cmp.after]) {
+        el.addEventListener('timeupdate', () => {
+          if (el !== cmp[cmp.side]) return;
+          const other = cmp[cmp.side === 'before' ? 'after' : 'before'];
+          if (other && Math.abs(other.currentTime - el.currentTime) > 0.15) other.currentTime = el.currentTime;
+          cmpRender();
+        });
+        el.addEventListener('ended', () => { cmp.before.pause(); cmp.after.pause(); cmp.before.currentTime = cmp.after.currentTime = 0; cmpRender(); });
+      }
+      cmpMessage('');
+      cmpRender();
+    } catch (e) {
+      if (token === cmp.token) cmpMessage(`${t('cmpError')}: ${e}`, true);
+    }
+  }
+  function toggleCompare(id, li) {
+    if (cmp.id === id) { closeCompare(); return; }
+    closeCompare();
+    cmp.id = id; cmp.li = li; cmp.side = 'after';
+    li.querySelector('.cmp').hidden = false;
+    li.querySelector('.compare').classList.add('on');
+    li.querySelector('.pos').value = '20';
+    li.querySelector('.play').onclick = () => {
+      const a = cmp.before, b = cmp.after;
+      if (!a || !b) return;
+      if (a.paused) { b.currentTime = a.currentTime; a.play(); b.play(); } else { a.pause(); b.pause(); }
+      cmpRender();
+    };
+    li.querySelectorAll('.seg button').forEach((btn) => { btn.onclick = () => { cmp.side = btn.dataset.side; cmpRender(); }; });
+    li.querySelector('.seek').oninput = (e) => {
+      if (!cmp.before || !cmp.after) return;
+      cmp.before.currentTime = cmp.after.currentTime = (Number(e.target.value) / 1000) * cmp.length;
+      cmpRender();
+    };
+    li.querySelector('.pos').onchange = (e) => loadCompare(Number(e.target.value) / 100);
+    loadCompare(0.2);
+  }
+
   // ---------- live mode (macOS) ----------
   let liveView = { supported: false, state: 'off' };
   let liveTimer = 0;
@@ -240,7 +359,7 @@
   $('#clear').addEventListener('click', async () => {
     await api.invoke('clear_finished');
     for (const [id, j] of jobs) {
-      if (!['queued', 'running'].includes(j.status)) { removed.add(id); jobs.delete(id); rows.get(id)?.remove(); rows.delete(id); }
+      if (!['queued', 'running'].includes(j.status)) { if (cmp.id === id) closeCompare(); removed.add(id); jobs.delete(id); rows.get(id)?.remove(); rows.delete(id); }
     }
     syncLayout();
   });
@@ -275,6 +394,14 @@
   })();
 
   // ---------- demo backend for viewing the UI in a browser ----------
+  function silentWav(seconds) { // 8 kHz mono 16-bit silence: the demo makes no sound
+    const n = seconds * 8000, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    const str = (o, x) => [...x].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+    str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVEfmt '); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 8000, true); v.setUint32(28, 16000, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, n * 2, true);
+    return buf;
+  }
   function demoApi() {
     const listeners = {};
     const emit = (ev, p) => (listeners[ev] || []).forEach((cb) => cb(p));
@@ -297,6 +424,9 @@
         if (cmd === 'live_start') return (liveDemo = { supported: true, state: 'running', backend: 'CoreML', latency: 1.8, load: 0.27, activity: true, strength: args.strength });
         if (cmd === 'live_stop') return (liveDemo = { supported: true, state: 'off' });
         if (cmd === 'live_set_strength') return null;
+        if (cmd === 'prepare_preview') return { start: 0, length: 30 };
+        if (cmd === 'preview_bytes') return silentWav(30);
+        if (cmd === 'clear_preview') return null;
         if (cmd === 'add_files') return args.paths.map((p) => ({ id: id++, input: p, name: p.split('/').pop(), status: 'queued', progress: 0, isVideo: true }));
         return null;
       },

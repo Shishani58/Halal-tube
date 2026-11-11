@@ -4,7 +4,9 @@
 //! - [`model`]: ONNX Runtime session (CoreML / DirectML / CPU).
 //! - [`media`]: FFmpeg probing and output format choice.
 //! - [`passthrough`]: original sound where nothing was removed, and the strength mix.
+//! - [`preview`]: short before/after clips for listening.
 //! - [`live`]: the streaming engine for a live (system audio) mode, without audio capture.
+//! - [`blur`]: hides nudity and women in video (re-encodes the picture, blurs regions).
 //! - [`job`]: the streaming file pipeline: decode → separate tile by tile → encode + mux.
 
 #[cfg(target_os = "macos")]
@@ -12,6 +14,7 @@ pub mod capture;
 #[cfg(target_os = "windows")]
 #[path = "capture_win.rs"]
 pub mod capture;
+pub mod blur;
 pub mod job;
 pub mod live;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -20,6 +23,7 @@ pub mod mdx;
 pub mod media;
 pub mod model;
 pub mod passthrough;
+pub mod preview;
 pub mod ring;
 pub mod stream;
 pub mod selftest;
@@ -36,6 +40,8 @@ pub enum Error {
     NotMedia(String),
     #[error("the file has no audio track")]
     NoAudio,
+    #[error("the file has no video track")]
+    NoVideo,
     #[error("ffmpeg failed: {0}")]
     Ffmpeg(String),
     #[error("model error: {0}")]
@@ -62,6 +68,7 @@ impl Error {
             Error::ModelMissing(_) => "model_missing",
             Error::NotMedia(_) => "not_media",
             Error::NoAudio => "no_audio",
+            Error::NoVideo => "no_video",
             Error::Ffmpeg(_) => "ffmpeg",
             Error::Model(_) => "model",
             Error::Cancelled => "cancelled",
@@ -73,3 +80,6 @@ impl Error {
 
 /// Default location of the bundled model relative to a resources directory.
 pub const MODEL_FILE: &str = "Kim_Vocal_2.onnx";
+/// Blur models (nudity + faces, face gender), next to the separation model.
+pub const NUDENET_FILE: &str = "nudenet-320n.onnx";
+pub const GENDER_FILE: &str = "genderage.onnx";

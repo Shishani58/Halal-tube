@@ -12,6 +12,8 @@ APP="$HERE/../target/release/bundle/macos/Music Remover.app"
 ID="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning | grep '"Apple Development' | head -1 | awk '{print $2}')}"
 [ -n "$ID" ] || { echo "no \"Apple Development\" certificate in the keychain (Xcode → Settings → Accounts → Manage Certificates)" >&2; exit 1; }
 echo "signing with: $ID"
+# the bundled ffmpeg/ffprobe first (inside-out), then the bundle
+for b in "$APP"/Contents/Resources/bin/*; do [ -f "$b" ] && codesign --force --options runtime --sign "$ID" "$b"; done
 codesign --force --options runtime --entitlements "$HERE/../app/entitlements.plist" --sign "$ID" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 codesign -dv "$APP" 2>&1 | grep -E "Identifier|Authority|TeamIdentifier|flags"

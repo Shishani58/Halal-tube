@@ -123,6 +123,54 @@ fn add_gpu_provider(_builder: SessionBuilder, _cache_dir: Option<&Path>) -> Resu
     Err(Error::Model("no GPU provider on this platform".into()))
 }
 
+/// A plain ONNX network with one f32 input and one f32 output (the blur detectors use these).
+pub struct Net {
+    session: Session,
+    pub backend: Backend,
+}
+
+impl Net {
+    /// Loads `path` on the GPU when `gpu` (falling back to the CPU if that fails to load or run), else on the CPU.
+    /// `probe_shape` is run once on zeros: a broken GPU path fails here, not mid-file.
+    pub fn load(path: &Path, probe_shape: &[usize], gpu: bool, cache_dir: Option<&Path>) -> Result<Self, Error> {
+        if !path.exists() {
+            return Err(Error::ModelMissing(path.to_path_buf()));
+        }
+        let order: &[Backend] = if gpu { &[Backend::Gpu, Backend::Cpu] } else { &[Backend::Cpu] };
+        let mut last: Option<Error> = None;
+        for &backend in order {
+            let built = (|| -> Result<Session, Error> {
+                let mut builder = Session::builder(environment()?)?
+                    .with_optimization_level(GraphOptimizationLevel::Level3)?
+                    .with_intra_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))?;
+                if backend == Backend::Gpu {
+                    builder = add_gpu_provider(builder, cache_dir)?;
+                }
+                Ok(builder.commit_from_file(path)?)
+            })();
+            match built {
+                Ok(session) => {
+                    let mut net = Net { session, backend };
+                    match net.run(probe_shape, &vec![0f32; probe_shape.iter().product()]) {
+                        Ok(_) => return Ok(net),
+                        Err(e) => last = Some(e),
+                    }
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| Error::Model("no backend".into())))
+    }
+
+    /// Runs the network on one input tensor; returns the first output, flattened.
+    pub fn run(&mut self, shape: &[usize], data: &[f32]) -> Result<Vec<f32>, Error> {
+        let tensor = TensorRef::from_array_view((shape.to_vec(), data))?;
+        let outputs = self.session.run(ort::inputs![tensor])?;
+        let (_, out) = outputs[0].try_extract_tensor::<f32>()?;
+        Ok(out.to_vec())
+    }
+}
+
 /// What the GPU self-test found (see [`Separator::self_test`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum SelfTest {

@@ -61,6 +61,10 @@
   </main>
 
   <footer class="bottom">
+    <div class="modes" role="group">
+      <label class="mode"><input id="mode-music" type="checkbox" checked> <span data-i18n="modeMusic"></span></label>
+      <label class="mode" id="mode-blur-label"><input id="mode-blur" type="checkbox"> <span data-i18n="modeBlur"></span></label>
+    </div>
     <label class="strength" title="">
       <span class="muted" data-i18n="strength"></span>
       <input id="strength" type="range" min="0" max="100" step="5" value="100" />
@@ -90,10 +94,26 @@
         <div class="bar"><div class="fill"></div></div>
       </div>
       <div class="actions">
+        <button type="button" class="btn compare" hidden></button>
         <button type="button" class="btn reveal" hidden></button>
         <button type="button" class="icon-btn stop" hidden aria-label="">
           <svg viewBox="0 0 16 16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
         </button>
+      </div>
+      <div class="cmp" hidden>
+        <div class="cmp-row">
+          <button type="button" class="btn play" aria-label=""></button>
+          <div class="seg" role="group">
+            <button type="button" data-side="before" data-i18n="cmpBefore"></button>
+            <button type="button" data-side="after" class="on" data-i18n="cmpAfter"></button>
+          </div>
+          <input class="seek" type="range" min="0" max="1000" value="0" aria-label="">
+          <span class="time muted">0:00</span>
+        </div>
+        <div class="cmp-row">
+          <label class="muted cmp-pos"><span data-i18n="cmpWhere"></span> <input class="pos" type="range" min="0" max="100" value="20"></label>
+          <span class="cmp-msg muted"></span>
+        </div>
       </div>
     </li>
   </template>

@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src blob:"
     }
   },
   "bundle": {
@@ -38,7 +38,11 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../../models/Kim_Vocal_2.onnx": "models/Kim_Vocal_2.onnx"
+      "../../models/Kim_Vocal_2.onnx": "models/Kim_Vocal_2.onnx",
+      "../../models/nudenet-320n.onnx": "models/nudenet-320n.onnx",
+      "../../models/genderage.onnx": "models/genderage.onnx",
+      "../vendor/ffmpeg/ffmpeg": "bin/ffmpeg",
+      "../vendor/ffmpeg/ffprobe": "bin/ffprobe"
     },
     "macOS": {
       "minimumSystemVersion": "14.0"

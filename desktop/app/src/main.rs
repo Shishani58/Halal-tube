@@ -3,10 +3,13 @@
 
 mod live;
 
+use mr_core::blur::detect::Detector;
+use mr_core::blur::job as blur_job;
 use mr_core::job;
 use mr_core::mdx::{Mdx, KIM_VOCAL_2};
 use mr_core::media::{self, Tools};
 use mr_core::model::{Model, SelfTest, Separator};
+use mr_core::preview;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,6 +35,11 @@ struct Job {
     suffix: String,
     /// Share of the clean voice in the output, percent (the rest is the original track).
     strength: u8,
+    /// Remove the music / hide nudity and women (video only).
+    music: bool,
+    blur: bool,
+    /// What the worker is doing now: "music" | "scan" | "blur" ("" while waiting).
+    stage: &'static str,
     output: Option<PathBuf>,
     status: Status,
     progress: f64,
@@ -55,6 +63,9 @@ struct JobView {
     eta: Option<f64>,
     duration: Option<f64>,
     is_video: bool,
+    music: bool,
+    blur: bool,
+    stage: &'static str,
     error_code: Option<String>,
     error_message: Option<String>,
 }
@@ -74,6 +85,9 @@ impl Job {
             eta: self.eta,
             duration: self.duration,
             is_video: self.has_video || media::VIDEO_EXTS.contains(&ext.as_str()),
+            music: self.music,
+            blur: self.blur,
+            stage: self.stage,
             error_code: self.error.as_ref().map(|e| e.0.clone()),
             error_message: self.error.as_ref().map(|e| e.1.clone()),
         }
@@ -161,7 +175,9 @@ fn is_hidden(p: &Path) -> bool {
 }
 
 #[tauri::command]
-fn add_files(app: AppHandle, state: State<AppState>, paths: Vec<String>, suffix: String, out_dir: Option<String>, strength: Option<u8>) -> Vec<JobView> {
+fn add_files(app: AppHandle, state: State<AppState>, paths: Vec<String>, suffix: String, out_dir: Option<String>, strength: Option<u8>, music: Option<bool>, blur: Option<bool>) -> Vec<JobView> {
+    let blur = blur.unwrap_or(false);
+    let music = music.unwrap_or(true) || !blur; // something must be done
     let out_dir = out_dir.filter(|s| !s.is_empty()).map(PathBuf::from);
     let mut added = Vec::new();
     let mut jobs = state.jobs.lock().unwrap();
@@ -177,6 +193,9 @@ fn add_files(app: AppHandle, state: State<AppState>, paths: Vec<String>, suffix:
             out_dir: out_dir.clone(),
             suffix: suffix.clone(),
             strength: strength.unwrap_or(100).min(100),
+            music,
+            blur,
+            stage: "",
             output: None,
             status: Status::Queued,
             progress: 0.0,
@@ -245,19 +264,215 @@ fn clear_finished(state: State<AppState>) {
         .retain(|j| matches!(j.status, Status::Queued | Status::Running));
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewView {
+    start: f64,
+    length: f64,
+}
+
+fn preview_file(app: &AppHandle, id: u64, which: &str) -> Result<PathBuf, String> {
+    let dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("preview");
+    Ok(dir.join(format!("{id}-{which}.wav")))
+}
+
+/// Cuts the same ~30 s stretch (starting at `position`, 0..1 of the file) out of the original and the
+/// cleaned file, so the UI can switch between them while listening.
+#[tauri::command(async)]
+fn prepare_preview(app: AppHandle, state: State<AppState>, id: u64, position: f64) -> Result<PreviewView, String> {
+    let (input, output, duration) = {
+        let jobs = state.jobs.lock().unwrap();
+        let j = jobs.iter().find(|j| j.id == id).ok_or("no such job")?;
+        if j.status != Status::Done {
+            return Err("not finished".into());
+        }
+        (j.input.clone(), j.output.clone().ok_or("no output")?, j.duration.unwrap_or(0.0))
+    };
+    let tools = Tools::locate().map_err(|e| e.to_string())?;
+    let (start, length) = preview::window(duration, position);
+    preview::cut_clip(&tools, &input, start, length, &preview_file(&app, id, "before")?).map_err(|e| e.to_string())?;
+    preview::cut_clip(&tools, &output, start, length, &preview_file(&app, id, "after")?).map_err(|e| e.to_string())?;
+    Ok(PreviewView { start, length })
+}
+
+/// The WAV bytes of one side of the preview ("before" / "after"), sent raw (not as a JSON array).
+#[tauri::command(async)]
+fn preview_bytes(app: AppHandle, id: u64, which: String) -> Result<tauri::ipc::Response, String> {
+    if which != "before" && which != "after" {
+        return Err("bad side".into());
+    }
+    std::fs::read(preview_file(&app, id, &which)?).map(tauri::ipc::Response::new).map_err(|e| e.to_string())
+}
+
+/// Drops the preview clips (they are only needed while listening).
+#[tauri::command(async)]
+fn clear_preview(app: AppHandle, id: u64) {
+    for w in ["before", "after"] {
+        if let Ok(p) = preview_file(&app, id, w) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// A model file: bundled in the app's resources, else the repository's `models/` (development).
+pub(crate) fn model_file(app: &AppHandle, file: &str) -> PathBuf {
+    let bundled = app.path().resource_dir().map(|d| d.join("models").join(file)).ok().filter(|p| p.exists());
+    bundled.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(file))
+}
+
 pub(crate) fn model_path(app: &AppHandle) -> PathBuf {
-    let bundled = app
-        .path()
-        .resource_dir()
-        .map(|d| d.join("models").join(mr_core::MODEL_FILE))
-        .ok()
-        .filter(|p| p.exists());
-    bundled.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(mr_core::MODEL_FILE))
+    model_file(app, mr_core::MODEL_FILE)
+}
+
+/// The loaded engines, kept between jobs.
+#[derive(Default)]
+struct Engines {
+    tools: Option<Tools>,
+    sep: Option<Separator>,
+    detector: Option<Detector>,
+}
+
+struct Picked {
+    input: PathBuf,
+    out_dir: Option<PathBuf>,
+    suffix: String,
+    strength: u8,
+    music: bool,
+    blur: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Loads the separation model (and runs its GPU self-test) unless it is loaded.
+fn ensure_separator(app: &AppHandle, eng: &mut Engines) -> Result<(), mr_core::Error> {
+    if eng.sep.is_some() {
+        return Ok(());
+    }
+    set_engine(app, EngineView { state: "loading", backend: None, error_code: None, error_message: None, gpu_check_failed: false });
+    let mdx = Mdx::new(KIM_VOCAL_2);
+    let cache = app.path().app_cache_dir().ok().map(|d| d.join("coreml"));
+    match Model::load(&model_path(app), mdx.tensor_shape(), None, cache.as_deref()) {
+        Ok(model) => {
+            let mut s = Separator::new(mdx, model);
+            // CoreML / DirectML can compute wrong numbers without an error: compare with the CPU once
+            // (the verdict is kept for a month); on a mismatch the CPU is used
+            let check = s.self_test(app.path().app_cache_dir().ok().map(|d| d.join("selftest")).as_deref());
+            let failed = matches!(check, Ok(SelfTest::FellBack(_)));
+            if let Ok(SelfTest::FellBack(why)) = &check {
+                eprintln!("GPU self-test failed ({why}): using the CPU");
+            }
+            set_engine(app, EngineView { state: "ready", backend: Some(s.model.backend.label().to_string()), error_code: None, error_message: None, gpu_check_failed: failed });
+            eng.sep = Some(s);
+            Ok(())
+        }
+        Err(e) => {
+            set_engine(app, EngineView { state: "error", backend: None, error_code: Some(e.code().into()), error_message: Some(e.to_string()), gpu_check_failed: false });
+            Err(e)
+        }
+    }
+}
+
+fn ensure_detector(app: &AppHandle, eng: &mut Engines) -> Result<(), mr_core::Error> {
+    if eng.detector.is_none() {
+        let cache = app.path().app_cache_dir().ok().map(|d| d.join("coreml"));
+        eng.detector = Some(Detector::load(&model_file(app, mr_core::NUDENET_FILE), &model_file(app, mr_core::GENDER_FILE), cache.as_deref())?);
+    }
+    Ok(())
+}
+
+/// Runs the stages a job asks for: remove the music, then hide people. With both, the music-free file is an
+/// intermediate (a hidden file next to the result) that the blur stage reads, and it is deleted afterwards.
+fn run_job(app: &AppHandle, id: u64, eng: &mut Engines, p: &Picked) -> Result<PathBuf, mr_core::Error> {
+    use mr_core::Error;
+    if eng.tools.is_none() {
+        eng.tools = Some(Tools::locate()?);
+    }
+    let tools = eng.tools.clone().unwrap();
+
+    // What the file is, and where the results go.
+    let prepared = if p.music { Some(job::prepare(&tools, &p.input, p.out_dir.as_deref(), &p.suffix)?) } else { None };
+    let has_video = match &prepared {
+        Some(pr) => pr.info.has_video,
+        None => match tools.probe(&p.input) {
+            Ok(i) => i.has_video,
+            Err(Error::NoAudio) => true, // a silent video: fine for blurring
+            Err(e) => return Err(e),
+        },
+    };
+    let blur = p.blur && has_video;
+    if !p.music && !blur {
+        return Err(Error::NoVideo);
+    }
+    let vinfo = if blur { Some(blur_job::probe_video(&tools, &p.input)?) } else { None };
+    let duration = prepared.as_ref().map(|pr| pr.info.duration).or(vinfo.as_ref().map(|v| v.duration)).unwrap_or(0.0);
+    let final_path = if blur {
+        let ext = blur_job::container_for(&prepared.as_ref().map(|pr| pr.plan.ext.clone()).unwrap_or_else(|| media::ext_of(&p.input)));
+        media::output_path(&p.input, p.out_dir.as_deref(), &p.suffix, ext)
+    } else {
+        prepared.as_ref().unwrap().output.clone()
+    };
+    with_job(app, id, |j| {
+        j.output = Some(final_path.clone());
+        j.duration = Some(duration);
+        j.has_video = has_video;
+    });
+
+    // Shares of the progress bar.
+    let (w_music, w_scan) = match (p.music, blur) {
+        (true, true) => (0.4, 0.15),
+        (true, false) => (1.0, 0.0),
+        (false, _) => (0.0, 0.15),
+    };
+    let started = Instant::now();
+    let mut last_emit = Instant::now();
+    let mut report = |base: f64, weight: f64, p: f64| {
+        let total = base + weight * p;
+        if last_emit.elapsed().as_millis() < 150 && p < 1.0 {
+            return;
+        }
+        last_emit = Instant::now();
+        let eta = if total > 0.02 { Some(started.elapsed().as_secs_f64() / total * (1.0 - total)) } else { None };
+        with_job(app, id, |j| {
+            j.progress = total.min(1.0);
+            j.eta = eta;
+        });
+    };
+
+    let mut intermediate: Option<PathBuf> = None;
+    let outcome = (|| -> Result<PathBuf, Error> {
+        let mut source = p.input.clone();
+        if let Some(pr) = &prepared {
+            ensure_separator(app, eng)?;
+            with_job(app, id, |j| j.stage = "music");
+            let target = if blur { pr.output.with_file_name(format!(".mr-tmp-{id}.{}", pr.plan.ext)) } else { pr.output.clone() };
+            let pr = job::Prepared { output: target.clone(), ..pr.clone() };
+            if blur {
+                intermediate = Some(target);
+            }
+            let sep = eng.sep.as_mut().unwrap();
+            let opts = job::Options { strength: p.strength as f32 / 100.0, keep_plain_speech: true };
+            let done = job::run_with(&tools, sep, &pr, &opts, &p.cancel, |x| report(0.0, w_music, x))?;
+            if !blur {
+                return Ok(done);
+            }
+            source = done;
+        }
+        let vinfo = vinfo.as_ref().unwrap();
+        ensure_detector(app, eng)?;
+        with_job(app, id, |j| j.stage = "scan");
+        let det = eng.detector.as_mut().unwrap();
+        let timeline = blur_job::analyze(&tools, det, &source, vinfo, &p.cancel, |x| report(w_music, w_scan, x))?;
+        with_job(app, id, |j| j.stage = "blur");
+        blur_job::render(&tools, &source, &final_path, vinfo, &timeline, &p.cancel, |x| report(w_music + w_scan, 1.0 - w_music - w_scan, x))?;
+        Ok(final_path.clone())
+    })();
+    if let Some(tmp) = intermediate {
+        let _ = std::fs::remove_file(tmp);
+    }
+    outcome
 }
 
 fn worker(app: AppHandle, rx: Receiver<u64>) {
-    let mut sep: Option<Separator> = None;
-    let mut tools: Option<Tools> = None;
+    let mut eng = Engines::default();
     while let Ok(id) = rx.recv() {
         // Pick up the job unless it was cancelled/removed while waiting.
         let picked = with_job(&app, id, |j| {
@@ -265,118 +480,48 @@ fn worker(app: AppHandle, rx: Receiver<u64>) {
                 return None;
             }
             j.status = Status::Running;
-            Some((j.input.clone(), j.out_dir.clone(), j.suffix.clone(), j.strength, j.cancel.clone()))
+            Some(Picked {
+                input: j.input.clone(),
+                out_dir: j.out_dir.clone(),
+                suffix: j.suffix.clone(),
+                strength: j.strength,
+                music: j.music,
+                blur: j.blur,
+                cancel: j.cancel.clone(),
+            })
         })
         .flatten();
-        let Some((input, out_dir, suffix, strength, cancel)) = picked else { continue };
+        let Some(picked) = picked else { continue };
 
         let fail = |code: &str, msg: String| {
             with_job(&app, id, |j| {
                 j.status = if code == "cancelled" { Status::Cancelled } else { Status::Error };
                 j.error = if code == "cancelled" { None } else { Some((code.to_string(), msg)) };
+                j.stage = "";
             });
         };
-
-        if tools.is_none() {
-            match Tools::locate() {
-                Ok(t) => tools = Some(t),
-                Err(e) => {
-                    fail(e.code(), e.to_string());
-                    continue;
-                }
-            }
-        }
-        let tools_ref = tools.as_ref().unwrap();
-
-        if sep.is_none() {
-            set_engine(&app, EngineView { state: "loading", backend: None, error_code: None, error_message: None, gpu_check_failed: false });
-            let mdx = Mdx::new(KIM_VOCAL_2);
-            let cache = app.path().app_cache_dir().ok().map(|d| d.join("coreml"));
-            match Model::load(&model_path(&app), mdx.tensor_shape(), None, cache.as_deref()) {
-                Ok(model) => {
-                    let mut s = Separator::new(mdx, model);
-                    // CoreML / DirectML can compute wrong numbers without an error: compare with the CPU once
-                    // (the verdict is kept for a month); on a mismatch the CPU is used
-                    let check = s.self_test(app.path().app_cache_dir().ok().map(|d| d.join("selftest")).as_deref());
-                    let failed = matches!(check, Ok(SelfTest::FellBack(_)));
-                    if let Ok(SelfTest::FellBack(why)) = &check {
-                        eprintln!("GPU self-test failed ({why}): using the CPU");
-                    }
-                    set_engine(&app, EngineView {
-                        state: "ready",
-                        backend: Some(s.model.backend.label().to_string()),
-                        error_code: None,
-                        error_message: None,
-                        gpu_check_failed: failed,
-                    });
-                    sep = Some(s);
-                }
-                Err(e) => {
-                    set_engine(&app, EngineView {
-                        state: "error",
-                        backend: None,
-                        error_code: Some(e.code().into()),
-                        error_message: Some(e.to_string()),
-                        gpu_check_failed: false,
-                    });
-                    fail(e.code(), e.to_string());
-                    continue;
-                }
-            }
-        }
-        let separator = sep.as_mut().unwrap();
-
-        let prepared = match job::prepare(tools_ref, &input, out_dir.as_deref(), &suffix) {
-            Ok(p) => p,
-            Err(e) => {
-                fail(e.code(), e.to_string());
-                continue;
-            }
-        };
-        with_job(&app, id, |j| {
-            j.output = Some(prepared.output.clone());
-            j.duration = Some(prepared.info.duration);
-            j.has_video = prepared.info.has_video;
-        });
-
-        let started = Instant::now();
-        let mut last_emit = Instant::now();
         // A panic must fail this job, not leave it (and the queue behind it) "running" forever.
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job::run_with(tools_ref, separator, &prepared, &job::Options { strength: strength as f32 / 100.0, keep_plain_speech: true }, &cancel, |p| {
-            if last_emit.elapsed().as_millis() < 150 && p < 1.0 {
-                return;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&app, id, &mut eng, &picked))) {
+            Ok(Ok(out)) => {
+                with_job(&app, id, |j| {
+                    j.status = Status::Done;
+                    j.progress = 1.0;
+                    j.eta = None;
+                    j.stage = "";
+                    j.output = Some(out);
+                });
             }
-            last_emit = Instant::now();
-            let elapsed = started.elapsed().as_secs_f64();
-            let eta = if p > 0.02 { Some(elapsed / p * (1.0 - p)) } else { None };
-            with_job(&app, id, |j| {
-                j.progress = p;
-                j.eta = eta;
-            });
-        })));
-        let res = match res {
-            Ok(r) => r,
+            Ok(Err(e)) => fail(e.code(), e.to_string()),
             Err(panic) => {
                 let msg = panic
                     .downcast_ref::<&str>()
                     .map(|s| s.to_string())
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "unexpected error".into());
-                sep = None; // its state may be inconsistent: reload the model for the next job
+                eng.sep = None; // their state may be inconsistent: reload for the next job
+                eng.detector = None;
                 fail("internal", msg);
-                continue;
             }
-        };
-        match res {
-            Ok(out) => {
-                with_job(&app, id, |j| {
-                    j.status = Status::Done;
-                    j.progress = 1.0;
-                    j.eta = None;
-                    j.output = Some(out);
-                });
-            }
-            Err(e) => fail(e.code(), e.to_string()),
         }
     }
 }
@@ -395,6 +540,10 @@ fn main() {
             pending: Mutex::new(Vec::new()),
         })
         .setup(move |app| {
+            // preview clips don't outlive a run
+            if let Ok(dir) = app.path().app_cache_dir() {
+                let _ = std::fs::remove_dir_all(dir.join("preview"));
+            }
             let handle = app.handle().clone();
             // Windows/Linux file associations pass files as arguments.
             let args: Vec<String> = std::env::args().skip(1).filter(|a| Path::new(a).exists()).collect();
@@ -413,6 +562,9 @@ fn main() {
             remove_job,
             clear_finished,
             take_pending_files,
+            prepare_preview,
+            preview_bytes,
+            clear_preview,
             live::live_devices,
             live::live_start,
             live::live_stop,

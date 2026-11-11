@@ -1,3 +1,4 @@
 target/
 app/gen/
 node_modules/
+vendor/
