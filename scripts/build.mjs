@@ -8,7 +8,9 @@ import { ASR_DEFAULT, ASR_MODELS } from './asr-models.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const test = process.argv.includes('--test');
-const dist = join(root, test ? 'dist-test' : 'dist');
+/** iPhone Safari prototype: content scripts + popup only, no models, no offscreen processor yet (see docs/safari.md). */
+const safari = process.argv.includes('--safari');
+const dist = join(root, safari ? 'dist-safari' : test ? 'dist-test' : 'dist');
 const watch = process.argv.includes('--watch');
 
 const MODELS = ['Kim_Vocal_2.onnx', 'nudenet-320n.onnx', 'mobileclip-s0-vision.onnx'];
@@ -22,7 +24,20 @@ const GENDER_SOURCE = process.env.GENDER_MODEL === 'fairface' ? 'gender-fairface
 const OPTIONAL_MODELS = ['Kim_Vocal_2.fp16.onnx'];
 const ORT_FILES = ['ort.webgpu.min.mjs', 'ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.asyncify.wasm'];
 
+function copyStaticSafari() {
+  mkdirSync(dist, { recursive: true });
+  cpSync(join(root, 'static/popup'), join(dist, 'popup'), { recursive: true });
+  const m = JSON.parse(readFileSync(join(root, 'static/manifest.json'), 'utf8'));
+  delete m.minimum_chrome_version;
+  delete m.commands; // no keyboard on a phone
+  m.permissions = m.permissions.filter((p) => p !== 'offscreen'); // Safari has no offscreen documents
+  m.background = { scripts: ['background.js'], persistent: false }; // Safari runs non-persistent background scripts
+  writeFileSync(join(dist, 'manifest.json'), JSON.stringify(m, null, 2));
+  makeIcons(join(dist, 'icons'));
+}
+
 function copyStatic() {
+  if (safari) return copyStaticSafari();
   cpSync(join(root, 'static'), dist, { recursive: true });
   mkdirSync(join(dist, 'ort'), { recursive: true });
   for (const f of ORT_FILES) copyFileSync(join(root, 'node_modules/onnxruntime-web/dist', f), join(dist, 'ort', f));
@@ -80,16 +95,20 @@ function copyStatic() {
 
 const common = {
   bundle: true,
-  target: 'chrome116',
+  target: safari ? 'safari17' : 'chrome116',
   sourcemap: 'linked',
   minify: !watch,
   logLevel: 'info',
   legalComments: 'none',
   // identifies this build: findings kept by the vision worker under another build are not trusted
-  define: { __BUILD_ID__: JSON.stringify(String(Date.now())) },
+  define: { __BUILD_ID__: JSON.stringify(String(Date.now())), __SAFARI_DEBUG__: String(safari) },
 };
 
-const builds = [
+const safariBuilds = [
+  { entryPoints: { 'content/main': 'src/content/main.ts', 'content/bridge': 'src/content/bridge.ts', background: 'src/background.ts', 'popup/popup': 'src/popup/popup.ts' }, format: 'iife' },
+];
+
+const builds = safari ? safariBuilds : [
   { entryPoints: { 'content/main': 'src/content/main.ts', 'content/bridge': 'src/content/bridge.ts' }, format: 'iife' },
   // transformers.js (speech recognition), loaded by the worker only when the profanity filter is on;
   // it reuses the ONNX Runtime the worker already loaded (see src/processor/ort-shim.ts)

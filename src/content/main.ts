@@ -22,6 +22,7 @@ import { timeStretch } from '../core/stretch';
 import type { FromVision } from '../shared/vision-messages';
 import { VisionController } from './blur';
 import { Captions } from './captions';
+import { mountHookBadge } from './hook-badge';
 import { ThumbHover } from './thumb-hover';
 import { ThumbCover } from './thumb-cover';
 import { PauseHold } from './hold';
@@ -30,8 +31,11 @@ import type { HoldPart } from '../core/hold';
 declare global {
   interface Window {
     __musicRemoverMain?: boolean;
+    /** iPhone Safari's MediaSource (MediaSource itself is not exposed there). */
+    ManagedMediaSource?: typeof MediaSource;
   }
 }
+declare const __SAFARI_DEBUG__: boolean;
 
 (() => {
   if (window.__musicRemoverMain) return;
@@ -85,23 +89,35 @@ declare global {
     return (v.buffer as ArrayBuffer).slice(v.byteOffset, v.byteOffset + v.byteLength);
   };
 
-  const MS = window.MediaSource;
+  // iPhone Safari has no `MediaSource` global, only `ManagedMediaSource` (a MediaSource subclass).
+  const MSClasses = [window.MediaSource, window.ManagedMediaSource].filter((c): c is typeof MediaSource => !!c);
+  const isMS = (o: unknown): o is MediaSource => MSClasses.some((c) => o instanceof c);
   const SB = window.SourceBuffer;
-  if (MS && SB) {
-    const origAdd = MS.prototype.addSourceBuffer;
-    MS.prototype.addSourceBuffer = function (this: MediaSource, mime: string): SourceBuffer {
-      const sb = origAdd.call(this, mime);
-      try {
-        const meta = { id: nextId++, session: msId(this), audio: /^audio\//i.test(mime), mime };
-        sbMeta.set(sb, meta);
-        hookLog.push(`addSourceBuffer(${mime}) ms=${meta.session}`);
-        if (meta.audio) send({ type: 'sb-init', session: meta.session, sb: meta.id, mime });
-        else if (/^video\//i.test(mime)) vision.onSourceBuffer(meta.id, meta.session, mime);
-      } catch {
-        /* never break the player */
-      }
-      return sb;
-    };
+  if (MSClasses.length && SB) {
+    // patch each prototype that owns addSourceBuffer once (the subclass normally inherits it)
+    const owners = new Set<object>();
+    for (const c of MSClasses) {
+      let p: object | null = c.prototype;
+      while (p && !Object.prototype.hasOwnProperty.call(p, 'addSourceBuffer')) p = Object.getPrototypeOf(p);
+      if (p) owners.add(p);
+    }
+    for (const owner of owners) {
+      const proto = owner as MediaSource;
+      const origAdd = proto.addSourceBuffer;
+      proto.addSourceBuffer = function (this: MediaSource, mime: string): SourceBuffer {
+        const sb = origAdd.call(this, mime);
+        try {
+          const meta = { id: nextId++, session: msId(this), audio: /^audio\//i.test(mime), mime };
+          sbMeta.set(sb, meta);
+          hookLog.push(`addSourceBuffer(${mime}) ms=${meta.session}`);
+          if (meta.audio) send({ type: 'sb-init', session: meta.session, sb: meta.id, mime });
+          else if (/^video\//i.test(mime)) vision.onSourceBuffer(meta.id, meta.session, mime);
+        } catch {
+          /* never break the player */
+        }
+        return sb;
+      };
+    }
 
     const origAppend = SB.prototype.appendBuffer;
     SB.prototype.appendBuffer = function (this: SourceBuffer, data: BufferSource): void {
@@ -153,7 +169,7 @@ declare global {
     URL.createObjectURL = function (obj: Blob | MediaSource): string {
       const url = origCreate.call(URL, obj);
       try {
-        if (obj instanceof MS) urlSession.set(url, msId(obj));
+        if (isMS(obj)) urlSession.set(url, msId(obj));
       } catch {
         /* ignore */
       }
@@ -161,9 +177,17 @@ declare global {
     };
   }
 
+  if (__SAFARI_DEBUG__) {
+    mountHookBadge(() => [
+      `MR hook: MediaSource=${typeof window.MediaSource} Managed=${typeof window.ManagedMediaSource} SB=${typeof SB}`,
+      `patched=${MSClasses.length ? 'yes' : 'no'} appends=${hookStats.appends} audio=${hookStats.audioAppends} (${hookStats.audioBytes} B)`,
+      ...hookLog.slice(-2),
+    ]);
+  }
+
   const sessionOf = (v: HTMLVideoElement): number => {
     const so = v.srcObject as unknown;
-    if (MS && so instanceof MS) return msId(so);
+    if (isMS(so)) return msId(so);
     return urlSession.get(v.currentSrc || v.src) ?? 0;
   };
 

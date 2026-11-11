@@ -579,6 +579,13 @@ fn main() {
                     mr_core::screen::show_regions(&[]);
                 });
             }
+            if std::env::var_os("MR_SCREEN_AUTOSTART").is_some() {
+                // checking aid: starts "hide on screen" without a click
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    screen::screen_start(h.clone(), h.state::<screen::ScreenSlot>());
+                });
+            }
             let args: Vec<String> = args.into_iter().filter(|a| Path::new(a).exists()).collect();
             push_pending(&handle, args);
             let handle = app.handle().clone();
