@@ -183,7 +183,7 @@ declare const __SAFARI_DEBUG__: boolean;
     mountHookBadge(() => [
       `MR hook: MS=${typeof window.MediaSource} MMS=${typeof window.ManagedMediaSource} SB=${typeof window.SourceBuffer} MSB=${typeof window.ManagedSourceBuffer}`,
       `patched=${MSClasses.length && SB ? 'yes' : 'no'} appends=${hookStats.appends} audio=${hookStats.audioAppends} (${hookStats.audioBytes} B) unknown=${hookStats.unknownSb}`,
-      `proc: link=${link.up} ready=${procReady} model=${workerStatus?.model}/${workerStatus?.backend} tiles=${dbg.tilesReceived} state=${player.state}`,
+      `proc: link=${link.up} ready=${procReady} model=${workerStatus?.model}/${workerStatus?.backend} tiles=${dbg.tilesReceived} state=${player.state} ctx=${player.ctx?.state} sched=${player.scheduled.size} t=${player.video?.currentTime.toFixed(1)} muted=${player.video?.muted} drift=${dbg.lastDrift}`,
       ...(workerStatus?.error ? [`err: ${String(workerStatus.error).slice(0, 160)}`] : []),
     ]);
   }

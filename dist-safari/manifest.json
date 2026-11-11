@@ -31,7 +31,9 @@
     {
       "matches": [
         "*://*.youtube.com/*",
-        "*://*.youtube-nocookie.com/*"
+        "*://*.youtube-nocookie.com/*",
+        "http://localhost/*",
+        "http://localhost:*/*"
       ],
       "js": [
         "content/main.js"
@@ -43,7 +45,9 @@
     {
       "matches": [
         "*://*.youtube.com/*",
-        "*://*.youtube-nocookie.com/*"
+        "*://*.youtube-nocookie.com/*",
+        "http://localhost/*",
+        "http://localhost:*/*"
       ],
       "js": [
         "content/bridge.js"
@@ -62,7 +66,9 @@
       ],
       "matches": [
         "*://*.youtube.com/*",
-        "*://*.youtube-nocookie.com/*"
+        "*://*.youtube-nocookie.com/*",
+        "http://localhost/*",
+        "http://localhost:*/*"
       ]
     }
   ]

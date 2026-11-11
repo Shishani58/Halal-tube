@@ -172,6 +172,9 @@ static CVPixelBufferPoolRef makePool(size_t w, size_t h) {
     self.replica.backgroundColor = NSColor.clearColor;
     self.replica.hasShadow = NO;
     self.replica.ignoresMouseEvents = YES;
+    // a window that is not fully opaque does not count as covering the real one: Chrome pauses its video in a
+    // window it thinks is hidden, and AppKit calls a window hidden when other windows cover it completely
+    self.replica.alphaValue = 0.99;
     self.replica.sharingType = getenv("MR_OVERLAY_VISIBLE") ? NSWindowSharingReadOnly : NSWindowSharingNone;
     self.replica.releasedWhenClosed = NO;
     self.replica.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorStationary | NSWindowCollectionBehaviorIgnoresCycle;

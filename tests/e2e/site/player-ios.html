@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MSE test player (iPhone Safari)</title>
+<style>body{margin:0;background:#0f0f0f;color:#eee;font:14px system-ui}.html5-video-player{position:relative;width:100%}video{width:100%;max-width:640px;background:#000}</style></head>
+<body>
+<!-- Same idea as player.html, but for iPhone Safari: no MediaSource there, only ManagedMediaSource (assigned through srcObject).
+     Audio only (synthetic speech + music, audio.webm), appended whole: it is small enough for the managed buffer limit. -->
+<div class="html5-video-player"><video id="v" controls playsinline></video></div>
+<p id="log"></p>
+<script>
+const v = document.getElementById('v');
+const log = (s) => (document.getElementById('log').textContent += s + '\n');
+const MS = window.ManagedMediaSource || window.MediaSource;
+const ms = new MS();
+v.disableRemotePlayback = true;
+if (window.ManagedMediaSource) v.srcObject = ms;
+else v.src = URL.createObjectURL(ms);
+ms.addEventListener('sourceopen', async () => {
+  try {
+    const sb = ms.addSourceBuffer('audio/webm; codecs="opus"');
+    const buf = new Uint8Array(await (await fetch('audio.webm')).arrayBuffer());
+    for (let i = 0; i < buf.length; i += 100000) {
+      sb.appendBuffer(buf.subarray(i, i + 100000));
+      await new Promise((r) => sb.addEventListener('updateend', r, { once: true }));
+    }
+    log('appended ' + buf.length + ' bytes');
+  } catch (e) {
+    log('error ' + e);
+  }
+}, { once: true });
+</script></body></html>

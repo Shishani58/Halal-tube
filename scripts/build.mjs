@@ -88,7 +88,7 @@ function copyStatic() {
     // test build: also run on the local MSE test page
     const mf = join(dist, 'manifest.json');
     const m = JSON.parse(readFileSync(mf, 'utf8'));
-    for (const cs of m.content_scripts) cs.matches.push('http://localhost/*');
+    for (const cs of m.content_scripts) cs.matches.push('http://localhost/*', ...(safari ? ['http://localhost:*/*'] : [])); // Safari takes the port into account
     writeFileSync(mf, JSON.stringify(m, null, 2));
   }
   if (safari) adaptManifestForSafari();
