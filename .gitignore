@@ -4,5 +4,6 @@ models/*.onnx
 models/whisper-*/
 *.zip
 dist-test/
+dist-safari/
 .DS_Store
 .claude/

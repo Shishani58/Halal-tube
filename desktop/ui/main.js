@@ -408,6 +408,28 @@
   // ---------- hide on screen (macOS) ----------
   let screenView = { supported: false, state: 'off' };
   let screenTimer = 0;
+  let screenSync = Number(store.get('screenSync', 0)) || 0;
+  let screenSentDelay = -1;
+  // how far the picture is held back in window mode: the live audio's latency (or a default) plus the user's correction
+  const screenDelayMs = () => Math.max(0, Math.round(((liveView.state === 'running' && liveView.latency) || 0.4) * 1000 + screenSync));
+  async function fillWindows(keep) {
+    const sel = $('#screen-window');
+    const list = (await api.invoke('screen_windows')) || [];
+    const want = keep === undefined ? sel.value : keep;
+    sel.innerHTML = '';
+    const whole = document.createElement('option');
+    whole.value = '';
+    whole.textContent = t('screenWhole');
+    sel.appendChild(whole);
+    for (const w of list) {
+      const o = document.createElement('option');
+      o.value = String(w.id);
+      o.textContent = `${w.app}${w.title ? ' — ' + w.title : ''}`.slice(0, 80);
+      sel.appendChild(o);
+    }
+    sel.value = list.some((w) => String(w.id) === want) ? want : '';
+    $('#screen-sync-row').hidden = !sel.value;
+  }
   function renderScreen() {
     const v = screenView;
     $('#screen').hidden = !v.supported;
@@ -421,11 +443,18 @@
     if (v.state === 'starting') text = t('screenStarting');
     else if (v.state === 'loading') text = t('screenLoading');
     else if (v.state === 'running') text = t('screenRunning')(v.regions, v.lastMs);
-    else if (v.state === 'error') text = v.errorCode === 'screen_permission' ? t('screenDenied') : t('screenError')(v.errorMessage || v.errorCode || '');
+    else if (v.state === 'error') text = v.errorCode === 'screen_permission' ? t('screenDenied') : v.errorCode === 'window_gone' ? t('screenGone') : t('screenError')(v.errorMessage || v.errorCode || '');
+    if (v.state === 'running' && v.window) text = t('screenRunningWin')((screenDelayMs() / 1000).toFixed(2).replace('.', lang === 'ru' ? ',' : '.'), v.regions);
     $('#screen-status').textContent = text;
+    $('#screen-window').disabled = on;
+    $('#screen-refresh').disabled = on;
+    $('#screen-sync-row').hidden = on ? !v.window : !$('#screen-window').value;
+    $('#screen-sync-val').textContent = `${screenSync > 0 ? '+' : ''}${screenSync} ${lang === 'ru' ? 'мс' : 'ms'}`;
+    $('#screen-sync').value = String(screenSync);
+    if (on && v.window && screenSentDelay !== screenDelayMs()) { screenSentDelay = screenDelayMs(); api.invoke('screen_set_delay', { delayMs: screenSentDelay }); }
     const help = $('#screen-help');
     const denied = v.state === 'error' && v.errorCode === 'screen_permission';
-    help.textContent = denied ? t('screenHelpPermission') : t('screenHelpRun');
+    help.textContent = denied ? t('screenHelpPermission') : (v.window ? t('screenHelpWin') : t('screenHelpRun'));
     help.hidden = !(v.state === 'running' || denied);
     if (on || v.state === 'error') { if (!screenTimer) screenTimer = setInterval(screenRefresh, 1000); }
     else if (screenTimer) { clearInterval(screenTimer); screenTimer = 0; }
@@ -433,9 +462,14 @@
   async function screenRefresh() { screenView = (await api.invoke('screen_status')) || screenView; renderScreen(); }
   $('#screen-toggle').addEventListener('click', async () => {
     const on = screenView.state !== 'off' && screenView.state !== 'error';
-    screenView = (await api.invoke(on ? 'screen_stop' : 'screen_start')) || screenView;
+    const win = $('#screen-window').value;
+    screenSentDelay = screenDelayMs();
+    screenView = (await api.invoke(on ? 'screen_stop' : 'screen_start', { window: win ? Number(win) : null, delayMs: screenSentDelay })) || screenView;
     renderScreen();
   });
+  $('#screen-refresh').addEventListener('click', () => fillWindows());
+  $('#screen-window').addEventListener('change', () => { $('#screen-sync-row').hidden = !$('#screen-window').value; });
+  $('#screen-sync').addEventListener('input', (e) => { screenSync = Number(e.target.value); store.set('screenSync', screenSync); renderScreen(); });
 
   async function liveRefresh() { liveView = (await api.invoke('live_status')) || liveView; renderLive(); }
   $('#live-toggle').addEventListener('click', async () => {
@@ -519,6 +553,7 @@
     renderEngine();
     await liveRefresh();
     await screenRefresh();
+    await fillWindows('');
     await fillDevices();
     (await api.invoke('list_jobs')).forEach(upsert);
     syncLayout();
@@ -557,6 +592,7 @@
         if (cmd === 'take_pending_files') return [];
         if (cmd === 'take_pending_play') return null;
         if (cmd === 'live_devices') return [{ name: 'MacBook Pro Speakers', isDefault: true }, { name: 'AirPods', isDefault: false }];
+        if (cmd === 'screen_windows') return [{ id: 11, app: 'Google Chrome', title: 'Video — YouTube', width: 1280, height: 800 }, { id: 12, app: 'QuickTime Player', title: 'clip.mp4', width: 640, height: 360 }];
         if (cmd === 'screen_status') return { supported: true, state: 'off' };
         if (cmd === 'live_status') return liveDemo;
         if (cmd === 'live_start') return (liveDemo = { supported: true, state: 'running', backend: 'CoreML', latency: 1.8, load: 0.27, activity: true, strength: args.strength });

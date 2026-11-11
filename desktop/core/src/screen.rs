@@ -21,7 +21,24 @@ use std::time::{Duration, Instant};
 
 type FrameCb = extern "C" fn(*const u8, u32, u32, u32, *mut c_void);
 
+#[repr(C)]
+struct RawWindowInfo {
+    id: u32,
+    width: u32,
+    height: u32,
+    app: [c_char; 64],
+    title: [c_char; 96],
+}
+type WindowCb = extern "C" fn(*const u8, u32, u32, u32, f64, *mut c_void);
+
 extern "C" {
+    fn mr_windows(out: *mut RawWindowInfo, max: i32) -> i32;
+    fn mr_window_start(window_id: u32, cb: WindowCb, ctx: *mut c_void, delay_s: f64, err: *mut c_char, err_len: usize) -> *mut c_void;
+    fn mr_window_set_delay(w: *mut c_void, delay_s: f64);
+    fn mr_window_add_span(w: *mut c_void, rects: *const f32, n: i32, from: f64, to: f64);
+    fn mr_window_ok(w: *mut c_void) -> i32;
+    fn mr_window_stop(w: *mut c_void);
+    fn mr_host_now() -> f64;
     fn mr_screen_access() -> i32;
     fn mr_screen_request() -> i32;
     fn mr_screen_start(cb: FrameCb, ctx: *mut c_void, max_width: u32, interval_s: f64, err: *mut c_char, err_len: usize) -> *mut c_void;
@@ -55,6 +72,29 @@ pub struct ScreenConfig {
     pub nudenet: PathBuf,
     pub gender: PathBuf,
     pub cache_dir: Option<PathBuf>,
+    /// None: the whole main display (patches over it, no delay). Some(id): that window, shown as a copy held back by
+    /// `delay_s` with the blur on the frames themselves (see mac/window.h).
+    pub window: Option<u32>,
+    /// How far the picture is held back in window mode, seconds (the live audio's latency, plus a correction).
+    pub delay_s: f64,
+}
+
+/// A window that can be chosen for the window mode.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WindowInfo {
+    pub id: u32,
+    pub app: String,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The windows on screen to choose from.
+pub fn list_windows() -> Vec<WindowInfo> {
+    let mut raw: Vec<RawWindowInfo> = (0..64).map(|_| RawWindowInfo { id: 0, width: 0, height: 0, app: [0; 64], title: [0; 96] }).collect();
+    let n = unsafe { mr_windows(raw.as_mut_ptr(), raw.len() as i32) };
+    let text = |a: &[c_char]| unsafe { std::ffi::CStr::from_ptr(a.as_ptr()) }.to_string_lossy().to_string();
+    raw.iter().take(n.max(0) as usize).map(|r| WindowInfo { id: r.id, app: text(&r.app), title: text(&r.title), width: r.width, height: r.height }).collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +140,10 @@ impl ScreenStats {
 
 pub struct ScreenHandle {
     pub stats: Arc<ScreenStats>,
+    /// The window being watched (None: the whole display).
+    pub window: Option<u32>,
+    /// Window mode: the delay of the picture, milliseconds (can be changed while running).
+    delay_ms: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -107,6 +151,9 @@ pub struct ScreenHandle {
 impl ScreenHandle {
     pub fn is_finished(&self) -> bool {
         self.join.as_ref().map(|j| j.is_finished()).unwrap_or(true)
+    }
+    pub fn set_delay(&self, seconds: f64) {
+        self.delay_ms.store((seconds.clamp(0.0, 3.0) * 1000.0) as u32, Ordering::Relaxed);
     }
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -125,13 +172,16 @@ impl Drop for ScreenHandle {
 pub fn start(cfg: ScreenConfig) -> ScreenHandle {
     let stats = Arc::new(ScreenStats::default());
     let stop = Arc::new(AtomicBool::new(false));
-    let (s, st) = (stats.clone(), stop.clone());
+    let window = cfg.window;
+    let delay_ms = Arc::new(AtomicU32::new((cfg.delay_s.clamp(0.0, 3.0) * 1000.0) as u32));
+    let (s, st, dm) = (stats.clone(), stop.clone(), delay_ms.clone());
     let join = std::thread::Builder::new()
         .name("mr-screen".into())
         .spawn(move || {
-            if let Err(e) = run(&cfg, &s, &st) {
+            if let Err(e) = run(&cfg, &s, &st, &dm) {
                 match &e {
                     Error::Capture(m) if m == "screen_permission" => s.fail("screen_permission", "no access to the screen".into()),
+                    Error::Capture(m) if m == "window_gone" => s.fail("window_gone", "the window was closed".into()),
                     Error::Capture(m) => s.fail("capture", m.clone()),
                     other => s.fail(other.code(), other.to_string()),
                 }
@@ -139,7 +189,7 @@ pub fn start(cfg: ScreenConfig) -> ScreenHandle {
             unsafe { mr_overlay_set(std::ptr::null(), 0) };
         })
         .expect("thread");
-    ScreenHandle { stats, stop, join: Some(join) }
+    ScreenHandle { stats, window, delay_ms, stop, join: Some(join) }
 }
 
 /// The newest captured frame, as packed RGB.
@@ -148,6 +198,8 @@ struct Frame {
     w: usize,
     h: usize,
     seq: u64,
+    /// Host-clock time of the capture (window mode; 0 on the whole screen).
+    pts: f64,
 }
 
 struct Shared {
@@ -156,6 +208,14 @@ struct Shared {
 }
 
 extern "C" fn on_frame(bgra: *const u8, w: u32, h: u32, stride: u32, ctx: *mut c_void) {
+    store_frame(bgra, w, h, stride, 0.0, ctx);
+}
+
+extern "C" fn on_window_frame(bgra: *const u8, w: u32, h: u32, stride: u32, pts: f64, ctx: *mut c_void) {
+    store_frame(bgra, w, h, stride, pts, ctx);
+}
+
+fn store_frame(bgra: *const u8, w: u32, h: u32, stride: u32, pts: f64, ctx: *mut c_void) {
     // SAFETY: ctx is the Shared leaked by `run`, alive until the capture is stopped
     let shared = unsafe { &*(ctx as *const Shared) };
     let (w, h, stride) = (w as usize, h as usize, stride as usize);
@@ -168,10 +228,16 @@ extern "C" fn on_frame(bgra: *const u8, w: u32, h: u32, stride: u32, ctx: *mut c
     }
     let mut seq = shared.seq.lock().unwrap();
     *seq += 1;
-    *shared.latest.lock().unwrap() = Some(Frame { rgb, w, h, seq: *seq });
+    *shared.latest.lock().unwrap() = Some(Frame { rgb, w, h, seq: *seq, pts });
 }
 
-fn run(cfg: &ScreenConfig, stats: &Arc<ScreenStats>, stop: &AtomicBool) -> Result<(), Error> {
+/// What the capture is pointed at: the whole display (patches over it) or one window (a delayed, blurred copy of it).
+enum Target {
+    Screen(*mut c_void),
+    Window(*mut c_void),
+}
+
+fn run(cfg: &ScreenConfig, stats: &Arc<ScreenStats>, stop: &AtomicBool, delay_ms: &AtomicU32) -> Result<(), Error> {
     stats.set(ScreenState::Starting);
     if !has_access() {
         request_access();
@@ -186,7 +252,15 @@ fn run(cfg: &ScreenConfig, stats: &Arc<ScreenStats>, stop: &AtomicBool) -> Resul
     let shared = Arc::new(Shared { latest: Mutex::new(None), seq: Mutex::new(0) });
     let ctx = Arc::into_raw(shared.clone()) as *mut c_void;
     let mut err = [0 as c_char; 512];
-    let cap = unsafe { mr_screen_start(on_frame, ctx, FRAME_WIDTH, STEP_S as f64, err.as_mut_ptr(), err.len()) };
+    let target = unsafe {
+        match cfg.window {
+            None => Target::Screen(mr_screen_start(on_frame, ctx, FRAME_WIDTH, STEP_S as f64, err.as_mut_ptr(), err.len())),
+            Some(id) => Target::Window(mr_window_start(id, on_window_frame, ctx, delay_ms.load(Ordering::Relaxed) as f64 / 1000.0, err.as_mut_ptr(), err.len())),
+        }
+    };
+    let cap = match target {
+        Target::Screen(p) | Target::Window(p) => p,
+    };
     if cap.is_null() {
         // SAFETY: balances into_raw above
         unsafe { drop(Arc::from_raw(ctx as *const Shared)) };
@@ -203,11 +277,17 @@ fn run(cfg: &ScreenConfig, stats: &Arc<ScreenStats>, stop: &AtomicBool) -> Resul
     let mut since_analysis = 0u32;
     let mut shown: Vec<Rect> = Vec::new();
     let mut next = Instant::now();
+    let mut gone = false;
     while !stop.load(Ordering::Relaxed) {
         next += Duration::from_millis((STEP_S * 1000.0) as u64);
         let frame = shared.latest.lock().unwrap().take();
+        // the time the decision is about: the frame's own (window mode), else now
+        let mut label = if let Target::Window(_) = target { unsafe { mr_host_now() } } else { 0.0 };
         if let Some(f) = frame.filter(|f| f.seq != last_seq) {
             last_seq = f.seq;
+            if f.pts > 0.0 {
+                label = f.pts;
+            }
             let thumb = thumbnail(&f.rgb, f.w, f.h);
             // a still screen is not looked at again, except now and then (a face may have been missed)
             let changed = last_thumb.is_empty() || mean_diff(&thumb, &last_thumb) > 0.6;
@@ -234,11 +314,32 @@ fn run(cfg: &ScreenConfig, stats: &Arc<ScreenStats>, stop: &AtomicBool) -> Resul
             last_thumb = thumb;
         }
         let rects = rules.push(last_det.clone());
+        match target {
+            Target::Screen(_) => {
+                if rects != shown {
+                    let flat: Vec<f32> = rects.iter().flat_map(|r| [r.x, r.y, r.w, r.h]).collect();
+                    unsafe { mr_overlay_set(flat.as_ptr(), rects.len() as i32) };
+                }
+            }
+            Target::Window(w) => unsafe {
+                // the decision holds for the frames around the moment it was made; the copy of the window is shown
+                // a few hundred ms later, so by then it is known for every frame it is put on
+                mr_window_set_delay(w, delay_ms.load(Ordering::Relaxed) as f64 / 1000.0);
+                if !rects.is_empty() {
+                    let flat: Vec<f32> = rects.iter().flat_map(|r| [r.x, r.y, r.w, r.h]).collect();
+                    mr_window_add_span(w, flat.as_ptr(), rects.len() as i32, label - STEP_S as f64 - 0.06, label + STEP_S as f64 * 0.5);
+                }
+                if mr_window_ok(w) == 0 {
+                    gone = true;
+                }
+            },
+        }
         if rects != shown {
-            let flat: Vec<f32> = rects.iter().flat_map(|r| [r.x, r.y, r.w, r.h]).collect();
-            unsafe { mr_overlay_set(flat.as_ptr(), rects.len() as i32) };
             stats.regions.store(rects.len() as u32, Ordering::Relaxed);
             shown = rects;
+        }
+        if gone {
+            break;
         }
         let now = Instant::now();
         if next > now {
@@ -248,10 +349,18 @@ fn run(cfg: &ScreenConfig, stats: &Arc<ScreenStats>, stop: &AtomicBool) -> Resul
         }
     }
     unsafe {
-        mr_overlay_set(std::ptr::null(), 0);
-        mr_screen_stop(cap);
+        match target {
+            Target::Screen(c) => {
+                mr_overlay_set(std::ptr::null(), 0);
+                mr_screen_stop(c);
+            }
+            Target::Window(w) => mr_window_stop(w),
+        }
         // SAFETY: the capture is stopped, no callback is running any more
         drop(Arc::from_raw(ctx as *const Shared));
+    }
+    if gone {
+        return Err(Error::Capture("window_gone".into()));
     }
     stats.set(ScreenState::Stopped);
     Ok(())

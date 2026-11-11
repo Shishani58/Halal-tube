@@ -583,7 +583,22 @@ fn main() {
                 // checking aid: starts "hide on screen" without a click
                 let h = handle.clone();
                 std::thread::spawn(move || {
-                    screen::screen_start(h.clone(), h.state::<screen::ScreenSlot>());
+                    // MR_SCREEN_AUTOSTART=1: the whole display; =app:QuickTime: the first window of an app whose name contains that
+                    let value = std::env::var("MR_SCREEN_AUTOSTART").unwrap_or_default();
+                    let window = value.strip_prefix("app:").or_else(|| value.strip_prefix("title:")).and_then(|name| {
+                        #[cfg(target_os = "macos")]
+                        {
+                            let by_title = value.starts_with("title:");
+                            mr_core::screen::list_windows().into_iter().find(|w| if by_title { w.title.contains(name) } else { w.app.contains(name) }).map(|w| w.id)
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let _ = name;
+                            None
+                        }
+                    });
+                    let delay = std::env::var("MR_SCREEN_DELAY_MS").ok().and_then(|v| v.parse().ok());
+                    screen::screen_start(h.clone(), h.state::<screen::ScreenSlot>(), window, delay);
                 });
             }
             let args: Vec<String> = args.into_iter().filter(|a| Path::new(a).exists()).collect();
@@ -620,7 +635,9 @@ fn main() {
             player::player_close,
 screen::screen_start,
 screen::screen_stop,
-screen::screen_status
+screen::screen_status,
+screen::screen_windows,
+screen::screen_set_delay
         ])
         .build(tauri::generate_context!())
         .expect("error while building Music Remover")

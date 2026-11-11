@@ -33,6 +33,8 @@ declare global {
     __musicRemoverMain?: boolean;
     /** iPhone Safari's MediaSource (MediaSource itself is not exposed there). */
     ManagedMediaSource?: typeof MediaSource;
+    /** iPhone Safari's SourceBuffer (SourceBuffer itself is not exposed there either). */
+    ManagedSourceBuffer?: typeof SourceBuffer;
   }
 }
 declare const __SAFARI_DEBUG__: boolean;
@@ -92,7 +94,7 @@ declare const __SAFARI_DEBUG__: boolean;
   // iPhone Safari has no `MediaSource` global, only `ManagedMediaSource` (a MediaSource subclass).
   const MSClasses = [window.MediaSource, window.ManagedMediaSource].filter((c): c is typeof MediaSource => !!c);
   const isMS = (o: unknown): o is MediaSource => MSClasses.some((c) => o instanceof c);
-  const SB = window.SourceBuffer;
+  const SB = window.SourceBuffer ?? window.ManagedSourceBuffer;
   if (MSClasses.length && SB) {
     // patch each prototype that owns addSourceBuffer once (the subclass normally inherits it)
     const owners = new Set<object>();
@@ -179,9 +181,10 @@ declare const __SAFARI_DEBUG__: boolean;
 
   if (__SAFARI_DEBUG__) {
     mountHookBadge(() => [
-      `MR hook: MediaSource=${typeof window.MediaSource} Managed=${typeof window.ManagedMediaSource} SB=${typeof SB}`,
-      `patched=${MSClasses.length ? 'yes' : 'no'} appends=${hookStats.appends} audio=${hookStats.audioAppends} (${hookStats.audioBytes} B)`,
-      ...hookLog.slice(-2),
+      `MR hook: MS=${typeof window.MediaSource} MMS=${typeof window.ManagedMediaSource} SB=${typeof window.SourceBuffer} MSB=${typeof window.ManagedSourceBuffer}`,
+      `patched=${MSClasses.length && SB ? 'yes' : 'no'} appends=${hookStats.appends} audio=${hookStats.audioAppends} (${hookStats.audioBytes} B) unknown=${hookStats.unknownSb}`,
+      `proc: link=${link.up} ready=${procReady} model=${workerStatus?.model}/${workerStatus?.backend} tiles=${dbg.tilesReceived} state=${player.state}`,
+      ...(workerStatus?.error ? [`err: ${String(workerStatus.error).slice(0, 160)}`] : []),
     ]);
   }
 

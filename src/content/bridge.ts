@@ -9,6 +9,7 @@
 import { DEFAULT_SETTINGS, MSG_NS, needsProcessor, type PageStatus, type Settings, type ToWorker } from '../shared/messages';
 import { isInitSegment } from '../shared/vision-messages';
 import { decodeFromWorker, encodeToWorker, type FromWorkerWire, type ToWorkerWire } from '../shared/wire';
+import { connectProcessor, type PortLike } from '../shared/port';
 import { ReplayLog } from './replay-log';
 import './bridge-vision';
 
@@ -53,7 +54,7 @@ function remember(msg: ToWorker, wire: ToWorkerWire): void {
 }
 
 // ───────────── connection to the offscreen processor ─────────────
-let port: chrome.runtime.Port | null = null;
+let port: PortLike | null = null;
 let connecting = false;
 let wanted = false;
 
@@ -79,10 +80,9 @@ async function connect(): Promise<void> {
   if (port || connecting || !contextAlive()) return;
   connecting = true;
   try {
-    await chrome.runtime.sendMessage({ type: 'ensure-offscreen' });
-    const p = chrome.runtime.connect({ name: 'mr-proc' });
-    p.onMessage.addListener((m: FromWorkerWire) => {
-      const msg = decodeFromWorker(m);
+    const p = await connectProcessor('mr-proc');
+    p.onMessage.addListener((m) => {
+      const msg = decodeFromWorker(m as FromWorkerWire);
       const transfer: Transferable[] = [];
       if (msg.type === 'tile') {
         transfer.push(msg.left.buffer, msg.right.buffer);

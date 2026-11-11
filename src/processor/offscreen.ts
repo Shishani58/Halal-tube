@@ -6,13 +6,14 @@
  */
 import type { FromWorker, ToWorker, WorkerStatus } from '../shared/messages';
 import { decodeToWorker, encodeFromWorker, type FromWorkerWire, type ToWorkerWire } from '../shared/wire';
+import { fromMessagePort, type PortLike } from '../shared/port';
 import { decodeToVision, type FromVision, type ToVisionWire } from '../shared/vision-messages';
 
 const SPAN = 1_000_000; // local session ids of one page stay far below this
 
 interface Link {
   id: number;
-  port: chrome.runtime.Port;
+  port: PortLike;
   sessions: Set<number>;
 }
 
@@ -83,16 +84,34 @@ function drop(link: Link): void {
   for (const s of link.sessions) worker?.postMessage({ type: 'drop-session', session: s } satisfies ToWorker);
 }
 
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'mr-proc') return;
+/**
+ * Chrome: pages reach this offscreen document over runtime Ports. Safari has no offscreen
+ * documents, so this page is a hidden iframe in the video page and connects over MessageChannels
+ * (see src/shared/port.ts). Either way the handler gets one Port-like object per connection.
+ */
+const inFrame = window.parent !== window;
+function listen(name: 'mr-proc' | 'mr-vis', handler: (port: PortLike) => void): void {
+  if (inFrame) {
+    window.addEventListener('message', (e: MessageEvent) => {
+      const d = e.data as { mr?: string; name?: string } | null;
+      if (d?.mr === 'connect' && d.name === name && e.ports[0]) handler(fromMessagePort(e.ports[0]));
+    });
+  } else {
+    chrome.runtime.onConnect.addListener((port) => {
+      if (port.name === name) handler(port as unknown as PortLike);
+    });
+  }
+}
+
+listen('mr-proc', (port) => {
   const link: Link = { id: nextLinkId++, port, sessions: new Set() };
   links.set(link.id, link);
   ensureWorker();
   for (const g of greeting) send(link, g);
   if (lastModelStatus) send(link, { type: 'status', status: { ...lastModelStatus, ahead: 0, inputAhead: 0, waitFor: undefined } });
 
-  port.onMessage.addListener((m: ToWorkerWire) => {
-    const msg = decodeToWorker(m);
+  port.onMessage.addListener((m) => {
+    const msg = decodeToWorker(m as ToWorkerWire);
     const global = link.id * SPAN + msg.session;
     link.sessions.add(global);
     const out = { ...msg, session: global } as ToWorker;
@@ -102,8 +121,7 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 // ───────────── frame classifier (blurring), one Worker per connected tab/frame ─────────────
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'mr-vis') return;
+listen('mr-vis', (port) => {
   const worker = new Worker(new URL('./vision-worker.js', location.href), { type: 'module' });
   let alive = true;
   worker.onmessage = (e: MessageEvent<FromVision>) => {
@@ -119,8 +137,8 @@ chrome.runtime.onConnect.addListener((port) => {
     console.error('[music-remover] vision worker error', e.message);
     if (alive) port.postMessage({ type: 'status', status: { model: 'error', backend: '-', error: e.message, frames: 0, speed: 0, ahead: 0 } } satisfies FromVision);
   };
-  port.onMessage.addListener((m: ToVisionWire) => {
-    const msg = decodeToVision(m);
+  port.onMessage.addListener((m) => {
+    const msg = decodeToVision(m as ToVisionWire);
     worker.postMessage(msg, msg.type === 'append' ? [msg.data] : []);
   });
   port.onDisconnect.addListener(() => {

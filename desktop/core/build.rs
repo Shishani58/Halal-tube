@@ -10,7 +10,10 @@ fn main() {
         println!("cargo:rerun-if-changed=src/mac/screen.m");
         println!("cargo:rerun-if-changed=src/mac/screen.h");
         cc::Build::new().file("src/mac/screen.m").flag("-fobjc-arc").flag("-Wno-unguarded-availability-new").flag("-Wno-unused-parameter").compile("mr_screen");
-        for f in ["ScreenCaptureKit", "AppKit", "CoreMedia", "CoreVideo", "CoreGraphics", "QuartzCore"] {
+        println!("cargo:rerun-if-changed=src/mac/window.m");
+        println!("cargo:rerun-if-changed=src/mac/window.h");
+        cc::Build::new().file("src/mac/window.m").flag("-fobjc-arc").flag("-Wno-unguarded-availability-new").flag("-Wno-unused-parameter").compile("mr_window");
+        for f in ["Accelerate", "CoreImage", "ScreenCaptureKit", "AppKit", "CoreMedia", "CoreVideo", "CoreGraphics", "QuartzCore"] {
             println!("cargo:rustc-link-lib=framework={f}");
         }
         println!("cargo:rustc-link-lib=framework=CoreAudio");

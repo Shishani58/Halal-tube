@@ -5,6 +5,7 @@
  */
 import { MSG_NS } from '../shared/messages';
 import { encodeToVision, isInitSegment, type FromVision, type ToVision, type ToVisionWire } from '../shared/vision-messages';
+import { connectProcessor, type PortLike } from '../shared/port';
 import { ReplayLog } from './replay-log';
 
 const log = new ReplayLog<ToVisionWire>(32 * 1024 * 1024);
@@ -20,7 +21,7 @@ function remember(msg: ToVision, wire: ToVisionWire): void {
   }
 }
 
-let port: chrome.runtime.Port | null = null;
+let port: PortLike | null = null;
 let connecting = false;
 
 function contextAlive(): boolean {
@@ -35,10 +36,9 @@ async function connect(): Promise<void> {
   if (port || connecting || !contextAlive()) return;
   connecting = true;
   try {
-    await chrome.runtime.sendMessage({ type: 'ensure-offscreen' });
-    const p = chrome.runtime.connect({ name: 'mr-vis' });
-    p.onMessage.addListener((msg: FromVision) => {
-      window.postMessage({ ns: MSG_NS, from: 'vision', msg }, '*');
+    const p = await connectProcessor('mr-vis');
+    p.onMessage.addListener((msg) => {
+      window.postMessage({ ns: MSG_NS, from: 'vision', msg: msg as FromVision }, '*');
     });
     p.onDisconnect.addListener(() => {
       port = null;

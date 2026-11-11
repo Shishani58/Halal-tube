@@ -31,6 +31,8 @@ pub struct ScreenView {
     backend: Option<String>,
     /// Patches on the screen right now.
     regions: u32,
+    /// The window being watched; None: the whole display.
+    window: Option<u32>,
     /// Milliseconds the last look at the screen took.
     last_ms: u32,
     error_code: Option<String>,
@@ -57,6 +59,7 @@ fn view_of(slot: &ScreenSlot) -> ScreenView {
         state,
         backend: Some(s.backend.lock().unwrap().clone()).filter(|b| !b.is_empty()),
         regions: s.regions.load(Ordering::Relaxed),
+        window: h.window,
         last_ms: s.last_ms.load(Ordering::Relaxed),
         error_code: code,
         error_message: msg,
@@ -65,7 +68,7 @@ fn view_of(slot: &ScreenSlot) -> ScreenView {
 }
 
 #[tauri::command(async)]
-pub fn screen_start(app: AppHandle, slot: State<ScreenSlot>) -> ScreenView {
+pub fn screen_start(app: AppHandle, slot: State<ScreenSlot>, window: Option<u32>, delay_ms: Option<u32>) -> ScreenView {
     #[cfg(target_os = "macos")]
     {
         use mr_core::screen::{self, ScreenConfig};
@@ -83,13 +86,15 @@ pub fn screen_start(app: AppHandle, slot: State<ScreenSlot>) -> ScreenView {
                 nudenet: crate::model_file(&app, mr_core::NUDENET_FILE),
                 gender: crate::model_file(&app, mr_core::GENDER_FILE),
                 cache_dir: cache,
+                window,
+                delay_s: delay_ms.unwrap_or(400) as f64 / 1000.0,
             }));
         }
         return view_of(&slot);
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (&app, &slot);
+        let _ = (&app, &slot, window, delay_ms);
         ScreenView { supported: false, state: "off", ..Default::default() }
     }
 }
@@ -111,4 +116,29 @@ pub fn screen_status(slot: State<ScreenSlot>) -> ScreenView {
         let _ = &slot;
         ScreenView { supported: false, state: "off", ..Default::default() }
     }
+}
+
+/// The windows that can be chosen for the window mode.
+#[tauri::command(async)]
+pub fn screen_windows() -> Vec<serde_json::Value> {
+    #[cfg(target_os = "macos")]
+    {
+        mr_core::screen::list_windows()
+            .into_iter()
+            .map(|w| serde_json::json!({ "id": w.id, "app": w.app, "title": w.title, "width": w.width, "height": w.height }))
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    Vec::new()
+}
+
+/// Window mode: how far the picture is held back (the live audio's latency plus the user's correction), milliseconds.
+#[tauri::command]
+pub fn screen_set_delay(slot: State<ScreenSlot>, delay_ms: u32) {
+    #[cfg(target_os = "macos")]
+    if let Some(h) = slot.handle.lock().unwrap().as_ref() {
+        h.set_delay(delay_ms as f64 / 1000.0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (&slot, delay_ms);
 }

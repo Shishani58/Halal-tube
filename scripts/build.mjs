@@ -8,7 +8,7 @@ import { ASR_DEFAULT, ASR_MODELS } from './asr-models.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const test = process.argv.includes('--test');
-/** iPhone Safari prototype: content scripts + popup only, no models, no offscreen processor yet (see docs/safari.md). */
+/** iPhone Safari build -> dist-safari/ (see docs/safari.md). */
 const safari = process.argv.includes('--safari');
 const dist = join(root, safari ? 'dist-safari' : test ? 'dist-test' : 'dist');
 const watch = process.argv.includes('--watch');
@@ -24,20 +24,20 @@ const GENDER_SOURCE = process.env.GENDER_MODEL === 'fairface' ? 'gender-fairface
 const OPTIONAL_MODELS = ['Kim_Vocal_2.fp16.onnx'];
 const ORT_FILES = ['ort.webgpu.min.mjs', 'ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.asyncify.wasm'];
 
-function copyStaticSafari() {
-  mkdirSync(dist, { recursive: true });
-  cpSync(join(root, 'static/popup'), join(dist, 'popup'), { recursive: true });
-  const m = JSON.parse(readFileSync(join(root, 'static/manifest.json'), 'utf8'));
+/** Safari (iPhone) has no offscreen documents and runs a non-persistent background script; the processor runs in an iframe of the video page. */
+function adaptManifestForSafari() {
+  const mf = join(dist, 'manifest.json');
+  const m = JSON.parse(readFileSync(mf, 'utf8'));
   delete m.minimum_chrome_version;
   delete m.commands; // no keyboard on a phone
-  m.permissions = m.permissions.filter((p) => p !== 'offscreen'); // Safari has no offscreen documents
-  m.background = { scripts: ['background.js'], persistent: false }; // Safari runs non-persistent background scripts
-  writeFileSync(join(dist, 'manifest.json'), JSON.stringify(m, null, 2));
-  makeIcons(join(dist, 'icons'));
+  m.permissions = m.permissions.filter((p) => p !== 'offscreen');
+  m.background = { scripts: ['background.js'], persistent: false };
+  m.web_accessible_resources = [{ resources: ['processor/offscreen.html'], matches: m.content_scripts[0].matches }];
+  writeFileSync(mf, JSON.stringify(m, null, 2));
+  rmSync(join(dist, 'bench'), { recursive: true, force: true });
 }
 
 function copyStatic() {
-  if (safari) return copyStaticSafari();
   cpSync(join(root, 'static'), dist, { recursive: true });
   mkdirSync(join(dist, 'ort'), { recursive: true });
   for (const f of ORT_FILES) copyFileSync(join(root, 'node_modules/onnxruntime-web/dist', f), join(dist, 'ort', f));
@@ -91,6 +91,7 @@ function copyStatic() {
     for (const cs of m.content_scripts) cs.matches.push('http://localhost/*');
     writeFileSync(mf, JSON.stringify(m, null, 2));
   }
+  if (safari) adaptManifestForSafari();
 }
 
 const common = {
@@ -101,14 +102,10 @@ const common = {
   logLevel: 'info',
   legalComments: 'none',
   // identifies this build: findings kept by the vision worker under another build are not trusted
-  define: { __BUILD_ID__: JSON.stringify(String(Date.now())), __SAFARI_DEBUG__: String(safari) },
+  define: { __BUILD_ID__: JSON.stringify(String(Date.now())), __SAFARI_DEBUG__: String(safari), __SAFARI__: String(safari) },
 };
 
-const safariBuilds = [
-  { entryPoints: { 'content/main': 'src/content/main.ts', 'content/bridge': 'src/content/bridge.ts', background: 'src/background.ts', 'popup/popup': 'src/popup/popup.ts' }, format: 'iife' },
-];
-
-const builds = safari ? safariBuilds : [
+const builds = [
   { entryPoints: { 'content/main': 'src/content/main.ts', 'content/bridge': 'src/content/bridge.ts' }, format: 'iife' },
   // transformers.js (speech recognition), loaded by the worker only when the profanity filter is on;
   // it reuses the ONNX Runtime the worker already loaded (see src/processor/ort-shim.ts)
@@ -117,7 +114,9 @@ const builds = safari ? safariBuilds : [
     format: 'esm',
     alias: { 'onnxruntime-web/webgpu': './src/processor/ort-shim.ts', 'onnxruntime-common': './src/processor/ort-shim.ts' },
   },
-  { entryPoints: { background: 'src/background.ts', 'processor/offscreen': 'src/processor/offscreen.ts', 'processor/worker': 'src/processor/worker.ts', 'processor/vision-worker': 'src/processor/vision-worker.ts', 'processor/clip-worker': 'src/processor/clip-worker.ts', 'popup/popup': 'src/popup/popup.ts', 'bench/bench': 'src/bench/bench.ts', 'bench/asr-bench': 'src/bench/asr-bench.ts' }, format: 'esm' },
+  // Safari's background script is not a module: bundle it as a classic script
+  ...(safari ? [{ entryPoints: { background: 'src/background.ts' }, format: 'iife' }] : []),
+  { entryPoints: { ...(safari ? {} : { background: 'src/background.ts' }), 'processor/offscreen': 'src/processor/offscreen.ts', 'processor/worker': 'src/processor/worker.ts', 'processor/vision-worker': 'src/processor/vision-worker.ts', 'processor/clip-worker': 'src/processor/clip-worker.ts', 'popup/popup': 'src/popup/popup.ts', ...(safari ? {} : { 'bench/bench': 'src/bench/bench.ts', 'bench/asr-bench': 'src/bench/asr-bench.ts' }) }, format: 'esm' },
 ];
 
 if (!watch) rmSync(dist, { recursive: true, force: true });
