@@ -164,7 +164,7 @@ window.I18N = {
     liveQuiet: 'nothing is playing now',
     liveGpuWrong: 'the GPU computed wrong results, using the CPU',
     liveError: (m) => `Could not start: ${m}`,
-    liveHelp: 'If there is no sound: System Settings → Privacy & Security → System Audio Recording → allow Music Remover. The sound comes about 2 seconds after the picture: watch files in the app's player ("watch right away": the voice stays in sync), use the browser extension for video in the browser; live mode suits podcasts and radio.',
+    liveHelp: 'If there is no sound: System Settings → Privacy & Security → System Audio Recording → allow Music Remover. The sound comes about 2 seconds after the picture: watch files in the built-in player ("watch right away": the voice stays in sync), use the browser extension for video in the browser; live mode suits podcasts and radio.',
     strength: 'Remove music',
     strengthHint: 'Below 100%: part of the original sound stays (applies to files added next)',
     errors: {
