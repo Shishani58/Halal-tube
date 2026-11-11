@@ -243,13 +243,14 @@ pub fn start(cfg: LiveConfig) -> LiveHandle {
 /// The output side: the default device's stream, fed from a ring. Opening it also makes this
 /// process an audio client, which the tap needs in order to exclude it (what we play must not be
 /// captured again).
-struct Output {
+pub(crate) struct Output {
     _stream: cpal::Stream,
-    ring: Arc<Ring>,
-    armed: Arc<AtomicBool>,
-    rate: u32,
+    pub(crate) ring: Arc<Ring>,
+    pub(crate) armed: Arc<AtomicBool>,
+    pub(crate) rate: u32,
     /// Which device it is on, to notice when the default output changes (headphones, AirPods).
-    device: String,
+    #[allow(dead_code)]
+    pub(crate) device: String,
 }
 
 /// An output device the user can play to.
@@ -284,7 +285,7 @@ fn output_key(name: Option<&str>) -> Option<String> {
     Some(format!("{}@{rate}", d.name().unwrap_or_default()))
 }
 
-fn open_output(name: Option<&str>) -> Result<Output, Error> {
+pub(crate) fn open_output(name: Option<&str>) -> Result<Output, Error> {
     let device = find_output(name).ok_or_else(|| Error::Capture(match name {
         Some(n) => format!("the output device \"{n}\" was not found"),
         None => "no output device".into(),

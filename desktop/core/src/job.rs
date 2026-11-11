@@ -109,6 +109,78 @@ pub fn run(tools: &Tools, sep: &mut Separator, job: &Prepared, cancel: &AtomicBo
     run_with(tools, sep, job, &Options::default(), cancel, on_progress)
 }
 
+/// Reads interleaved f32 stereo (at the model's rate) from `src`, separates it tile by tile and hands each
+/// cleaned stretch (left, right) to `sink`, which returns `Ok(false)` to stop early. `opts` is asked before every
+/// tile, so the strength can change while it runs. Returns how many input samples per channel were read.
+pub fn separate_stream(
+    sep: &mut Separator,
+    src: &mut impl Read,
+    opts: &mut dyn FnMut() -> Options,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(&[f32], &[f32]) -> Result<bool, Error>,
+) -> Result<usize, Error> {
+    let rate = sep.mdx.cfg.sample_rate;
+    let (g, trim, chunk) = (sep.mdx.gen_size, sep.mdx.trim, sep.mdx.chunk_size);
+    // buffer[0] is absolute sample (k·g − trim); start with `trim` samples of silence.
+    let mut buf_l: Vec<f32> = vec![0.0; trim];
+    let mut buf_r: Vec<f32> = vec![0.0; trim];
+    let mut total_in: usize = 0;
+    let mut eof = false;
+    let mut raw = vec![0u8; 1 << 16];
+    let mut carry: Vec<u8> = Vec::with_capacity(8);
+    let (mut win_l, mut win_r) = (vec![0f32; chunk], vec![0f32; chunk]);
+    let (mut out_l, mut out_r) = (vec![0f32; g], vec![0f32; g]);
+    let mut k: usize = 0;
+    loop {
+        while buf_l.len() < chunk && !eof {
+            let n = src.read(&mut raw)?;
+            if n == 0 {
+                eof = true;
+                break;
+            }
+            carry.extend_from_slice(&raw[..n]);
+            let frames = carry.len() / 8;
+            for f in 0..frames {
+                let o = f * 8;
+                buf_l.push(f32::from_le_bytes(carry[o..o + 4].try_into().unwrap()));
+                buf_r.push(f32::from_le_bytes(carry[o + 4..o + 8].try_into().unwrap()));
+            }
+            total_in += frames;
+            carry.drain(..frames * 8);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        if eof && k * g >= total_in {
+            break;
+        }
+        let avail = buf_l.len().min(chunk);
+        win_l[..avail].copy_from_slice(&buf_l[..avail]);
+        win_r[..avail].copy_from_slice(&buf_r[..avail]);
+        win_l[avail..].fill(0.0);
+        win_r[avail..].fill(0.0);
+
+        sep.separate_window(&win_l, &win_r, &mut out_l, &mut out_r)?;
+        // out[i] is the voice at window sample trim + i: the original over the same span
+        let (orig_l, orig_r) = (&win_l[trim..trim + g], &win_r[trim..trim + g]);
+        let o = opts();
+        if o.keep_plain_speech {
+            keep_original_where_clean(&mut out_l, &mut out_r, orig_l, orig_r, rate, BELOW_DB);
+        }
+        mix_original(&mut out_l, &mut out_r, orig_l, orig_r, o.strength);
+
+        let n_out = if eof { g.min(total_in - k * g) } else { g };
+        if !sink(&out_l[..n_out], &out_r[..n_out])? {
+            break;
+        }
+        let drop_n = g.min(buf_l.len());
+        buf_l.drain(..drop_n);
+        buf_r.drain(..drop_n);
+        k += 1;
+    }
+    Ok(total_in)
+}
+
 /// Runs the pipeline. `on_progress` receives the processed fraction in [0, 1].
 pub fn run_with(
     tools: &Tools,
@@ -119,7 +191,6 @@ pub fn run_with(
     mut on_progress: impl FnMut(f64),
 ) -> Result<PathBuf, Error> {
     let rate = sep.mdx.cfg.sample_rate;
-    let (g, trim, chunk) = (sep.mdx.gen_size, sep.mdx.trim, sep.mdx.chunk_size);
     let info = &job.info;
 
     let dir = job.output.parent().unwrap_or(Path::new("."));
@@ -179,68 +250,19 @@ pub fn run_with(
     let total_est = (info.duration * rate as f64).max(1.0);
     let result = (|| -> Result<(), Error> {
         let mut writer = BufWriter::with_capacity(1 << 20, enc_in);
-        // buffer[0] is absolute sample (k·g − trim); start with `trim` samples of silence.
-        let mut buf_l: Vec<f32> = vec![0.0; trim];
-        let mut buf_r: Vec<f32> = vec![0.0; trim];
-        let mut total_in: usize = 0;
-        let mut eof = false;
-        let mut raw = vec![0u8; 1 << 16];
-        let mut carry: Vec<u8> = Vec::with_capacity(8);
-        let (mut win_l, mut win_r) = (vec![0f32; chunk], vec![0f32; chunk]);
-        let (mut out_l, mut out_r) = (vec![0f32; g], vec![0f32; g]);
-        let mut bytes = Vec::with_capacity(g * 8);
-        let mut k: usize = 0;
-        loop {
-            while buf_l.len() < chunk && !eof {
-                let n = dec_out.read(&mut raw)?;
-                if n == 0 {
-                    eof = true;
-                    break;
-                }
-                carry.extend_from_slice(&raw[..n]);
-                let frames = carry.len() / 8;
-                for f in 0..frames {
-                    let o = f * 8;
-                    buf_l.push(f32::from_le_bytes(carry[o..o + 4].try_into().unwrap()));
-                    buf_r.push(f32::from_le_bytes(carry[o + 4..o + 8].try_into().unwrap()));
-                }
-                total_in += frames;
-                carry.drain(..frames * 8);
-            }
-            if cancel.load(Ordering::Relaxed) {
-                return Err(Error::Cancelled);
-            }
-            if eof && k * g >= total_in {
-                break;
-            }
-            let avail = buf_l.len().min(chunk);
-            win_l[..avail].copy_from_slice(&buf_l[..avail]);
-            win_r[..avail].copy_from_slice(&buf_r[..avail]);
-            win_l[avail..].fill(0.0);
-            win_r[avail..].fill(0.0);
-
-            sep.separate_window(&win_l, &win_r, &mut out_l, &mut out_r)?;
-            // out[i] is the voice at window sample trim + i: the original over the same span
-            let (orig_l, orig_r) = (&win_l[trim..trim + g], &win_r[trim..trim + g]);
-            if opts.keep_plain_speech {
-                keep_original_where_clean(&mut out_l, &mut out_r, orig_l, orig_r, rate, BELOW_DB);
-            }
-            mix_original(&mut out_l, &mut out_r, orig_l, orig_r, opts.strength);
-
-            let n_out = if eof { g.min(total_in - k * g) } else { g };
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut done = 0usize;
+        let total_in = separate_stream(sep, &mut dec_out, &mut || *opts, cancel, &mut |l, r| {
             bytes.clear();
-            for i in 0..n_out {
-                bytes.extend_from_slice(&out_l[i].to_le_bytes());
-                bytes.extend_from_slice(&out_r[i].to_le_bytes());
+            for i in 0..l.len() {
+                bytes.extend_from_slice(&l[i].to_le_bytes());
+                bytes.extend_from_slice(&r[i].to_le_bytes());
             }
             writer.write_all(&bytes)?;
-
-            let drop_n = g.min(buf_l.len());
-            buf_l.drain(..drop_n);
-            buf_r.drain(..drop_n);
-            k += 1;
-            on_progress(((k * g) as f64 / total_est).min(0.999));
-        }
+            done += l.len();
+            on_progress((done as f64 / total_est).min(0.999));
+            Ok(true)
+        })?;
         if total_in == 0 {
             return Err(Error::NoAudio);
         }

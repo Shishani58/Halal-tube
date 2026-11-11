@@ -26,8 +26,9 @@
   const api = T ? {
     invoke: (cmd, args) => T.core.invoke(cmd, args),
     listen: (ev, cb) => T.event.listen(ev, (e) => cb(e.payload)),
-    pickFiles: () => T.dialog.open({
-      multiple: true,
+    fileUrl: (p) => T.core.convertFileSrc(p),
+    pickFiles: (opts = {}) => T.dialog.open({
+      multiple: opts.multiple !== false,
       title: t('chooseFiles'),
       filters: [{ name: t('mediaFiles'), extensions: ['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', 'wmv', 'flv', 'mpg', 'mpeg', 'ts', 'mts', 'm2ts', '3gp', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'oga', 'opus', 'wma', 'aiff', 'aif', 'mka'] }],
     }),
@@ -169,6 +170,101 @@
     const d = await api.pickFolder();
     if (typeof d === 'string' && d) { outDir = d; store.set('outDir', d); renderDest(); }
   });
+  // ---------- player: watch with the music removed, in sync ----------
+  // The sound comes from the backend, cleaned ahead of playback; the picture is a muted <video> that follows
+  // the position the backend reports (it plays at the audio's pace, and is nudged back when it drifts).
+  const pl = { open: false, timer: 0, view: null, seeking: false, strengthTimer: 0, noPicture: false };
+  const plVideo = () => $('#player-video');
+  function plRender() {
+    const v = pl.view;
+    if (!v) return;
+    const st = $('#player-status');
+    st.classList.toggle('err', v.state === 'error');
+    st.textContent =
+      v.state === 'loading' ? t('playerLoading') :
+      v.state === 'buffering' ? t('playerBuffering') :
+      v.state === 'ended' ? t('playerEnded') :
+      v.state === 'error' ? t('playerError')(v.errorMessage || v.errorCode || '') :
+      v.state === 'playing' ? t('playerPlaying')(Math.round(v.buffered)) : '';
+    const playing = v.state === 'playing' || v.state === 'buffering';
+    const btn = $('#player-play');
+    btn.textContent = playing ? '⏸' : '▶';
+    btn.title = btn.ariaLabel = t(playing ? 'cmpPause' : 'cmpPlay');
+    if (!pl.seeking && v.duration) $('#player-seek').value = String(Math.round((v.position / v.duration) * 1000));
+    $('#player-time').textContent = `${clock(v.position)} / ${clock(v.duration)}`;
+    $('#player-note').hidden = !(pl.noPicture || (v.state !== 'loading' && !v.hasVideo));
+    $('#player-note').textContent = pl.noPicture ? t('playerNoPicture') : t('playerAudioOnly');
+    plVideo().hidden = !v.hasVideo || pl.noPicture;
+  }
+  function plSyncVideo() {
+    const v = pl.view, el = plVideo();
+    if (!v || !v.hasVideo || pl.noPicture || !el.src) return;
+    const drift = el.currentTime - v.position;
+    if (v.state === 'playing') {
+      if (Math.abs(drift) > 0.25) el.currentTime = v.position;
+      else el.playbackRate = Math.min(1.05, Math.max(0.95, 1 - drift * 0.5));
+      if (el.paused) el.play().catch(() => {});
+    } else {
+      if (!el.paused) el.pause();
+      if (Math.abs(drift) > 0.1) el.currentTime = v.position;
+    }
+  }
+  async function plPoll() {
+    if (!pl.open) return;
+    pl.view = (await api.invoke('player_status')) || pl.view;
+    if (pl.view && pl.view.hasVideo && !plVideo().src && pl.path && api.fileUrl) plVideo().src = api.fileUrl(pl.path);
+    plRender();
+    plSyncVideo();
+  }
+  async function openPlayer(path) {
+    closePlayer();
+    pl.open = true; pl.path = path; pl.noPicture = false; pl.view = null;
+    $('main').hidden = true;
+    $('#player').hidden = false;
+    $('#player-title').textContent = path.split(/[\\/]/).pop();
+    const el = plVideo();
+    el.removeAttribute('src');
+    el.onerror = () => { pl.noPicture = true; el.removeAttribute('src'); plRender(); };
+    pl.view = await api.invoke('player_open', { path, strength, device: liveDevice || null });
+    await liveRefresh(); // live mode is switched off while the player plays
+    plRender();
+    pl.timer = setInterval(plPoll, 150);
+  }
+  function closePlayer() {
+    if (!pl.open) return;
+    pl.open = false;
+    clearInterval(pl.timer);
+    plVideo().pause(); plVideo().removeAttribute('src');
+    $('#player').hidden = true;
+    $('main').hidden = false;
+    api.invoke('player_close');
+  }
+  $('#play-pick').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const r = await api.pickFiles({ multiple: false });
+    const path = Array.isArray(r) ? r[0] : r;
+    if (typeof path === 'string' && path) openPlayer(path);
+  });
+  $('#player-close').addEventListener('click', closePlayer);
+  $('#player-play').addEventListener('click', () => {
+    const v = pl.view; if (!v) return;
+    const playing = v.state === 'playing' || v.state === 'buffering';
+    api.invoke(playing ? 'player_pause' : 'player_play');
+    if (v.state === 'ended') plVideo().currentTime = 0;
+    plPoll();
+  });
+  $('#player-seek').addEventListener('input', () => { pl.seeking = true; if (pl.view) $('#player-time').textContent = `${clock(Number($('#player-seek').value) / 1000 * pl.view.duration)} / ${clock(pl.view.duration)}`; });
+  $('#player-seek').addEventListener('change', () => {
+    const t = Number($('#player-seek').value) / 1000 * (pl.view ? pl.view.duration : 0);
+    pl.seeking = false;
+    api.invoke('player_seek', { seconds: t });
+    if (!plVideo().paused || plVideo().src) plVideo().currentTime = t;
+  });
+  document.addEventListener('keydown', (e) => {
+    if (pl.open && e.code === 'Space') { e.preventDefault(); $('#player-play').click(); }
+    if (pl.open && e.key === 'Escape') closePlayer();
+  });
+
   // ---------- what to do ----------
   function renderModes() {
     $('#mode-music').checked = music;
@@ -352,7 +448,7 @@
     $('#strength-val').textContent = `${strength}%`;
     strengthEl.parentElement.title = t('strengthHint');
   };
-  strengthEl.addEventListener('input', () => { strength = Number(strengthEl.value); store.set('strength', String(strength)); renderStrength(); api.invoke('live_set_strength', { strength }); });
+  strengthEl.addEventListener('input', () => { strength = Number(strengthEl.value); store.set('strength', String(strength)); renderStrength(); api.invoke('live_set_strength', { strength }); if (pl.open) { clearTimeout(pl.strengthTimer); pl.strengthTimer = setTimeout(() => api.invoke('player_set_strength', { strength }), 300); } });
   renderStrength();
   $('#dest-reset').addEventListener('click', () => { outDir = null; store.set('outDir', null); renderDest(); });
 
@@ -380,6 +476,8 @@
   });
   const takePending = async () => addPaths(await api.invoke('take_pending_files'));
   api.listen('open-files', takePending);
+  const takePlay = async () => { const p = await api.invoke('take_pending_play'); if (p) openPlayer(p); };
+  api.listen('play-file', takePlay);
   api.listen('engine', (e) => { engine = e; renderEngine(); jobs.forEach((j) => j.status === 'running' && renderJob(j)); });
 
   (async () => {
@@ -391,6 +489,7 @@
     (await api.invoke('list_jobs')).forEach(upsert);
     syncLayout();
     takePending();
+    takePlay();
   })();
 
   // ---------- demo backend for viewing the UI in a browser ----------
@@ -412,6 +511,9 @@
       { name: 'Подкаст 12.mp3', isVideo: false, status: 'queued', progress: 0 },
       { name: 'notes.txt', isVideo: false, status: 'error', progress: 0, errorCode: 'unsupported', errorMessage: 'txt' },
     ];
+    let player = { t0: 0, paused: true, at: 0 };
+    const playerPos = () => player.paused ? player.at : Math.min(600, player.at + (Date.now() - player.t0) / 1000);
+    const playerDemo = () => ({ supported: true, state: player.paused ? 'paused' : 'playing', position: playerPos(), duration: 600, buffered: 9.8, hasVideo: false, backend: 'CoreML' });
     const params = new URLSearchParams(location.search);
     let liveDemo = params.has('live') ? { supported: true, state: 'running', backend: 'CoreML', latency: 1.8, load: 0.27, activity: true } : { supported: true, state: 'off' };
     return {
@@ -419,11 +521,18 @@
         if (cmd === 'engine_status') return params.has('empty') ? { state: 'idle' } : { state: 'ready', backend: 'CoreML' };
         if (cmd === 'list_jobs') return params.has('empty') ? [] : demo.map((d) => ({ id: id++, input: '/Users/me/Movies/' + d.name, output: '/Users/me/Movies/x', ...d }));
         if (cmd === 'take_pending_files') return [];
+        if (cmd === 'take_pending_play') return null;
         if (cmd === 'live_devices') return [{ name: 'MacBook Pro Speakers', isDefault: true }, { name: 'AirPods', isDefault: false }];
         if (cmd === 'live_status') return liveDemo;
         if (cmd === 'live_start') return (liveDemo = { supported: true, state: 'running', backend: 'CoreML', latency: 1.8, load: 0.27, activity: true, strength: args.strength });
         if (cmd === 'live_stop') return (liveDemo = { supported: true, state: 'off' });
         if (cmd === 'live_set_strength') return null;
+        if (cmd === 'player_open') { player = { t0: Date.now(), paused: false, at: 0 }; return playerDemo(); }
+        if (cmd === 'player_status') return playerDemo();
+        if (cmd === 'player_pause') { player.at = playerPos(); player.paused = true; return null; }
+        if (cmd === 'player_play') { player.t0 = Date.now(); player.paused = false; return null; }
+        if (cmd === 'player_seek') { player.at = args.seconds; player.t0 = Date.now(); return null; }
+        if (cmd === 'player_set_strength' || cmd === 'player_close') return null;
         if (cmd === 'prepare_preview') return { start: 0, length: 30 };
         if (cmd === 'preview_bytes') return silentWav(30);
         if (cmd === 'clear_preview') return null;
@@ -432,6 +541,7 @@
       },
       listen: (ev, cb) => { (listeners[ev] ||= []).push(cb); },
       pickFiles: async () => ['/Users/me/Movies/new clip.mp4'],
+      fileUrl: () => '',
       pickFolder: async () => '/Users/me/Movies/Clean',
       reveal: () => {},
       onDrag: () => {},

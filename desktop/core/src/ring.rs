@@ -41,6 +41,11 @@ impl Ring {
         self.len() == 0
     }
 
+    /// Samples the consumer has taken in all (they only grow): a playback position.
+    pub fn popped(&self) -> usize {
+        self.tail.load(Ordering::Acquire)
+    }
+
     /// Producer side: writes what fits, counts the rest as overruns; returns how many were written.
     pub fn push(&self, data: &[f32]) -> usize {
         let head = self.head.load(Ordering::Relaxed);

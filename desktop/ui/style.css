@@ -215,3 +215,16 @@ h2 { margin: 0; font-size: 11.5px; font-weight: 650; text-transform: uppercase; 
 .mode { display: inline-flex; align-items: center; gap: 6px; font-weight: 550; cursor: pointer; }
 .mode input { accent-color: var(--accent); margin: 0; }
 .strength.off { opacity: .45; }
+
+/* player */
+.player { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding: 4px 22px 0; }
+.player-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.player-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.player-stage { flex: 1; min-height: 0; display: grid; place-items: center; background: #000; border-radius: 12px; overflow: hidden; }
+.player-stage video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+.player-stage p { margin: 0; padding: 20px; text-align: center; color: #9aa19d; }
+.player-bar { display: flex; align-items: center; gap: 10px; }
+.player-bar input { flex: 1; accent-color: var(--accent); }
+.player-bar .time { font-variant-numeric: tabular-nums; min-width: 86px; text-align: right; }
+.player-status { font-size: 12px; min-height: 18px; }
+.player-status.err { color: var(--danger); }

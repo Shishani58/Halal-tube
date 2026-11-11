@@ -7,6 +7,7 @@
 //! - [`preview`]: short before/after clips for listening.
 //! - [`live`]: the streaming engine for a live (system audio) mode, without audio capture.
 //! - [`blur`]: hides nudity and women in video (re-encodes the picture, blurs regions).
+//! - [`player`]: watching a file with the music removed ahead of playback, so the voice never lags the picture.
 //! - [`job`]: the streaming file pipeline: decode → separate tile by tile → encode + mux.
 
 #[cfg(target_os = "macos")]
@@ -19,6 +20,8 @@ pub mod job;
 pub mod live;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod live_session;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod player;
 pub mod mdx;
 pub mod media;
 pub mod model;

@@ -49,6 +49,7 @@
       <p class="drop-title" data-i18n="dropTitle"></p>
       <p class="drop-or"><span data-i18n="or"></span> <button id="pick" type="button" class="link" data-i18n="pick"></button></p>
       <p class="drop-formats" data-i18n="formats"></p>
+      <p class="drop-or"><span data-i18n="watchOr"></span> <button id="play-pick" type="button" class="link" data-i18n="watchPick"></button></p>
     </section>
 
     <section id="list-wrap" class="list-wrap" hidden>
@@ -59,6 +60,23 @@
       <ul id="list" class="list"></ul>
     </section>
   </main>
+
+  <section id="player" class="player" hidden>
+    <div class="player-top">
+      <b id="player-title" class="player-title"></b>
+      <button id="player-close" type="button" class="btn" data-i18n="close"></button>
+    </div>
+    <div class="player-stage">
+      <video id="player-video" muted playsinline></video>
+      <p id="player-note" class="muted" hidden></p>
+    </div>
+    <div class="player-bar">
+      <button id="player-play" type="button" class="btn play"></button>
+      <input id="player-seek" type="range" min="0" max="1000" value="0">
+      <span id="player-time" class="muted time"></span>
+    </div>
+    <div id="player-status" class="player-status muted"></div>
+  </section>
 
   <footer class="bottom">
     <div class="modes" role="group">

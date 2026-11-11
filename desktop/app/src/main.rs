@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod live;
+mod player;
 
 use mr_core::blur::detect::Detector;
 use mr_core::blur::job as blur_job;
@@ -113,6 +114,8 @@ struct AppState {
     /// Files opened via Finder ("Open With", Dock icon) or the command line, waiting for the UI
     /// to queue them with its current settings (language suffix, output folder).
     pending: Mutex<Vec<String>>,
+    /// `--play FILE` on the command line: opened in the player once the window asks.
+    pending_play: Mutex<Option<String>>,
 }
 
 fn push_pending(app: &AppHandle, paths: Vec<String>) {
@@ -125,6 +128,11 @@ fn push_pending(app: &AppHandle, paths: Vec<String>) {
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+}
+
+#[tauri::command]
+fn take_pending_play(state: State<AppState>) -> Option<String> {
+    state.pending_play.lock().unwrap().take()
 }
 
 #[tauri::command]
@@ -532,12 +540,14 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(live::LiveSlot::default())
+        .manage(player::PlayerSlot::default())
         .manage(AppState {
             jobs: Mutex::new(Vec::new()),
             tx: Mutex::new(tx),
             next_id: AtomicU64::new(1),
             engine: Mutex::new(EngineView { state: "idle", backend: None, error_code: None, error_message: None, gpu_check_failed: false }),
             pending: Mutex::new(Vec::new()),
+            pending_play: Mutex::new(None),
         })
         .setup(move |app| {
             // preview clips don't outlive a run
@@ -546,7 +556,16 @@ fn main() {
             }
             let handle = app.handle().clone();
             // Windows/Linux file associations pass files as arguments.
-            let args: Vec<String> = std::env::args().skip(1).filter(|a| Path::new(a).exists()).collect();
+            let mut args: Vec<String> = std::env::args().skip(1).collect();
+            if let Some(i) = args.iter().position(|a| a == "--play") {
+                // `--play FILE`: watch it right away
+                if let Some(file) = args.get(i + 1).cloned() {
+                    *handle.state::<AppState>().pending_play.lock().unwrap() = Some(file);
+                    let _ = handle.emit("play-file", ());
+                }
+                args.drain(i..(i + 2).min(args.len()));
+            }
+            let args: Vec<String> = args.into_iter().filter(|a| Path::new(a).exists()).collect();
             push_pending(&handle, args);
             let handle = app.handle().clone();
             std::thread::Builder::new()
@@ -562,6 +581,7 @@ fn main() {
             remove_job,
             clear_finished,
             take_pending_files,
+            take_pending_play,
             prepare_preview,
             preview_bytes,
             clear_preview,
@@ -569,7 +589,14 @@ fn main() {
             live::live_start,
             live::live_stop,
             live::live_status,
-            live::live_set_strength
+            live::live_set_strength,
+            player::player_open,
+            player::player_status,
+            player::player_play,
+            player::player_pause,
+            player::player_seek,
+            player::player_set_strength,
+            player::player_close
         ])
         .build(tauri::generate_context!())
         .expect("error while building Music Remover")
@@ -577,6 +604,7 @@ fn main() {
             // release the audio tap when the app quits: the system's own output is heard again
             if let tauri::RunEvent::Exit = _event {
                 _app.state::<live::LiveSlot>().shutdown();
+                _app.state::<player::PlayerSlot>().shutdown();
             }
             // macOS delivers "Open With" / Dock-icon drops as an Opened event.
             #[cfg(target_os = "macos")]
