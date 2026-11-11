@@ -73,7 +73,7 @@ window.I18N = {
     liveQuiet: 'сейчас ничего не играет',
     liveGpuWrong: 'видеокарта считала неверно, работает процессор',
     liveError: (m) => `Не получилось: ${m}`,
-    liveHelp: 'Если звука нет: Системные настройки → Конфиденциальность и безопасность → Запись системного звука → разрешите Music Remover. Звук идёт на ~2 секунды позже картинки: файлы смотрите в плеере приложения («смотрите сразу», там звук вровень с картинкой), видео в браузере — через расширение, а для подкастов и радио живой режим подходит хорошо.',
+    liveHelp: 'Если звука нет: Системные настройки → Конфиденциальность и безопасность → Запись системного звука → разрешите Music Remover. Звук идёт на ~0,4 секунды позже картинки: это заметно на речи крупным планом. Чтобы звук был вровень, смотрите файлы в плеере приложения («смотрите сразу») или видео в браузере через расширение; для подкастов и радио живой режим подходит как есть.',
     strength: 'Убирать музыку',
     strengthHint: 'Меньше 100%: часть оригинального звука остаётся (действует на новые файлы)',
     errors: {
@@ -164,7 +164,7 @@ window.I18N = {
     liveQuiet: 'nothing is playing now',
     liveGpuWrong: 'the GPU computed wrong results, using the CPU',
     liveError: (m) => `Could not start: ${m}`,
-    liveHelp: 'If there is no sound: System Settings → Privacy & Security → System Audio Recording → allow Music Remover. The sound comes about 2 seconds after the picture: watch files in the built-in player ("watch right away": the voice stays in sync), use the browser extension for video in the browser; live mode suits podcasts and radio.',
+    liveHelp: 'If there is no sound: System Settings → Privacy & Security → System Audio Recording → allow Music Remover. The sound comes about 0.4 s after the picture, which shows on close-up speech. For exact sync watch files in the built-in player ("watch right away") or use the browser extension for video in the browser; live mode suits podcasts and radio as it is.',
     strength: 'Remove music',
     strengthHint: 'Below 100%: part of the original sound stays (applies to files added next)',
     errors: {

@@ -43,6 +43,7 @@
     ],
     "resources": {
       "../../models/Kim_Vocal_2.onnx": "models/Kim_Vocal_2.onnx",
+      "../../models/Kim_Vocal_2.t32.onnx": "models/Kim_Vocal_2.t32.onnx",
       "../../models/nudenet-320n.onnx": "models/nudenet-320n.onnx",
       "../../models/genderage.onnx": "models/genderage.onnx",
       "../vendor/ffmpeg/ffmpeg": "bin/ffmpeg",

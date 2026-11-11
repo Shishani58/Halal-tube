@@ -31,6 +31,30 @@ impl StreamResampler {
         Ok(StreamResampler { inner, in_l: Vec::new(), in_r: Vec::new() })
     }
 
+    /// Like `new`, but with a resampler even when the rates are equal, so that [`nudge`](Self::nudge) works.
+    pub fn new_adjustable(from: u32, to: u32) -> Result<Self, Error> {
+        let mut s = Self::new(from, to)?;
+        if s.inner.is_none() {
+            let params = SincInterpolationParameters {
+                sinc_len: 128,
+                f_cutoff: 0.95,
+                interpolation: SincInterpolationType::Linear,
+                oversampling_factor: 128,
+                window: WindowFunction::BlackmanHarris2,
+            };
+            s.inner = Some(SincFixedIn::<f32>::new(1.0, 1.1, params, CHUNK, 2).map_err(|e| Error::Capture(format!("resampler: {e}")))?);
+        }
+        Ok(s)
+    }
+
+    /// Changes the speed of what comes out by `rel` (1.003: 0.3 % more samples per second, i.e. 0.3 % lower pitch), smoothly.
+    /// Used to hold the output queue at a steady level when the capture and the output clocks drift apart.
+    pub fn nudge(&mut self, rel: f64) {
+        if let Some(rs) = self.inner.as_mut() {
+            let _ = rs.set_resample_ratio_relative(rel.clamp(0.9, 1.1), true);
+        }
+    }
+
     /// Converts a block; appends what is ready to `out_*` (it lags the input by a few milliseconds).
     pub fn process(&mut self, l: &[f32], r: &[f32], out_l: &mut Vec<f32>, out_r: &mut Vec<f32>) -> Result<(), Error> {
         let Some(rs) = self.inner.as_mut() else {

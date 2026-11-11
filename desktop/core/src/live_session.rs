@@ -13,7 +13,7 @@
 use crate::capture::Capture;
 use crate::job::Options;
 use crate::live::Live;
-use crate::mdx::{Mdx, KIM_VOCAL_2};
+use crate::mdx::{Mdx, KIM_VOCAL_2, LIVE_FRAMES};
 use crate::model::{Backend, Model, SelfTest, Separator};
 use crate::ring::Ring;
 use crate::stream::StreamResampler;
@@ -34,7 +34,9 @@ pub struct LiveConfig {
     pub output_device: Option<String>,
     /// Windows only: the render device to listen to (loopback), different from `output_device`; see capture_win.rs.
     pub capture_device: Option<String>,
-    /// How often the model runs, seconds (1: ~25 % of a CoreML GPU, latency ~1.8 s).
+    /// How often the model runs, seconds. On the short-window model (the default, see `LIVE_MODEL_FILE`) 0.1 costs ~35 % of a
+    /// CoreML GPU and gives a latency of ~0.3 s; on the CPU it is raised to 0.4 s; with only the long model next to
+    /// `model_path` it is raised to 1 s (latency ~1.8 s).
     pub hop_s: f64,
     pub keep_plain_speech: bool,
     /// Percent of clean voice in the output (see `Options::strength`); can be changed while running.
@@ -70,7 +72,7 @@ impl LiveConfig {
             prefer: None,
             output_device: None,
             capture_device: None,
-            hop_s: 1.0,
+            hop_s: 0.1,
             keep_plain_speech: true,
             strength: 100,
             mute_original: true,
@@ -363,8 +365,14 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
 
     // ── the model
     stats.set_state(LiveState::LoadingModel);
-    let mdx = Mdx::new(KIM_VOCAL_2);
-    let model = Model::load(&cfg.model_path, mdx.tensor_shape(), cfg.prefer, cfg.cache_dir.as_deref())?;
+    // the short-window model next to the long one, if it is there: a run is 3.5× cheaper, so it can run 7× as often
+    let short = cfg.model_path.with_file_name(crate::LIVE_MODEL_FILE);
+    let (mdx, model_path, min_hop) = if short.exists() {
+        (Mdx::new(KIM_VOCAL_2.with_frames(LIVE_FRAMES)), short, 0.0f64)
+    } else {
+        (Mdx::new(KIM_VOCAL_2), cfg.model_path.clone(), 1.0)
+    };
+    let model = Model::load(&model_path, mdx.tensor_shape(), cfg.prefer, cfg.cache_dir.as_deref())?;
     *stats.backend.lock().unwrap() = model.backend.label().to_string();
     let mut sep = Separator::new(mdx, model);
     if let Ok(SelfTest::FellBack(why)) = sep.self_test(cfg.cache_dir.as_deref()) {
@@ -373,15 +381,18 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
         *stats.backend.lock().unwrap() = sep.model.backend.label().to_string();
     }
     let opts = |pct: u32| Options { strength: pct as f32 / 100.0, keep_plain_speech: cfg.keep_plain_speech };
-    let mut live = Live::new(&sep, cfg.hop_s, opts(stats.strength.load(Ordering::Relaxed)));
+    // on the CPU a short run is ~130 ms: the hop must leave room for it
+    let min_hop = if sep.model.backend == Backend::Cpu { min_hop.max(0.4) } else { min_hop };
+    let hop_s = cfg.hop_s.max(min_hop);
+    let mut live = Live::new(&sep, hop_s, opts(stats.strength.load(Ordering::Relaxed)));
     let model_rate = sep.mdx.cfg.sample_rate;
     report.model_rate = model_rate;
     report.latency = live.latency();
-    // a model run is a few hundred ms of work: the output starts after a margin that covers a slow
-    // run, so that it doesn't run dry between hops
-    const MARGIN_S: f64 = 0.4;
-    stats.latency_ms.store(((live.latency() as f64 / model_rate as f64 + MARGIN_S + 0.3) * 1000.0) as u32, Ordering::Relaxed);
-    let mut from_model = StreamResampler::new(model_rate, out.rate)?;
+    // the output starts after a margin that covers a slow run (and the hop's jitter), so that it doesn't run dry
+    // between hops: a run is ~70 ms on the short window and ~270 ms on the long one
+    let (margin_s, run_s) = if sep.mdx.cfg.dim_t <= LIVE_FRAMES { (0.15, 0.06) } else { (0.4, 0.3) };
+    stats.latency_ms.store(((live.latency() as f64 / model_rate as f64 + margin_s + run_s) * 1000.0) as u32, Ordering::Relaxed);
+    let mut from_model = StreamResampler::new_adjustable(model_rate, out.rate)?;
 
     // capture starts only now: audio heard while the model loaded would only add delay
     let mut cap = Some(start_capture(stats, stop, cfg.mute_original, cfg.capture_target())?);
@@ -406,7 +417,7 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
                 eprintln!("the output device changed: reopening the audio");
                 drop(cap.take()); // releases the tap first: the system's own output is heard while we switch
                 out = open_output(cfg.output_device.as_deref())?;
-                from_model = StreamResampler::new(model_rate, out.rate)?;
+                from_model = StreamResampler::new_adjustable(model_rate, out.rate)?;
                 began = false;
                 let c = start_capture(stats, stop, cfg.mute_original, cfg.capture_target())?;
                 cap_rate = c.sample_rate;
@@ -429,6 +440,13 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
             if pct != last_strength {
                 last_strength = pct;
                 live.set_options(opts(pct));
+            }
+            // hold the queue to the output at its target: the tap's clock and the device's drift apart by a fraction
+            // of a percent, which would empty it (a click) or let it grow (more delay). A tiny change of speed, inaudible.
+            if began {
+                let level = out.ring.len() as f64 / (out.rate as f64 * 2.0);
+                let err = level - (margin_s + hop_s / 2.0);
+                from_model.nudge(1.0 - (err / 5.0).clamp(-0.01, 0.01));
             }
             stats.out_ring_ms.store((out.ring.len() as f64 / (out.rate as f64 * 2.0) * 1000.0) as u32, Ordering::Relaxed);
             if cfg.playback {
@@ -483,7 +501,7 @@ fn run(cfg: &LiveConfig, stats: &Arc<LiveStats>, stop: &AtomicBool, report: &mut
         from_model.process(&pl, &pr, &mut ol, &mut or)?;
         if cfg.playback {
             if !began {
-                out.ring.push(&vec![0f32; (out.rate as f64 * MARGIN_S) as usize * 2]);
+                out.ring.push(&vec![0f32; (out.rate as f64 * margin_s) as usize * 2]);
             }
             inter.clear();
             inter.extend(ol.iter().zip(&or).flat_map(|(a, b)| [*a, *b]));

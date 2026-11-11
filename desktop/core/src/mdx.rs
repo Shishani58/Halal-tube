@@ -27,6 +27,18 @@ pub const KIM_VOCAL_2: MdxConfig = MdxConfig {
     sample_rate: 44100,
 };
 
+impl MdxConfig {
+    /// The same net on a shorter (or longer) time axis: `dim_t` frames per window. The weights don't depend on it,
+    /// but an ONNX file has a fixed shape, so each value needs a file re-exported for it (scripts/retime-onnx.py).
+    pub const fn with_frames(self, dim_t: usize) -> Self {
+        MdxConfig { dim_t, ..self }
+    }
+}
+
+/// Frames per window of the live model: 0.74 s instead of 5.9 s, a run takes 35 ms instead of 230 ms (CoreML GPU).
+/// The output agrees with the long window's to 26–31 dB on real recordings (tests/live_short.rs).
+pub const LIVE_FRAMES: usize = 32;
+
 pub struct Mdx {
     pub cfg: MdxConfig,
     /// Samples fed to the model per call.

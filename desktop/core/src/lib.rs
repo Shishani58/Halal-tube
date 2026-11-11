@@ -83,6 +83,8 @@ impl Error {
 
 /// Default location of the bundled model relative to a resources directory.
 pub const MODEL_FILE: &str = "Kim_Vocal_2.onnx";
+/// The same model on a 32-frame window, for the live mode (made by scripts/retime-onnx.py).
+pub const LIVE_MODEL_FILE: &str = "Kim_Vocal_2.t32.onnx";
 /// Blur models (nudity + faces, face gender), next to the separation model.
 pub const NUDENET_FILE: &str = "nudenet-320n.onnx";
 pub const GENDER_FILE: &str = "genderage.onnx";

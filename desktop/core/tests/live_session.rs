@@ -135,3 +135,47 @@ fn playing_to_a_device_chosen_by_name_works() {
     assert!(inp > 0.05 && out < inp * 0.1, "the tone should be captured and removed");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Plays for real (strength 100 on a tone: the output is near-silent) and reports the latency and whether the output ran dry.
+#[test]
+#[ignore = "needs the System Audio Recording permission; plays (near-silence) to the default output"]
+fn the_output_does_not_run_dry_at_the_default_hop() {
+    let model = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(mr_core::MODEL_FILE);
+    let dir = std::env::temp_dir().join(format!("mr-live-dry-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tone = dir.join("tone.wav");
+    assert!(Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=40", "-ar", "44100", "-ac", "2"])
+        .arg(&tone)
+        .status()
+        .unwrap()
+        .success());
+    let cfg = LiveConfig::new(model, Some(dir.join("cache")));
+    let handle = live_session::start(cfg);
+    let t = Instant::now();
+    while handle.stats.state() != LiveState::Running {
+        assert!(handle.stats.state() != LiveState::Error, "session failed: {:?}", handle.stats.error.lock().unwrap());
+        assert!(t.elapsed() < Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut player = Command::new("afplay").arg(&tone).spawn().expect("afplay");
+    let mut series = Vec::new();
+    for _ in 0..35 {
+        std::thread::sleep(Duration::from_secs(1));
+        series.push((handle.stats.out_ring_seconds() * 1000.0) as u32);
+    }
+    eprintln!("out ring ms each second: {series:?}");
+    let _ = player.kill();
+    let s = &handle.stats;
+    eprintln!(
+        "latency {:.2} s · underruns {} · overruns {} · runs {} · worst run {} ms · out ring {} ms · backend {}",
+        s.latency_seconds(),
+        s.underruns.load(Ordering::Relaxed),
+        s.overruns.load(Ordering::Relaxed),
+        s.runs.load(Ordering::Relaxed),
+        s.worst_run_ms(),
+        (s.out_ring_seconds() * 1000.0) as u32,
+        s.backend.lock().unwrap()
+    );
+    assert_eq!(s.underruns.load(Ordering::Relaxed), 0, "the output ran dry");
+}
